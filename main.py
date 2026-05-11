@@ -262,7 +262,7 @@ def send_welcome(message):
         save_user(message)
         save_data()
         
-        welcome_msg = "🚀 Welcome To B4 Pool Alerts\n\nI Monitor Solana Pools On B4 In Real-Time\n\n📢 You Will Receive Notifications For:\n\n🎯 New Pools Launching\n⏰ 1 Hour Before Pool Closes\n⏲️ 5 Minutes Before Pool Closes\n💰 Pool Closure & Reward Distribution\n\n✅ You Are Now Subscribed\n\nSit Back And Receive Alerts!"
+        welcome_msg = "🚀 Welcome To B4 Pool Alerts\n\nI Monitor B4 Pool In Real-Time\n\n📢 You Will Receive Notifications For:\n\n🎯 New Pools Launching\n⏰ 1 Hour Before Pool Closes\n⏲️ 5 Minutes Before Pool Closes\n💰 Pool Closure & Reward Distribution\n\n✅ You Are Now Subscribed\n\nSit Back And Receive Alerts!"
         bot.reply_to(message, welcome_msg)
     except Exception as e:
         print(f"error in start: {e}")
