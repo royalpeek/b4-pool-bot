@@ -21,7 +21,7 @@ users_file = "users.json"
 SOLANA_PROGRAM_ID = "9XQDD38sy1qJ57DqAQvADuLRTjcYUXD48H7deyNuaehH"
 SOLANA_RPC = "https://api.mainnet-beta.solana.com"
 
-ADMIN_ID = int(os.getenv("ADMIN_ID", 0)
+ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
 
 
 def load_data():
