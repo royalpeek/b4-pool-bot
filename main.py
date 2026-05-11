@@ -21,7 +21,7 @@ users_file = "users.json"
 SOLANA_PROGRAM_ID = "9XQDD38sy1qJ57DqAQvADuLRTjcYUXD48H7deyNuaehH"
 SOLANA_RPC = "https://api.mainnet-beta.solana.com"
 
-ADMIN_ID = None
+ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
 
 def load_data():
     global subscribed_chats, announced_pools, scheduled_notifications, users_db
@@ -53,7 +53,7 @@ def save_data():
 load_data()
 
 def is_admin(user_id):
-    if ADMIN_ID is None:
+    if ADMIN_ID is None or ADMIN_ID == 0:
         return False
     return user_id == ADMIN_ID
 
@@ -64,8 +64,8 @@ def save_user(message):
         if user_id not in users_db:
             users_db[user_id] = {
                 "user_id": message.from_user.id,
-                "username": message.from_user.username or "no username",
-                "first_name": message.from_user.first_name or "no name",
+                "username": message.from_user.username or "No Username",
+                "first_name": message.from_user.first_name or "No Name",
                 "join_date": datetime.now().isoformat(),
                 "is_admin": is_admin(message.from_user.id)
             }
@@ -179,7 +179,7 @@ def monitor_solana_pools():
                             create_time = pool_data["create_time"]
                             end_time = pool_data["end_time"]
                             
-                            notification = f"🚀 NEW POOL ALERT\n\n━━━━━━━━━━━━━━━━━━━\nPool ID: {pool_id}\nStatus: LIVE\nDuration: 24 Hours\nCreated: {create_time}\n━━━━━━━━━━━━━━━━━━━\n\n⏱️ Stake now before this opportunity closes!\n\n#B4 #Solana #Staking"
+                            notification = f"🚀 NEW POOL LIVE\n\nPool ID: {pool_id}\nStatus: ACTIVE\nDuration: 24 Hours\nCreated: {create_time}\n\nStake now before this opportunity closes!"
                             broadcast_to_all(notification)
                             
                             announced_pools[signature] = pool_data
@@ -212,14 +212,14 @@ def check_scheduled_notifications():
                     minutes_until = time_until / 60
                     
                     if hours_until <= 1.0 and not pool_data.get("notified_1h"):
-                        notification = f"⏰ POOL CLOSING SOON\n\n━━━━━━━━━━━━━━━━━━━\nPool ID: {pool_id}\nTime Remaining: 1 HOUR\n━━━━━━━━━━━━━━━━━━━\n\n🔴 This is your last chance to stake!\n\n#B4 #Solana #Staking"
+                        notification = f"⏰ POOL CLOSING SOON\n\nPool ID: {pool_id}\nTime Remaining: 1 Hour\n\nThis is your last chance to stake!"
                         broadcast_to_all(notification)
                         announced_pools[signature]["notified_1h"] = True
                         save_data()
                         print(f"1 hour reminder sent for pool: {pool_id}")
                     
                     elif minutes_until <= 5.0 and not pool_data.get("notified_5m"):
-                        notification = f"🚨 URGENT: POOL CLOSING IN 5 MINUTES\n\n━━━━━━━━━━━━━━━━━━━\nPool ID: {pool_id}\nTime Remaining: 5 MINUTES ⏳\n━━━━━━━━━━━━━━━━━━━\n\n🔴 ACT NOW or lose this opportunity!\n\n#B4 #Solana #Staking"
+                        notification = f"🚨 URGENT: POOL CLOSING IN 5 MINUTES\n\nPool ID: {pool_id}\nTime Remaining: 5 Minutes\n\nAct Now or lose this opportunity!"
                         broadcast_to_all(notification)
                         announced_pools[signature]["notified_5m"] = True
                         save_data()
@@ -227,7 +227,7 @@ def check_scheduled_notifications():
                 
                 else:
                     if not pool_data.get("notified_ended"):
-                        notification = f"✅ POOL CLOSED\n\n━━━━━━━━━━━━━━━━━━━\nPool ID: {pool_id}\nStatus: ENDED\n━━━━━━━━━━━━━━━━━━━\n\n💰 Reward distribution in progress...\nCheck your wallet for returns!\n\n#B4 #Solana #Staking"
+                        notification = f"✅ POOL CLOSED\n\nPool ID: {pool_id}\nStatus: Ended\n\nReward Distribution in Progress. Check your wallet for returns!"
                         broadcast_to_all(notification)
                         announced_pools[signature]["notified_ended"] = True
                         save_data()
@@ -241,12 +241,12 @@ def check_scheduled_notifications():
 def get_my_id(message):
     try:
         user_id = message.from_user.id
-        username = message.from_user.username or "no username"
-        reply = f"your telegram id: {user_id}\nyour username: @{username}"
+        username = message.from_user.username or "No Username"
+        reply = f"📱 Your Telegram ID: {user_id}\n👤 Your Username: @{username}"
         bot.reply_to(message, reply)
     except Exception as e:
         print(f"error in getmyid: {e}")
-        bot.reply_to(message, "error getting your id")
+        bot.reply_to(message, "Error getting your ID")
 
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
@@ -262,21 +262,21 @@ def send_welcome(message):
         save_user(message)
         save_data()
         
-        welcome_msg = "welcome to b4 pool alerts 🚀\n\ni monitor solana pools on b4 in real-time and send you instant notifications about:\n• new pools launching\n• 1 hour before pool closes\n• 5 minutes before pool closes\n• pool closure & reward distribution\n\nyou're now subscribed. sit back and receive alerts!"
+        welcome_msg = "🚀 Welcome To B4 Pool Alerts\n\nI Monitor Solana Pools On B4 In Real-Time\n\n📢 You Will Receive Notifications For:\n\n🎯 New Pools Launching\n⏰ 1 Hour Before Pool Closes\n⏲️ 5 Minutes Before Pool Closes\n💰 Pool Closure & Reward Distribution\n\n✅ You Are Now Subscribed\n\nSit Back And Receive Alerts!"
         bot.reply_to(message, welcome_msg)
     except Exception as e:
         print(f"error in start: {e}")
-        bot.reply_to(message, "error subscribing you")
+        bot.reply_to(message, "Error Subscribing You")
 
 @bot.message_handler(commands=['help'])
 def send_help(message):
     try:
         save_user(message)
-        help_text = "b4 pool alert bot\n\n📋 commands:\n/start - subscribe to pool alerts\n/help - show this message\n/status - check monitoring status\n/getmyid - get your telegram id\n\n⚙️ what i do:\ni continuously monitor b4 pools on solana and send real-time notifications at critical moments. never miss a staking opportunity."
+        help_text = "📖 B4 Pool Alert Bot\n\n⚙️ Available Commands:\n\n/start - Subscribe To Pool Alerts\n/help - Show This Message\n/status - Check Bot Status\n/getmyid - Get Your Telegram ID\n\n❓ What I Do:\n\nI Continuously Monitor B4 Pools On Solana And Send Real-Time Notifications At Critical Moments.\n\nNever Miss A Staking Opportunity!"
         bot.reply_to(message, help_text)
     except Exception as e:
         print(f"error in help: {e}")
-        bot.reply_to(message, "error showing help")
+        bot.reply_to(message, "Error Showing Help")
 
 @bot.message_handler(commands=['status'])
 def pool_status(message):
@@ -284,87 +284,87 @@ def pool_status(message):
         save_user(message)
         total_pools = len(announced_pools)
         total_chats = len(subscribed_chats)
-        status_msg = f"📊 bot status\n\nactive pools: {total_pools}\nsubscribed users/groups: {total_chats}\n\nstatus: ✅ running & monitoring"
+        status_msg = f"📊 Bot Status\n\n🔍 Active Pools: {total_pools}\n👥 Subscribed Users/Groups: {total_chats}\n\n✅ Status: Running & Monitoring"
         bot.reply_to(message, status_msg)
     except Exception as e:
         print(f"error in status: {e}")
-        bot.reply_to(message, "error getting status")
+        bot.reply_to(message, "Error Getting Status")
 
 @bot.message_handler(commands=['users'])
 def show_users(message):
     try:
         if not is_admin(message.from_user.id):
-            bot.reply_to(message, "❌ you don't have permission to use this command")
+            bot.reply_to(message, "❌ Permission Denied. Admin Only Command")
             return
         
         total_users = len(users_db)
-        users_msg = f"📊 user statistics\n\ntotal users: {total_users}"
+        users_msg = f"📊 User Statistics\n\n👥 Total Users: {total_users}"
         bot.reply_to(message, users_msg)
     except Exception as e:
         print(f"error in users: {e}")
-        bot.reply_to(message, "error getting users")
+        bot.reply_to(message, "Error Getting Users")
 
 @bot.message_handler(commands=['listusers'])
 def list_users(message):
     try:
         if not is_admin(message.from_user.id):
-            bot.reply_to(message, "❌ you don't have permission to use this command")
+            bot.reply_to(message, "❌ Permission Denied. Admin Only Command")
             return
         
         if not users_db:
-            bot.reply_to(message, "no users yet")
+            bot.reply_to(message, "No Users Yet")
             return
         
-        users_list = "📋 registered users\n\n"
+        users_list = "📋 Registered Users\n\n"
         for user_id, user_data in users_db.items():
-            username = user_data.get("username", "no username")
-            first_name = user_data.get("first_name", "no name")
-            join_date = user_data.get("join_date", "unknown")
-            users_list += f"id: {user_id}\nname: {first_name}\nusername: @{username}\njoined: {join_date}\n\n"
+            username = user_data.get("username", "No Username")
+            first_name = user_data.get("first_name", "No Name")
+            join_date = user_data.get("join_date", "Unknown")
+            users_list += f"ID: {user_id}\nName: {first_name}\nUsername: @{username}\nJoined: {join_date}\n\n"
         
         bot.reply_to(message, users_list)
     except Exception as e:
         print(f"error in listusers: {e}")
-        bot.reply_to(message, "error listing users")
+        bot.reply_to(message, "Error Listing Users")
 
 @bot.message_handler(commands=['stats'])
 def show_stats(message):
     try:
         if not is_admin(message.from_user.id):
-            bot.reply_to(message, "❌ you don't have permission to use this command")
+            bot.reply_to(message, "❌ Permission Denied. Admin Only Command")
             return
         
         total_users = len(users_db)
         total_pools = len(announced_pools)
         total_chats = len(subscribed_chats)
         
-        stats_msg = f"📊 bot statistics\n\n━━━━━━━━━━━━━━━━━━━\ntotal users: {total_users}\nactive pools: {total_pools}\nsubscribed chats: {total_chats}\nstatus: ✅ running\n━━━━━━━━━━━━━━━━━━━"
+        stats_msg = f"📊 Bot Statistics\n\n👥 Total Users: {total_users}\n🔍 Active Pools: {total_pools}\n💬 Subscribed Chats: {total_chats}\n\n✅ Status: Running"
         bot.reply_to(message, stats_msg)
     except Exception as e:
         print(f"error in stats: {e}")
-        bot.reply_to(message, "error getting stats")
+        bot.reply_to(message, "Error Getting Stats")
 
 @bot.message_handler(commands=['broadcast'])
 def broadcast_command(message):
     try:
         if not is_admin(message.from_user.id):
-            bot.reply_to(message, "❌ you don't have permission to use this command")
+            bot.reply_to(message, "❌ Permission Denied. Admin Only Command")
             return
         
         args = message.text.split(maxsplit=1)
         
         if len(args) < 2:
-            bot.reply_to(message, "format: /broadcast your message here")
+            bot.reply_to(message, "Format: /broadcast Your Message Here")
             return
         
         broadcast_msg = args[1]
         broadcast_to_all(broadcast_msg)
-        bot.reply_to(message, f"message sent to {len(subscribed_chats)} chats")
+        bot.reply_to(message, f"📢 Message Sent To {len(subscribed_chats)} Chats")
     except Exception as e:
         print(f"error in broadcast: {e}")
-        bot.reply_to(message, "error broadcasting message")
+        bot.reply_to(message, "Error Broadcasting Message")
 
-print("starting bot...")
+print("Starting Bot...")
 monitor_thread = Thread(target=monitor_solana_pools, daemon=True)
 monitor_thread.start()
 
@@ -383,11 +383,11 @@ def run_flask():
     except Exception as e:
         print(f"error running flask: {e}")
 
-print("starting flask server...")
+print("Starting Flask Server...")
 flask_thread = FlaskThread(target=run_flask, daemon=True)
 flask_thread.start()
 
-print("bot is ready")
+print("Bot Is Ready")
 try:
     bot.infinity_polling()
 except Exception as e:
