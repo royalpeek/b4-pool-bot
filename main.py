@@ -6,7 +6,7 @@ from threading import Thread
 from datetime import datetime, timedelta
 import requests
 
-bot_token = "8698408538:AAH01ZNyMpN2kI8qb6f4mEoK6-ZPmfYPk_g"
+bot_token = os.getenv("BOT_TOKEN")
 bot = telebot.TeleBot(bot_token)
 
 subscribed_chats = {}
