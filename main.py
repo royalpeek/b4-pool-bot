@@ -6,7 +6,7 @@ from threading import Thread
 from datetime import datetime, timedelta
 import requests
 
-bot_token = "8698408538:AAH01ZNyMpN2kI8qb6f4mEoK6-ZPmfYPk_g"
+bot_token = os.getenv("BOT_TOKEN")
 bot = telebot.TeleBot(bot_token)
 
 subscribed_chats = {}
@@ -21,7 +21,7 @@ users_file = "users.json"
 SOLANA_PROGRAM_ID = "9XQDD38sy1qJ57DqAQvADuLRTjcYUXD48H7deyNuaehH"
 SOLANA_RPC = "https://api.mainnet-beta.solana.com"
 
-ADMIN_ID = 991875198
+ADMIN_ID = int(os.getenv("ADMIN_ID", 0)
 
 
 def load_data():
