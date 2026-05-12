@@ -151,6 +151,8 @@ def parse_transaction_for_pool(signature):
                         "create_time": create_time.isoformat(),
                         "end_time": end_time.isoformat(),
                         "block_time": block_time,
+                        "detected_at": time.time(),
+                        "notified_new": False,
                         "notified_1h": False,
                         "notified_5m": False,
                         "notified_ended": False
@@ -175,17 +177,9 @@ def monitor_solana_pools():
                         pool_data = parse_transaction_for_pool(signature)
                         
                         if pool_data:
-                            pool_id = pool_data["pool_id"]
-                            create_time = pool_data["create_time"]
-                            end_time = pool_data["end_time"]
-                            
-                            notification = f"🚀 NEW POOL LIVE\n\nPool ID: {pool_id}\nStatus: ACTIVE\nDuration: 24 Hours\nCreated: {create_time}\n\nStake now before this opportunity closes!"
-                            broadcast_to_all(notification)
-                            
                             announced_pools[signature] = pool_data
                             save_data()
-                            
-                            print(f"new pool detected: {pool_id}")
+                            print(f"pool detected (waiting 30 mins before notify): {pool_data['pool_id']}")
                 except Exception as e:
                     print(f"error processing transaction: {e}")
             
@@ -201,7 +195,21 @@ def check_scheduled_notifications():
     try:
         now = datetime.now()
         
-        for signature, pool_data in announced_pools.items():
+        # Check if pools are ready to be announced (30 minute delay)
+        for signature, pool_data in list(announced_pools.items()):
+            if not pool_data.get("notified_new"):
+                time_since_detection = time.time() - pool_data.get("detected_at", time.time())
+                if time_since_detection >= 1800:  # 30 minutes
+                    pool_id = pool_data["pool_id"]
+                    create_time = pool_data["create_time"]
+                    notification = f"🚀 NEW POOL LIVE\n\nPool ID: {pool_id}\nStatus: ACTIVE\nDuration: 24 Hours\nCreated: {create_time}\n\nStake now before this opportunity closes!"
+                    broadcast_to_all(notification)
+                    announced_pools[signature]["notified_new"] = True
+                    save_data()
+                    print(f"new pool notification sent: {pool_id}")
+        
+        # Check for 1 hour and 5 minute reminders
+        for signature, pool_data in list(announced_pools.items()):
             try:
                 end_time = datetime.fromisoformat(pool_data["end_time"])
                 pool_id = pool_data["pool_id"]
@@ -246,7 +254,7 @@ def get_my_id(message):
         bot.reply_to(message, reply)
     except Exception as e:
         print(f"error in getmyid: {e}")
-        bot.reply_to(message, "Error getting your ID")
+        bot.reply_to(message, "Error Getting Your ID")
 
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
@@ -262,7 +270,7 @@ def send_welcome(message):
         save_user(message)
         save_data()
         
-        welcome_msg = "🚀 Welcome To B4 Pool Alerts\n\nI Monitor B4 Pool In Real-Time\n\n📢 You Will Receive Notifications For:\n\n🎯 New Pools Launching\n⏰ 1 Hour Before Pool Closes\n⏲️ 5 Minutes Before Pool Closes\n💰 Pool Closure & Reward Distribution\n\n✅ You Are Now Subscribed\n\nSit Back And Receive Alerts!"
+        welcome_msg = "🚀 Welcome To B4 Pool Alerts\n\nI Monitor B4 Pools In Real-Time\n\n📢 You Will Receive Notifications For:\n\n🎯 New Pools Launching\n⏰ 1 Hour Before Pool Closes\n⏲️ 5 Minutes Before Pool Closes\n💰 Pool Closure & Reward Distribution\n\n✅ You Are Now Subscribed\n\nSit Back And Receive Alerts!"
         bot.reply_to(message, welcome_msg)
     except Exception as e:
         print(f"error in start: {e}")
