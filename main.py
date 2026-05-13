@@ -3,8 +3,7 @@ import json
 import os
 import time
 import logging
-import psycopg2
-import psycopg2.extras
+import psycopg
 from threading import Thread
 from datetime import datetime
 import requests
@@ -24,50 +23,43 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 
 
 def get_db():
-    conn = psycopg2.connect(DATABASE_URL, sslmode='require')
+    conn = psycopg.connect(DATABASE_URL)
     return conn
 
 
 def init_db():
     try:
-        conn = get_db()
-        cur = conn.cursor()
-
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS subscribed_chats (
-                chat_id TEXT PRIMARY KEY,
-                chat_name TEXT,
-                created_at TIMESTAMP DEFAULT NOW()
-            )
-        """)
-
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id TEXT PRIMARY KEY,
-                username TEXT,
-                first_name TEXT,
-                join_date TEXT,
-                is_admin BOOLEAN DEFAULT FALSE
-            )
-        """)
-
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS announced_markets (
-                market_id TEXT PRIMARY KEY,
-                title TEXT,
-                theme TEXT,
-                end_time TEXT,
-                notified_new BOOLEAN DEFAULT FALSE,
-                notified_1h BOOLEAN DEFAULT FALSE,
-                notified_5m BOOLEAN DEFAULT FALSE,
-                notified_ended BOOLEAN DEFAULT FALSE,
-                detected_at TEXT
-            )
-        """)
-
-        conn.commit()
-        cur.close()
-        conn.close()
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS subscribed_chats (
+                        chat_id TEXT PRIMARY KEY,
+                        chat_name TEXT,
+                        created_at TIMESTAMP DEFAULT NOW()
+                    )
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS users (
+                        user_id TEXT PRIMARY KEY,
+                        username TEXT,
+                        first_name TEXT,
+                        join_date TEXT,
+                        is_admin BOOLEAN DEFAULT FALSE
+                    )
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS announced_markets (
+                        market_id TEXT PRIMARY KEY,
+                        title TEXT,
+                        theme TEXT,
+                        end_time TEXT,
+                        notified_new BOOLEAN DEFAULT FALSE,
+                        notified_1h BOOLEAN DEFAULT FALSE,
+                        notified_5m BOOLEAN DEFAULT FALSE,
+                        notified_ended BOOLEAN DEFAULT FALSE,
+                        detected_at TEXT
+                    )
+                """)
         logger.info("database tables ready")
     except Exception as e:
         logger.error(f"error initialising database: {e}")
@@ -83,63 +75,52 @@ def is_admin(user_id):
 def save_user(message):
     try:
         user_id = str(message.from_user.id)
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO users (user_id, username, first_name, join_date, is_admin)
-            VALUES (%s, %s, %s, %s, %s)
-            ON CONFLICT (user_id) DO NOTHING
-        """, (
-            user_id,
-            message.from_user.username or "No Username",
-            message.from_user.first_name or "No Name",
-            datetime.now().isoformat(),
-            is_admin(message.from_user.id)
-        ))
-        conn.commit()
-        cur.close()
-        conn.close()
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO users (user_id, username, first_name, join_date, is_admin)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (user_id) DO NOTHING
+                """, (
+                    user_id,
+                    message.from_user.username or "No Username",
+                    message.from_user.first_name or "No Name",
+                    datetime.now().isoformat(),
+                    is_admin(message.from_user.id)
+                ))
     except Exception as e:
         logger.error(f"error saving user: {e}")
 
 
 def add_chat(chat_id, chat_name):
     try:
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO subscribed_chats (chat_id, chat_name)
-            VALUES (%s, %s)
-            ON CONFLICT (chat_id) DO NOTHING
-        """, (str(chat_id), chat_name))
-        conn.commit()
-        cur.close()
-        conn.close()
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO subscribed_chats (chat_id, chat_name)
+                    VALUES (%s, %s)
+                    ON CONFLICT (chat_id) DO NOTHING
+                """, (str(chat_id), chat_name))
     except Exception as e:
         logger.error(f"error adding chat: {e}")
 
 
 def remove_chat(chat_id):
     try:
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute("DELETE FROM subscribed_chats WHERE chat_id = %s", (str(chat_id),))
-        conn.commit()
-        cur.close()
-        conn.close()
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM subscribed_chats WHERE chat_id = %s", (str(chat_id),))
     except Exception as e:
         logger.error(f"error removing chat: {e}")
 
 
 def get_all_chats():
     try:
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute("SELECT chat_id FROM subscribed_chats")
-        rows = cur.fetchall()
-        cur.close()
-        conn.close()
-        return [row[0] for row in rows]
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT chat_id FROM subscribed_chats")
+                rows = cur.fetchall()
+                return [row[0] for row in rows]
     except Exception as e:
         logger.error(f"error fetching chats: {e}")
         return []
@@ -147,13 +128,10 @@ def get_all_chats():
 
 def get_all_users():
     try:
-        conn = get_db()
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute("SELECT * FROM users")
-        rows = cur.fetchall()
-        cur.close()
-        conn.close()
-        return rows
+        with get_db() as conn:
+            with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
+                cur.execute("SELECT * FROM users")
+                return cur.fetchall()
     except Exception as e:
         logger.error(f"error fetching users: {e}")
         return []
@@ -161,13 +139,10 @@ def get_all_users():
 
 def get_announced_market(market_id):
     try:
-        conn = get_db()
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute("SELECT * FROM announced_markets WHERE market_id = %s", (str(market_id),))
-        row = cur.fetchone()
-        cur.close()
-        conn.close()
-        return row
+        with get_db() as conn:
+            with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
+                cur.execute("SELECT * FROM announced_markets WHERE market_id = %s", (str(market_id),))
+                return cur.fetchone()
     except Exception as e:
         logger.error(f"error fetching market {market_id}: {e}")
         return None
@@ -175,41 +150,32 @@ def get_announced_market(market_id):
 
 def save_announced_market(market_id, title, theme, end_time):
     try:
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO announced_markets (market_id, title, theme, end_time, notified_new, notified_1h, notified_5m, notified_ended, detected_at)
-            VALUES (%s, %s, %s, %s, TRUE, FALSE, FALSE, FALSE, %s)
-            ON CONFLICT (market_id) DO NOTHING
-        """, (str(market_id), title, theme, end_time, datetime.now().isoformat()))
-        conn.commit()
-        cur.close()
-        conn.close()
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO announced_markets (market_id, title, theme, end_time, notified_new, notified_1h, notified_5m, notified_ended, detected_at)
+                    VALUES (%s, %s, %s, %s, TRUE, FALSE, FALSE, FALSE, %s)
+                    ON CONFLICT (market_id) DO NOTHING
+                """, (str(market_id), title, theme, end_time, datetime.now().isoformat()))
     except Exception as e:
         logger.error(f"error saving market {market_id}: {e}")
 
 
 def update_market_flag(market_id, flag):
     try:
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute(f"UPDATE announced_markets SET {flag} = TRUE WHERE market_id = %s", (str(market_id),))
-        conn.commit()
-        cur.close()
-        conn.close()
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(f"UPDATE announced_markets SET {flag} = TRUE WHERE market_id = %s", (str(market_id),))
     except Exception as e:
         logger.error(f"error updating flag {flag} for market {market_id}: {e}")
 
 
 def get_all_announced_markets():
     try:
-        conn = get_db()
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute("SELECT * FROM announced_markets")
-        rows = cur.fetchall()
-        cur.close()
-        conn.close()
-        return rows
+        with get_db() as conn:
+            with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
+                cur.execute("SELECT * FROM announced_markets")
+                return cur.fetchall()
     except Exception as e:
         logger.error(f"error fetching all markets: {e}")
         return []
