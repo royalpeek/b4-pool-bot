@@ -21,6 +21,8 @@ B4_API_URL = "https://b4app.xyz/api/markets"
 ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
 DATABASE_URL = os.getenv("DATABASE_URL")
 
+recently_announced = set()
+
 
 def get_db():
     conn = psycopg.connect(DATABASE_URL)
@@ -214,7 +216,7 @@ def get_market_messages(market_id):
         return []
 
 
-def delete_market_messages(market_id):
+def delete_market_messages_from_db(market_id):
     try:
         with get_db() as conn:
             with conn.cursor() as cur:
@@ -263,10 +265,22 @@ def delete_all_market_messages(market_id):
                 logger.error(f"error deleting message {message_id} in chat {chat_id}: {e}")
                 failed += 1
 
-        delete_market_messages(market_id)
+        delete_market_messages_from_db(market_id)
         logger.info(f"deleted {deleted} messages for market {market_id}, {failed} failed")
     except Exception as e:
         logger.error(f"error in delete_all_market_messages: {e}")
+
+
+def schedule_message_deletion(market_id, title):
+    def delete_after_delay():
+        logger.info(f"waiting 10 minutes before deleting messages for: {title}")
+        time.sleep(600)
+        logger.info(f"deleting messages for market: {title}")
+        delete_all_market_messages(market_id)
+        update_market_flag(market_id, "delete_scheduled")
+
+    delete_thread = Thread(target=delete_after_delay, daemon=True)
+    delete_thread.start()
 
 
 def fetch_b4_markets():
@@ -338,18 +352,6 @@ def format_theme(theme):
     return theme_map.get(theme, f"💬 {theme.title()}" if theme else "💬 General")
 
 
-def schedule_message_deletion(market_id, title):
-    def delete_after_delay():
-        logger.info(f"waiting 10 minutes before deleting messages for: {title}")
-        time.sleep(600)
-        logger.info(f"deleting messages for market: {title}")
-        delete_all_market_messages(market_id)
-        update_market_flag(market_id, "delete_scheduled")
-
-    delete_thread = Thread(target=delete_after_delay, daemon=True)
-    delete_thread.start()
-
-
 def monitor_b4_markets():
     logger.info("b4 market monitoring thread started")
     while True:
@@ -370,6 +372,9 @@ def monitor_b4_markets():
                     if not is_market_active(market):
                         continue
 
+                    if market_id in recently_announced:
+                        continue
+
                     existing = get_announced_market(market_id)
                     if not existing:
                         title = str(market.get("title", "")).strip()
@@ -377,6 +382,8 @@ def monitor_b4_markets():
                         end_time_unix = market.get("end_time")
                         end_time = datetime.fromtimestamp(int(end_time_unix))
                         end_time_str = end_time.strftime('%b %d, %Y at %I:%M %p')
+
+                        recently_announced.add(market_id)
 
                         notification = (
                             f"🚀 NEW MARKET LIVE\n\n"
