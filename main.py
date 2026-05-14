@@ -57,7 +57,17 @@ def init_db():
                         notified_1h BOOLEAN DEFAULT FALSE,
                         notified_5m BOOLEAN DEFAULT FALSE,
                         notified_ended BOOLEAN DEFAULT FALSE,
+                        delete_scheduled BOOLEAN DEFAULT FALSE,
                         detected_at TEXT
+                    )
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS market_messages (
+                        id SERIAL PRIMARY KEY,
+                        market_id TEXT,
+                        chat_id TEXT,
+                        message_id INTEGER,
+                        created_at TIMESTAMP DEFAULT NOW()
                     )
                 """)
         logger.info("database tables ready")
@@ -153,8 +163,8 @@ def save_announced_market(market_id, title, theme, end_time):
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
-                    INSERT INTO announced_markets (market_id, title, theme, end_time, notified_new, notified_1h, notified_5m, notified_ended, detected_at)
-                    VALUES (%s, %s, %s, %s, TRUE, FALSE, FALSE, FALSE, %s)
+                    INSERT INTO announced_markets (market_id, title, theme, end_time, notified_new, notified_1h, notified_5m, notified_ended, delete_scheduled, detected_at)
+                    VALUES (%s, %s, %s, %s, TRUE, FALSE, FALSE, FALSE, FALSE, %s)
                     ON CONFLICT (market_id) DO NOTHING
                 """, (str(market_id), title, theme, end_time, datetime.now().isoformat()))
     except Exception as e:
@@ -181,15 +191,49 @@ def get_all_announced_markets():
         return []
 
 
-def broadcast_to_all(message_text):
+def save_message_id(market_id, chat_id, message_id):
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO market_messages (market_id, chat_id, message_id)
+                    VALUES (%s, %s, %s)
+                """, (str(market_id), str(chat_id), message_id))
+    except Exception as e:
+        logger.error(f"error saving message id: {e}")
+
+
+def get_market_messages(market_id):
+    try:
+        with get_db() as conn:
+            with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
+                cur.execute("SELECT * FROM market_messages WHERE market_id = %s", (str(market_id),))
+                return cur.fetchall()
+    except Exception as e:
+        logger.error(f"error fetching messages for market {market_id}: {e}")
+        return []
+
+
+def delete_market_messages(market_id):
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM market_messages WHERE market_id = %s", (str(market_id),))
+    except Exception as e:
+        logger.error(f"error deleting messages for market {market_id}: {e}")
+
+
+def broadcast_to_all(message_text, market_id=None):
     try:
         chats = get_all_chats()
         failed = []
         sent = 0
         for chat_id in chats:
             try:
-                bot.send_message(int(chat_id), message_text)
+                sent_msg = bot.send_message(int(chat_id), message_text)
                 sent += 1
+                if market_id:
+                    save_message_id(market_id, chat_id, sent_msg.message_id)
             except Exception as e:
                 logger.error(f"error sending to {chat_id}: {e}")
                 failed.append(chat_id)
@@ -200,6 +244,29 @@ def broadcast_to_all(message_text):
         logger.info(f"broadcast sent to {sent} chats, {len(failed)} failed")
     except Exception as e:
         logger.error(f"error in broadcast_to_all: {e}")
+
+
+def delete_all_market_messages(market_id):
+    try:
+        messages = get_market_messages(market_id)
+        deleted = 0
+        failed = 0
+
+        for msg in messages:
+            chat_id = int(msg["chat_id"])
+            message_id = msg["message_id"]
+            try:
+                bot.delete_message(chat_id, message_id)
+                deleted += 1
+                time.sleep(0.1)
+            except Exception as e:
+                logger.error(f"error deleting message {message_id} in chat {chat_id}: {e}")
+                failed += 1
+
+        delete_market_messages(market_id)
+        logger.info(f"deleted {deleted} messages for market {market_id}, {failed} failed")
+    except Exception as e:
+        logger.error(f"error in delete_all_market_messages: {e}")
 
 
 def fetch_b4_markets():
@@ -225,17 +292,14 @@ def fetch_b4_markets():
 def is_valid_market(market):
     market_id = str(market.get("market_id", "")).strip()
     if not market_id:
-        logger.warning("skipped market: missing market_id")
         return False
 
     title = str(market.get("title", "")).strip()
     if not title:
-        logger.warning(f"skipped market {market_id}: blank or missing title")
         return False
 
     end_time_unix = market.get("end_time")
     if not end_time_unix or not isinstance(end_time_unix, (int, float)) or int(end_time_unix) <= 0:
-        logger.warning(f"skipped market {market_id}: invalid end_time ({end_time_unix})")
         return False
 
     return True
@@ -274,6 +338,18 @@ def format_theme(theme):
     return theme_map.get(theme, f"💬 {theme.title()}" if theme else "💬 General")
 
 
+def schedule_message_deletion(market_id, title):
+    def delete_after_delay():
+        logger.info(f"waiting 10 minutes before deleting messages for: {title}")
+        time.sleep(600)
+        logger.info(f"deleting messages for market: {title}")
+        delete_all_market_messages(market_id)
+        update_market_flag(market_id, "delete_scheduled")
+
+    delete_thread = Thread(target=delete_after_delay, daemon=True)
+    delete_thread.start()
+
+
 def monitor_b4_markets():
     logger.info("b4 market monitoring thread started")
     while True:
@@ -286,7 +362,6 @@ def monitor_b4_markets():
                     market_id = str(market.get("market_id", "")).strip()
 
                     if not market_id:
-                        logger.warning("skipped market: missing market_id")
                         continue
 
                     if not is_valid_market(market):
@@ -311,7 +386,7 @@ def monitor_b4_markets():
                             f"Stake Now And Earn Rewards!"
                         )
 
-                        broadcast_to_all(notification)
+                        broadcast_to_all(notification, market_id)
                         save_announced_market(market_id, title, theme, end_time.isoformat())
                         logger.info(f"new market announced: {title}")
 
@@ -336,18 +411,12 @@ def check_scheduled_notifications():
                 market_id = market_data["market_id"]
 
                 if market_data.get("notified_ended"):
-                    logger.info(f"skipped {market_data.get('title', market_id)}: already sent ended notification")
                     continue
 
                 end_time_str = market_data.get("end_time")
                 title = market_data.get("title", "").strip()
 
-                if not end_time_str:
-                    logger.warning(f"skipped market {market_id}: missing end_time in db")
-                    continue
-
-                if not title:
-                    logger.warning(f"skipped market {market_id}: blank title in db")
+                if not end_time_str or not title:
                     continue
 
                 end_time = datetime.fromisoformat(end_time_str)
@@ -365,7 +434,7 @@ def check_scheduled_notifications():
                             f"⏳ Time Remaining: {mins_left} Minutes\n\n"
                             f"This Is Your Last Chance To Stake!"
                         )
-                        broadcast_to_all(notification)
+                        broadcast_to_all(notification, market_id)
                         update_market_flag(market_id, "notified_1h")
                         logger.info(f"1 hour reminder sent for: {title}")
 
@@ -376,21 +445,22 @@ def check_scheduled_notifications():
                             f"⏳ Time Remaining: 5 Minutes\n\n"
                             f"Act Now Or Lose This Opportunity!"
                         )
-                        broadcast_to_all(notification)
+                        broadcast_to_all(notification, market_id)
                         update_market_flag(market_id, "notified_5m")
                         logger.info(f"5 minute reminder sent for: {title}")
 
                 else:
-                    if not market_data.get("notified_ended"):
-                        notification = (
-                            f"✅ MARKET CLOSED\n\n"
-                            f"📌 {title}\n\n"
-                            f"💰 Reward Distribution In Progress\n"
-                            f"Check Your Wallet For Returns!"
-                        )
-                        broadcast_to_all(notification)
-                        update_market_flag(market_id, "notified_ended")
-                        logger.info(f"ended notification sent for: {title}")
+                    notification = (
+                        f"✅ MARKET CLOSED\n\n"
+                        f"📌 {title}\n\n"
+                        f"💰 Reward Distribution In Progress\n"
+                        f"Check Your Wallet For Returns!\n\n"
+                        f"🗑️ This message will be deleted in 10 minutes"
+                    )
+                    broadcast_to_all(notification, market_id)
+                    update_market_flag(market_id, "notified_ended")
+                    logger.info(f"ended notification sent for: {title}")
+                    schedule_message_deletion(market_id, title)
 
             except Exception as e:
                 logger.error(f"error checking notification for market {market_id}: {e}")
@@ -473,6 +543,7 @@ def send_help(message):
             "❓ What I Do:\n\n"
             "I Continuously Monitor B4 Markets And Send "
             "Real-Time Notifications At Critical Moments.\n\n"
+            "Messages Are Auto-Deleted 10 Minutes After Market Closes.\n\n"
             "Never Miss A Market Opportunity!"
         )
         bot.reply_to(message, help_text)
