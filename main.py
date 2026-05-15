@@ -371,12 +371,16 @@ def monitor_b4_markets():
                         continue
 
                     if not is_valid_market(market):
+                        logger.warning(f"skipped {market_id}: failed validation")
                         continue
 
                     if not is_market_active(market):
+                        end_time_unix = market.get("end_time")
+                        logger.warning(f"skipped {market_id}: market not active (end_time: {end_time_unix}, resolved: {market.get('resolved')}, hidden: {market.get('hidden')})")
                         continue
 
                     if market_id in recently_announced:
+                        logger.warning(f"skipped {market_id}: already announced recently")
                         continue
 
                     existing = get_announced_market(market_id)
