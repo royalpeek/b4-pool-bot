@@ -695,13 +695,37 @@ def reset_notifications(message):
             bot.reply_to(message, "❌ Permission Denied. Admin Only Command")
             return
 
+        # first get all messages before deleting
+        messages_to_delete = get_market_messages("") if hasattr(get_market_messages, '__call__') else []
+        
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM market_messages")
+                messages_to_delete = cur.fetchall()
+        
+        deleted_count = 0
+        failed_count = 0
+        
+        # delete each message from telegram
+        for msg in messages_to_delete:
+            try:
+                chat_id = int(msg[2])  # chat_id is at index 2
+                message_id = int(msg[3])  # message_id is at index 3
+                bot.delete_message(chat_id, message_id)
+                deleted_count += 1
+                time.sleep(0.05)
+            except Exception as e:
+                logger.error(f"error deleting message {msg[3]} from chat {msg[2]}: {e}")
+                failed_count += 1
+        
+        # clear database
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute("DELETE FROM announced_markets")
                 cur.execute("DELETE FROM market_messages")
         
-        bot.reply_to(message, "✅ All markets and messages cleared. Bot will start fresh.")
-        logger.info("notifications reset by admin")
+        bot.reply_to(message, f"✅ Reset Complete\n\n🗑️ Deleted {deleted_count} messages\n❌ Failed: {failed_count}\n\nBot will start fresh.")
+        logger.info(f"notifications reset by admin - deleted {deleted_count} messages, {failed_count} failed")
     except Exception as e:
         logger.error(f"error in reset: {e}")
         bot.reply_to(message, f"❌ Error: {e}")
