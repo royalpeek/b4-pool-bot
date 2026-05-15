@@ -25,7 +25,7 @@ recently_announced = set()
 
 
 def now_utc():
-    return datetime.utcnow()
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 def get_db():
@@ -333,7 +333,7 @@ def is_market_active(market):
 
         end_time_unix = market.get("end_time")
         if end_time_unix:
-            end_time = datetime.utcfromtimestamp(int(end_time_unix))
+            end_time = datetime.fromtimestamp(int(end_time_unix), tz=timezone.utc).replace(tzinfo=None)
             if now_utc() > end_time:
                 return False
 
@@ -388,7 +388,7 @@ def monitor_b4_markets():
                         title = str(market.get("title", "")).strip()
                         theme = format_theme(market.get("theme", "other"))
                         end_time_unix = market.get("end_time")
-                        end_time = datetime.utcfromtimestamp(int(end_time_unix))
+                        end_time = datetime.fromtimestamp(int(end_time_unix), tz=timezone.utc).replace(tzinfo=None)
                         end_time_str = end_time.strftime('%b %d, %Y at %I:%M %p UTC')
 
                         recently_announced.add(market_id)
@@ -418,7 +418,7 @@ def monitor_b4_markets():
 
 def check_scheduled_notifications():
     try:
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
         markets = get_all_announced_markets()
 
         for market_data in markets:
@@ -487,7 +487,7 @@ def check_scheduled_notifications():
 
 
 def get_ending_soon_markets():
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     ending_soon = []
     markets = get_all_announced_markets()
 
