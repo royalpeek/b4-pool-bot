@@ -1,3 +1,4 @@
+print("NEW DEPLOY VERSION")
 import telebot
 import json
 import os
