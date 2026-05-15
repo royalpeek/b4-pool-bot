@@ -21,6 +21,7 @@ bot = telebot.TeleBot(bot_token)
 B4_API_URL = "https://b4app.xyz/api/markets"
 ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
 DATABASE_URL = os.getenv("DATABASE_URL")
+NOTIFICATIONS_PAUSED = False
 
 
 def now_utc():
@@ -362,6 +363,11 @@ def monitor_b4_markets():
     logger.info("b4 market monitoring thread started")
     while True:
         try:
+            if NOTIFICATIONS_PAUSED:
+                logger.info("notifications paused, skipping check")
+                time.sleep(10)
+                continue
+            
             markets = fetch_b4_markets()
             logger.info(f"processing {len(markets)} markets")
 
@@ -728,6 +734,57 @@ def reset_notifications(message):
         logger.info(f"notifications reset by admin - deleted {deleted_count} messages, {failed_count} failed")
     except Exception as e:
         logger.error(f"error in reset: {e}")
+        bot.reply_to(message, f"❌ Error: {e}")
+
+
+@bot.message_handler(commands=['pause'])
+def pause_notifications(message):
+    try:
+        if not is_admin(message.from_user.id):
+            bot.reply_to(message, "❌ Permission Denied. Admin Only Command")
+            return
+        
+        global NOTIFICATIONS_PAUSED
+        NOTIFICATIONS_PAUSED = True
+        bot.reply_to(message, "⏸️ Notifications PAUSED\n\nNo more market alerts will be sent until you /resume")
+        logger.info("notifications paused by admin")
+    except Exception as e:
+        logger.error(f"error in pause: {e}")
+
+
+@bot.message_handler(commands=['resume'])
+def resume_notifications(message):
+    try:
+        if not is_admin(message.from_user.id):
+            bot.reply_to(message, "❌ Permission Denied. Admin Only Command")
+            return
+        
+        global NOTIFICATIONS_PAUSED
+        NOTIFICATIONS_PAUSED = False
+        bot.reply_to(message, "▶️ Notifications RESUMED\n\nMarket alerts are now active again")
+        logger.info("notifications resumed by admin")
+    except Exception as e:
+        logger.error(f"error in resume: {e}")
+
+
+@bot.message_handler(commands=['test'])
+def test_notification(message):
+    try:
+        if not is_admin(message.from_user.id):
+            bot.reply_to(message, "❌ Permission Denied. Admin Only Command")
+            return
+        
+        test_msg = (
+            "🧪 TEST NOTIFICATION\n\n"
+            "If you see this, the bot is working correctly.\n\n"
+            "✅ Bot Status: Operational\n"
+            "✅ Notifications: Ready\n\n"
+            "Safe to /resume notifications to all users"
+        )
+        bot.send_message(message.chat.id, test_msg)
+        logger.info("test notification sent to admin")
+    except Exception as e:
+        logger.error(f"error in test: {e}")
         bot.reply_to(message, f"❌ Error: {e}")
 
 
