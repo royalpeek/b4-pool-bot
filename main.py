@@ -688,6 +688,25 @@ def broadcast_command(message):
         logger.error(f"error in broadcast: {e}")
 
 
+@bot.message_handler(commands=['reset'])
+def reset_notifications(message):
+    try:
+        if not is_admin(message.from_user.id):
+            bot.reply_to(message, "❌ Permission Denied. Admin Only Command")
+            return
+
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM announced_markets")
+                cur.execute("DELETE FROM market_messages")
+        
+        bot.reply_to(message, "✅ All markets and messages cleared. Bot will start fresh.")
+        logger.info("notifications reset by admin")
+    except Exception as e:
+        logger.error(f"error in reset: {e}")
+        bot.reply_to(message, f"❌ Error: {e}")
+
+
 logger.info("Starting Bot...")
 init_db()
 
