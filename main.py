@@ -378,9 +378,6 @@ def monitor_b4_markets():
                         logger.warning(f"skipped {market_id}: market not active (end_time: {end_time_unix}, resolved: {market.get('resolved')}, hidden: {market.get('hidden')})")
                         continue
 
-                    if market_id in recently_announced:
-                        logger.warning(f"skipped {market_id}: already announced recently")
-                        continue
 
                     existing = get_announced_market(market_id)
                     if not existing:
@@ -389,8 +386,6 @@ def monitor_b4_markets():
                         end_time_unix = market.get("end_time")
                         end_time = datetime.fromtimestamp(int(end_time_unix), tz=timezone.utc).replace(tzinfo=None)
                         end_time_str = end_time.strftime('%b %d, %Y at %I:%M %p UTC')
-
-                        recently_announced.add(market_id)
 
                         notification = (
                             f"🚀 NEW MARKET LIVE\n\n"
