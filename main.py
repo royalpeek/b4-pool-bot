@@ -791,6 +791,27 @@ def test_notification(message):
 logger.info("Starting Bot...")
 init_db()
 
+# Register bot commands
+try:
+    bot.set_my_commands([
+        telebot.types.BotCommand("start", "Subscribe to market alerts"),
+        telebot.types.BotCommand("help", "Show available commands"),
+        telebot.types.BotCommand("status", "Check bot status"),
+        telebot.types.BotCommand("liveending", "Show markets ending soon"),
+        telebot.types.BotCommand("getmyid", "Get your telegram id"),
+        telebot.types.BotCommand("pause", "⚠️ ADMIN: Pause all notifications"),
+        telebot.types.BotCommand("resume", "▶️ ADMIN: Resume notifications"),
+        telebot.types.BotCommand("test", "🧪 ADMIN: Send test notification"),
+        telebot.types.BotCommand("reset", "🔄 ADMIN: Reset all data"),
+        telebot.types.BotCommand("broadcast", "📢 ADMIN: Broadcast message"),
+        telebot.types.BotCommand("stats", "📊 ADMIN: Show bot statistics"),
+        telebot.types.BotCommand("users", "👥 ADMIN: Show user count"),
+        telebot.types.BotCommand("listusers", "📋 ADMIN: List all users"),
+    ])
+    logger.info("bot commands registered")
+except Exception as e:
+    logger.error(f"error registering commands: {e}")
+
 monitor_thread = Thread(target=monitor_b4_markets, daemon=True)
 monitor_thread.start()
 
