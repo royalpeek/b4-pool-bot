@@ -794,16 +794,18 @@ init_db()
 # Register bot commands
 try:
     # Public commands for everyone
-    bot.set_my_commands([
+    public_commands = [
         telebot.types.BotCommand("start", "Subscribe to market alerts"),
         telebot.types.BotCommand("help", "Show available commands"),
         telebot.types.BotCommand("status", "Check bot status"),
         telebot.types.BotCommand("liveending", "Show markets ending soon"),
         telebot.types.BotCommand("getmyid", "Get your telegram id"),
-    ])
+    ]
     
-    # Admin commands - only show for admin user
-    admin_commands = [
+    bot.set_my_commands(public_commands)
+    
+    # Admin commands - show for admin user PLUS the public ones
+    admin_commands = public_commands + [
         telebot.types.BotCommand("pause", "Pause all notifications"),
         telebot.types.BotCommand("resume", "Resume notifications"),
         telebot.types.BotCommand("test", "Send test notification"),
