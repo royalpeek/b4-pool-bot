@@ -52,22 +52,23 @@ def init_db():
                         is_admin BOOLEAN DEFAULT FALSE
                     )
                 """)
+                
                 cur.execute("DROP TABLE IF EXISTS announced_markets")
 
-cur.execute("""
-    CREATE TABLE IF NOT EXISTS announced_markets (
-        market_id TEXT PRIMARY KEY,
-        title TEXT,
-        theme TEXT,
-        end_time TEXT,
-        notified_new BOOLEAN DEFAULT FALSE,
-        notified_1h BOOLEAN DEFAULT FALSE,
-        notified_5m BOOLEAN DEFAULT FALSE,
-        notified_ended BOOLEAN DEFAULT FALSE,
-        delete_scheduled BOOLEAN DEFAULT FALSE,
-        detected_at TEXT
-    )
-""")
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS announced_markets (
+                        market_id TEXT PRIMARY KEY,
+                        title TEXT,
+                        theme TEXT,
+                        end_time TEXT,
+                        notified_new BOOLEAN DEFAULT FALSE,
+                        notified_1h BOOLEAN DEFAULT FALSE,
+                        notified_5m BOOLEAN DEFAULT FALSE,
+                        notified_ended BOOLEAN DEFAULT FALSE,
+                        delete_scheduled BOOLEAN DEFAULT FALSE,
+                        detected_at TEXT
+                    )
+                """)
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS market_messages (
                         id SERIAL PRIMARY KEY,
@@ -379,7 +380,6 @@ def monitor_b4_markets():
                         end_time_unix = market.get("end_time")
                         logger.warning(f"skipped {market_id}: market not active (end_time: {end_time_unix}, resolved: {market.get('resolved')}, hidden: {market.get('hidden')})")
                         continue
-
 
                     existing = get_announced_market(market_id)
                     if not existing:
