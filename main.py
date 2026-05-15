@@ -21,8 +21,6 @@ B4_API_URL = "https://b4app.xyz/api/markets"
 ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-recently_announced = set()
-
 
 def now_utc():
     return datetime.now(timezone.utc).replace(tzinfo=None)
