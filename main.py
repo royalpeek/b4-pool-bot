@@ -793,21 +793,32 @@ init_db()
 
 # Register bot commands
 try:
+    # Public commands for everyone
     bot.set_my_commands([
         telebot.types.BotCommand("start", "Subscribe to market alerts"),
         telebot.types.BotCommand("help", "Show available commands"),
         telebot.types.BotCommand("status", "Check bot status"),
         telebot.types.BotCommand("liveending", "Show markets ending soon"),
         telebot.types.BotCommand("getmyid", "Get your telegram id"),
-        telebot.types.BotCommand("pause", "⚠️ ADMIN: Pause all notifications"),
-        telebot.types.BotCommand("resume", "▶️ ADMIN: Resume notifications"),
-        telebot.types.BotCommand("test", "🧪 ADMIN: Send test notification"),
-        telebot.types.BotCommand("reset", "🔄 ADMIN: Reset all data"),
-        telebot.types.BotCommand("broadcast", "📢 ADMIN: Broadcast message"),
-        telebot.types.BotCommand("stats", "📊 ADMIN: Show bot statistics"),
-        telebot.types.BotCommand("users", "👥 ADMIN: Show user count"),
-        telebot.types.BotCommand("listusers", "📋 ADMIN: List all users"),
     ])
+    
+    # Admin commands - only show for admin user
+    admin_commands = [
+        telebot.types.BotCommand("pause", "Pause all notifications"),
+        telebot.types.BotCommand("resume", "Resume notifications"),
+        telebot.types.BotCommand("test", "Send test notification"),
+        telebot.types.BotCommand("reset", "Reset all data"),
+        telebot.types.BotCommand("broadcast", "Broadcast message"),
+        telebot.types.BotCommand("stats", "Show bot statistics"),
+        telebot.types.BotCommand("users", "Show user count"),
+        telebot.types.BotCommand("listusers", "List all users"),
+    ]
+    
+    # Set admin commands for the admin user
+    if ADMIN_ID and ADMIN_ID != 0:
+        scope = telebot.types.BotCommandScopeChat(chat_id=ADMIN_ID)
+        bot.set_my_commands(admin_commands, scope=scope)
+    
     logger.info("bot commands registered")
 except Exception as e:
     logger.error(f"error registering commands: {e}")
