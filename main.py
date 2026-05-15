@@ -25,7 +25,7 @@ recently_announced = set()
 
 
 def now_utc():
-    return datetime.now(timezone.utc).replace(tzinfo=None)
+    return datetime.utcnow()
 
 
 def get_db():
@@ -414,7 +414,7 @@ def monitor_b4_markets():
 
 def check_scheduled_notifications():
     try:
-        now = now_utc()
+        now = datetime.utcnow()
         markets = get_all_announced_markets()
 
         for market_data in markets:
@@ -483,7 +483,7 @@ def check_scheduled_notifications():
 
 
 def get_ending_soon_markets():
-    now = now_utc()
+    now = datetime.utcnow()
     ending_soon = []
     markets = get_all_announced_markets()
 
