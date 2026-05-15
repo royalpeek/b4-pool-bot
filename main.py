@@ -52,20 +52,22 @@ def init_db():
                         is_admin BOOLEAN DEFAULT FALSE
                     )
                 """)
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS announced_markets (
-                        market_id TEXT PRIMARY KEY,
-                        title TEXT,
-                        theme TEXT,
-                        end_time TEXT,
-                        notified_new BOOLEAN DEFAULT FALSE,
-                        notified_1h BOOLEAN DEFAULT FALSE,
-                        notified_5m BOOLEAN DEFAULT FALSE,
-                        notified_ended BOOLEAN DEFAULT FALSE,
-                        delete_scheduled BOOLEAN DEFAULT FALSE,
-                        detected_at TEXT
-                    )
-                """)
+                cur.execute("DROP TABLE IF EXISTS announced_markets")
+
+cur.execute("""
+    CREATE TABLE IF NOT EXISTS announced_markets (
+        market_id TEXT PRIMARY KEY,
+        title TEXT,
+        theme TEXT,
+        end_time TEXT,
+        notified_new BOOLEAN DEFAULT FALSE,
+        notified_1h BOOLEAN DEFAULT FALSE,
+        notified_5m BOOLEAN DEFAULT FALSE,
+        notified_ended BOOLEAN DEFAULT FALSE,
+        delete_scheduled BOOLEAN DEFAULT FALSE,
+        detected_at TEXT
+    )
+""")
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS market_messages (
                         id SERIAL PRIMARY KEY,
