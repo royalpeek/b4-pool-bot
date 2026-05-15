@@ -5,7 +5,7 @@ import time
 import logging
 import psycopg
 from threading import Thread
-from datetime import datetime
+from datetime import datetime, timezone
 import requests
 
 logging.basicConfig(
@@ -22,6 +22,10 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 recently_announced = set()
+
+
+def now_utc():
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 def get_db():
@@ -97,7 +101,7 @@ def save_user(message):
                     user_id,
                     message.from_user.username or "No Username",
                     message.from_user.first_name or "No Name",
-                    datetime.now().isoformat(),
+                    now_utc().isoformat(),
                     is_admin(message.from_user.id)
                 ))
     except Exception as e:
@@ -168,7 +172,7 @@ def save_announced_market(market_id, title, theme, end_time):
                     INSERT INTO announced_markets (market_id, title, theme, end_time, notified_new, notified_1h, notified_5m, notified_ended, delete_scheduled, detected_at)
                     VALUES (%s, %s, %s, %s, TRUE, FALSE, FALSE, FALSE, FALSE, %s)
                     ON CONFLICT (market_id) DO NOTHING
-                """, (str(market_id), title, theme, end_time, datetime.now().isoformat()))
+                """, (str(market_id), title, theme, end_time, now_utc().isoformat()))
     except Exception as e:
         logger.error(f"error saving market {market_id}: {e}")
 
@@ -329,8 +333,8 @@ def is_market_active(market):
 
         end_time_unix = market.get("end_time")
         if end_time_unix:
-            end_time = datetime.fromtimestamp(int(end_time_unix))
-            if datetime.now() > end_time:
+            end_time = datetime.utcfromtimestamp(int(end_time_unix))
+            if now_utc() > end_time:
                 return False
 
         return True
@@ -380,8 +384,8 @@ def monitor_b4_markets():
                         title = str(market.get("title", "")).strip()
                         theme = format_theme(market.get("theme", "other"))
                         end_time_unix = market.get("end_time")
-                        end_time = datetime.fromtimestamp(int(end_time_unix))
-                        end_time_str = end_time.strftime('%b %d, %Y at %I:%M %p')
+                        end_time = datetime.utcfromtimestamp(int(end_time_unix))
+                        end_time_str = end_time.strftime('%b %d, %Y at %I:%M %p UTC')
 
                         recently_announced.add(market_id)
 
@@ -410,7 +414,7 @@ def monitor_b4_markets():
 
 def check_scheduled_notifications():
     try:
-        now = datetime.now()
+        now = now_utc()
         markets = get_all_announced_markets()
 
         for market_data in markets:
@@ -428,6 +432,8 @@ def check_scheduled_notifications():
 
                 end_time = datetime.fromisoformat(end_time_str)
                 time_until = (end_time - now).total_seconds()
+
+                logger.info(f"market: {title} | time_until: {time_until:.0f}s | notified_1h: {market_data.get('notified_1h')} | notified_5m: {market_data.get('notified_5m')}")
 
                 if time_until > 0:
                     hours_until = time_until / 3600
@@ -477,7 +483,7 @@ def check_scheduled_notifications():
 
 
 def get_ending_soon_markets():
-    now = datetime.now()
+    now = now_utc()
     ending_soon = []
     markets = get_all_announced_markets()
 
