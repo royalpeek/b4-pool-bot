@@ -158,7 +158,7 @@ make it very urgent and action-oriented. this is their last chance to voice thei
             return None
 
         response = ai_client.chat.completions.create(
-            model="llama-3.1-70b-versatile",
+            model="llama-3.1-8b-instant",
             messages=[{"role": "user", "content": prompt}],
             max_tokens=100
         )
