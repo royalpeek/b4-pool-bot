@@ -158,7 +158,7 @@ make it very urgent and action-oriented. this is their last chance to voice thei
             return None
 
         response = ai_client.chat.completions.create(
-            model="gpt-5.5",
+            model="mixtral-8x7b-32768",
             messages=[{"role": "user", "content": prompt}],
             max_tokens=100
         )
