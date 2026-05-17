@@ -21,7 +21,6 @@ bot = telebot.TeleBot(bot_token)
 B4_API_URL = "https://b4app.xyz/api/markets"
 ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
 DATABASE_URL = os.getenv("DATABASE_URL")
-NOTIFICATIONS_PAUSED = False
 
 
 def now_utc():
@@ -79,6 +78,12 @@ def init_db():
                         created_at TIMESTAMP DEFAULT NOW()
                     )
                 """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS bot_state (
+                        key TEXT PRIMARY KEY,
+                        value TEXT
+                    )
+                """)
         logger.info("database tables ready")
     except Exception as e:
         logger.error(f"error initialising database: {e}")
@@ -89,6 +94,33 @@ def is_admin(user_id):
     if ADMIN_ID is None or ADMIN_ID == 0:
         return False
     return user_id == ADMIN_ID
+
+
+def set_pause_state(paused):
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM bot_state WHERE key = 'paused'")
+                cur.execute("""
+                    INSERT INTO bot_state (key, value)
+                    VALUES ('paused', %s)
+                """, (str(paused),))
+    except Exception as e:
+        logger.error(f"error setting pause state: {e}")
+
+
+def get_pause_state():
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT value FROM bot_state WHERE key = 'paused'")
+                result = cur.fetchone()
+                if result:
+                    return result[0] == 'True'
+        return False
+    except Exception as e:
+        logger.error(f"error getting pause state: {e}")
+        return False
 
 
 def save_user(message):
@@ -363,7 +395,7 @@ def monitor_b4_markets():
     logger.info("b4 market monitoring thread started")
     while True:
         try:
-            if NOTIFICATIONS_PAUSED:
+            if get_pause_state():
                 logger.info("notifications paused, skipping check")
                 time.sleep(10)
                 continue
@@ -396,11 +428,11 @@ def monitor_b4_markets():
                         end_time_str = end_time.strftime('%b %d, %Y at %I:%M %p UTC')
 
                         notification = (
-                            f"🚀 NEW MARKET LIVE\n\n"
+                            f"🆕 NEW MARKET LIVE\n\n"
                             f"📌 {title}\n\n"
                             f"🏷️ Theme: {theme}\n"
                             f"⏰ Closes: {end_time_str}\n\n"
-                            f"Stake Now And Earn Rewards!"
+                            f"Place your stake now!"
                         )
 
                         broadcast_to_all(notification, market_id)
@@ -448,29 +480,29 @@ def check_scheduled_notifications():
                     if hours_until <= 1.0 and not market_data.get("notified_1h"):
                         mins_left = int(minutes_until)
                         notification = (
-                            f"⏰ MARKET CLOSING SOON\n\n"
+                            f"🔃 MARKET CLOSING SOON\n\n"
                             f"📌 {title}\n\n"
                             f"⏳ Time Remaining: {mins_left} Minutes\n\n"
-                            f"This Is Your Last Chance To Stake!"
+                            f"This is your last chance to stake!"
                         )
                         broadcast_to_all(notification, market_id)
                         update_market_flag(market_id, "notified_1h")
                         logger.info(f"1 hour reminder sent for: {title}")
 
-                    elif minutes_until <= 5.0 and not market_data.get("notified_5m"):
+                    elif minutes_until <= 10.0 and not market_data.get("notified_5m"):
                         notification = (
-                            f"🚨 URGENT: MARKET CLOSING IN 5 MINUTES\n\n"
+                            f"🚨 URGENT: MARKET CLOSING IN 10 MINUTES\n\n"
                             f"📌 {title}\n\n"
-                            f"⏳ Time Remaining: 5 Minutes\n\n"
+                            f"⏳ Time Remaining: 10 Minutes\n\n"
                             f"Act Now Or Lose This Opportunity!"
                         )
                         broadcast_to_all(notification, market_id)
                         update_market_flag(market_id, "notified_5m")
-                        logger.info(f"5 minute reminder sent for: {title}")
+                        logger.info(f"10 minute reminder sent for: {title}")
 
                 else:
                     notification = (
-                        f"✅ MARKET CLOSED\n\n"
+                        f"⛔ MARKET CLOSED\n\n"
                         f"📌 {title}\n\n"
                         f"💰 Reward Distribution In Progress\n"
                         f"Check Your Wallet For Returns!\n\n"
@@ -537,7 +569,7 @@ def send_welcome(message):
             "📢 You Will Receive Notifications For:\n\n"
             "🎯 New Markets Launching\n"
             "⏰ 1 Hour Before Market Closes\n"
-            "⏲️ 5 Minutes Before Market Closes\n"
+            "⏲️ 10 Minutes Before Market Closes\n"
             "💰 Market Closure & Reward Distribution\n\n"
             "✅ You Are Now Subscribed\n\n"
             "Sit Back And Receive Alerts!"
@@ -744,8 +776,7 @@ def pause_notifications(message):
             bot.reply_to(message, "❌ Permission Denied. Admin Only Command")
             return
         
-        global NOTIFICATIONS_PAUSED
-        NOTIFICATIONS_PAUSED = True
+        set_pause_state(True)
         bot.reply_to(message, "⏸️ Notifications PAUSED\n\nNo more market alerts will be sent until you /resume")
         logger.info("notifications paused by admin")
     except Exception as e:
@@ -759,8 +790,7 @@ def resume_notifications(message):
             bot.reply_to(message, "❌ Permission Denied. Admin Only Command")
             return
         
-        global NOTIFICATIONS_PAUSED
-        NOTIFICATIONS_PAUSED = False
+        set_pause_state(False)
         bot.reply_to(message, "▶️ Notifications RESUMED\n\nMarket alerts are now active again")
         logger.info("notifications resumed by admin")
     except Exception as e:
