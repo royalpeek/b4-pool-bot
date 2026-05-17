@@ -407,7 +407,7 @@ def generate_smart_message(title, theme):
     try:
         if not freemodel_client:
             logger.warning("freemodel not configured, using default message")
-            return f"Place your stake now!"
+            return f"Don't miss this opportunity!"
         
         prompt = f"Generate a short, exciting 1-2 sentence call-to-action message for a prediction market. Market Title: '{title}'. Theme: '{theme}'. Keep it under 50 words, casual and compelling."
         
@@ -421,11 +421,11 @@ def generate_smart_message(title, theme):
         )
         
         message = response.choices[0].message.content.strip()
-        logger.info(f"generated smart message: {message}")
+        logger.info(f"generated smart message for '{title}': {message}")
         return message
     except Exception as e:
-        logger.error(f"error generating smart message: {e}")
-        return "Place your stake now!"
+        logger.error(f"error generating smart message for '{title}': {type(e).__name__} - {str(e)}")
+        return "Don't miss this opportunity!"
 
 
 def monitor_b4_markets():
@@ -520,34 +520,40 @@ def check_scheduled_notifications():
 
                     if hours_until <= 1.0 and not market_data.get("notified_1h"):
                         mins_left = int(minutes_until)
+                        theme_raw = market_data.get("theme", "other")
+                        smart_message = generate_smart_message(title, theme_raw)
                         notification = (
                             f"🔃 MARKET CLOSING SOON\n\n"
                             f"📌 {title}\n\n"
                             f"⏳ Time Remaining: {mins_left} Minutes\n\n"
-                            f"This is your last chance to stake!"
+                            f"{smart_message}"
                         )
                         broadcast_to_all(notification, market_id)
                         update_market_flag(market_id, "notified_1h")
                         logger.info(f"1 hour reminder sent for: {title}")
 
                     elif minutes_until <= 10.0 and not market_data.get("notified_5m"):
+                        theme_raw = market_data.get("theme", "other")
+                        smart_message = generate_smart_message(title, theme_raw)
                         notification = (
                             f"🚨 URGENT: MARKET CLOSING IN 10 MINUTES\n\n"
                             f"📌 {title}\n\n"
                             f"⏳ Time Remaining: 10 Minutes\n\n"
-                            f"Act Now Or Lose This Opportunity!"
+                            f"{smart_message}"
                         )
                         broadcast_to_all(notification, market_id)
                         update_market_flag(market_id, "notified_5m")
                         logger.info(f"5 minute reminder sent for: {title}")
 
                 else:
+                    theme_raw = market_data.get("theme", "other")
+                    smart_message = generate_smart_message(title, theme_raw)
                     notification = (
                         f"⛔ MARKET CLOSED\n\n"
                         f"📌 {title}\n\n"
                         f"💰 Reward Distribution In Progress\n"
                         f"Check Your Wallet For Returns!\n\n"
-                        f"🗑️ This message will be deleted in 10 minutes"
+                        f"{smart_message}"
                     )
                     broadcast_to_all(notification, market_id)
                     update_market_flag(market_id, "notified_ended")
