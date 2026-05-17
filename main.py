@@ -1,4 +1,4 @@
-print("NEW DEPLOY VERSION")
+print("NEW DEPLOY VERSION - WITH FREEMODEL AI")
 import telebot
 import json
 import os
@@ -23,15 +23,16 @@ B4_API_URL = "https://b4app.xyz/api/markets"
 ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# freemodel ai configuration
-FREEMODEL_API_KEY = os.getenv("FREEMODEL_API_KEY")
-FREEMODEL_BASE_URL = os.getenv("FREEMODEL_BASE_URL", "https://cc.freemodel.dev")
+# Freemodel AI client
+freemodel_api_key = os.getenv("FREEMODEL_API_KEY")
+freemodel_base_url = os.getenv("FREEMODEL_BASE_URL")
 
-# initialize freemodel client
-freemodel_client = OpenAI(
-    api_key=FREEMODEL_API_KEY,
-    base_url=FREEMODEL_BASE_URL
-) if FREEMODEL_API_KEY else None
+ai_client = None
+if freemodel_api_key and freemodel_base_url:
+    ai_client = OpenAI(api_key=freemodel_api_key, base_url=freemodel_base_url)
+    logger.info("freemodel ai client initialized")
+else:
+    logger.warning("freemodel not configured, using template notifications")
 
 
 def now_utc():
@@ -132,6 +133,42 @@ def get_pause_state():
     except Exception as e:
         logger.error(f"error getting pause state: {e}")
         return False
+
+
+def generate_smart_notification(title, theme, notification_type="new"):
+    """use freemodel ai to generate smart notifications"""
+    if not ai_client:
+        return None
+    
+    try:
+        if notification_type == "new":
+            prompt = f"""you are a crypto prediction market bot. generate a short exciting 2-sentence notification for a new market.
+market: "{title}"
+theme: {theme}
+keep it conversational and fun. make users want to participate."""
+        elif notification_type == "1h":
+            prompt = f"""you are a crypto prediction market bot. generate a 2-sentence reminder for a market closing in 1 hour.
+market: "{title}"
+make it compelling but not too urgent. encourage action."""
+        elif notification_type == "10m":
+            prompt = f"""you are a crypto prediction market bot. generate a 2-sentence URGENT reminder for a market closing in 10 minutes.
+market: "{title}"
+make it very urgent and action-oriented. this is their last chance."""
+        else:
+            return None
+
+        response = ai_client.chat.completions.create(
+            model="FRE-5.5",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=100
+        )
+        
+        message = response.choices[0].message.content.strip()
+        logger.info(f"generated ai notification for {notification_type}: {message[:50]}...")
+        return message
+    except Exception as e:
+        logger.error(f"error generating smart notification: {e}")
+        return None
 
 
 def save_user(message):
@@ -402,32 +439,6 @@ def format_theme(theme):
     return theme_map.get(theme, f"💬 {theme.title()}" if theme else "💬 General")
 
 
-def generate_smart_message(title, theme):
-    """generate personalized message using freemodel ai"""
-    try:
-        if not freemodel_client:
-            logger.warning("freemodel not configured, using default message")
-            return f"Don't miss this opportunity!"
-        
-        prompt = f"Generate a short, exciting 1-2 sentence call-to-action message for a prediction market. Market Title: '{title}'. Theme: '{theme}'. Keep it under 50 words, casual and compelling."
-        
-        response = freemodel_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "user", "content": prompt}
-            ],
-            max_tokens=100,
-            temperature=0.7
-        )
-        
-        message = response.choices[0].message.content.strip()
-        logger.info(f"generated smart message for '{title}': {message}")
-        return message
-    except Exception as e:
-        logger.error(f"error generating smart message for '{title}': {type(e).__name__} - {str(e)}")
-        return "Don't miss this opportunity!"
-
-
 def monitor_b4_markets():
     logger.info("b4 market monitoring thread started")
     while True:
@@ -459,22 +470,30 @@ def monitor_b4_markets():
                     existing = get_announced_market(market_id)
                     if not existing:
                         title = str(market.get("title", "")).strip()
-                        theme_raw = market.get("theme", "other")
-                        theme = format_theme(theme_raw)
+                        theme = format_theme(market.get("theme", "other"))
                         end_time_unix = market.get("end_time")
                         end_time = datetime.fromtimestamp(int(end_time_unix), tz=timezone.utc).replace(tzinfo=None)
                         end_time_str = end_time.strftime('%b %d, %Y at %I:%M %p UTC')
 
-                        # generate smart message using freemodel ai
-                        smart_message = generate_smart_message(title, theme_raw)
-
-                        notification = (
-                            f"🆕 NEW MARKET LIVE\n\n"
-                            f"📌 {title}\n\n"
-                            f"🏷️ Theme: {theme}\n"
-                            f"⏰ Closes: {end_time_str}\n\n"
-                            f"{smart_message}"
-                        )
+                        # try to generate ai notification
+                        ai_message = generate_smart_notification(title, market.get("theme", "other"), "new")
+                        
+                        if ai_message:
+                            notification = (
+                                f"🆕 NEW MARKET LIVE\n\n"
+                                f"📌 {title}\n\n"
+                                f"🏷️ Theme: {theme}\n"
+                                f"⏰ Closes: {end_time_str}\n\n"
+                                f"{ai_message}"
+                            )
+                        else:
+                            notification = (
+                                f"🆕 NEW MARKET LIVE\n\n"
+                                f"📌 {title}\n\n"
+                                f"🏷️ Theme: {theme}\n"
+                                f"⏰ Closes: {end_time_str}\n\n"
+                                f"Place your stake now!"
+                            )
 
                         broadcast_to_all(notification, market_id)
                         save_announced_market(market_id, title, theme, end_time.isoformat())
@@ -520,40 +539,59 @@ def check_scheduled_notifications():
 
                     if hours_until <= 1.0 and not market_data.get("notified_1h"):
                         mins_left = int(minutes_until)
-                        theme_raw = market_data.get("theme", "other")
-                        smart_message = generate_smart_message(title, theme_raw)
-                        notification = (
-                            f"🔃 MARKET CLOSING SOON\n\n"
-                            f"📌 {title}\n\n"
-                            f"⏳ Time Remaining: {mins_left} Minutes\n\n"
-                            f"{smart_message}"
-                        )
+                        
+                        # try ai message
+                        ai_message = generate_smart_notification(title, market_data.get("theme", "other"), "1h")
+                        
+                        if ai_message:
+                            notification = (
+                                f"🔃 MARKET CLOSING SOON\n\n"
+                                f"📌 {title}\n\n"
+                                f"⏳ Time Remaining: {mins_left} Minutes\n\n"
+                                f"{ai_message}"
+                            )
+                        else:
+                            notification = (
+                                f"🔃 MARKET CLOSING SOON\n\n"
+                                f"📌 {title}\n\n"
+                                f"⏳ Time Remaining: {mins_left} Minutes\n\n"
+                                f"This is your last chance to stake!"
+                            )
+                        
                         broadcast_to_all(notification, market_id)
                         update_market_flag(market_id, "notified_1h")
                         logger.info(f"1 hour reminder sent for: {title}")
 
                     elif minutes_until <= 10.0 and not market_data.get("notified_5m"):
-                        theme_raw = market_data.get("theme", "other")
-                        smart_message = generate_smart_message(title, theme_raw)
-                        notification = (
-                            f"🚨 URGENT: MARKET CLOSING IN 10 MINUTES\n\n"
-                            f"📌 {title}\n\n"
-                            f"⏳ Time Remaining: 10 Minutes\n\n"
-                            f"{smart_message}"
-                        )
+                        
+                        # try ai message
+                        ai_message = generate_smart_notification(title, market_data.get("theme", "other"), "10m")
+                        
+                        if ai_message:
+                            notification = (
+                                f"🚨 URGENT: MARKET CLOSING IN 10 MINUTES\n\n"
+                                f"📌 {title}\n\n"
+                                f"{ai_message}"
+                            )
+                        else:
+                            notification = (
+                                f"🚨 URGENT: MARKET CLOSING IN 10 MINUTES\n\n"
+                                f"📌 {title}\n\n"
+                                f"⏳ Time Remaining: 10 Minutes\n\n"
+                                f"Act Now Or Lose This Opportunity!"
+                            )
+                        
                         broadcast_to_all(notification, market_id)
                         update_market_flag(market_id, "notified_5m")
-                        logger.info(f"5 minute reminder sent for: {title}")
+                        logger.info(f"10 minute reminder sent for: {title}")
 
                 else:
-                    theme_raw = market_data.get("theme", "other")
-                    smart_message = generate_smart_message(title, theme_raw)
                     notification = (
                         f"⛔ MARKET CLOSED\n\n"
                         f"📌 {title}\n\n"
                         f"💰 Reward Distribution In Progress\n"
                         f"Check Your Wallet For Returns!\n\n"
-                        f"{smart_message}"
+                        f"🗑️ This message will be deleted in 10 minutes"
                     )
                     broadcast_to_all(notification, market_id)
                     update_market_flag(market_id, "notified_ended")
@@ -780,9 +818,6 @@ def reset_notifications(message):
             bot.reply_to(message, "❌ Permission Denied. Admin Only Command")
             return
 
-        # first get all messages before deleting
-        messages_to_delete = get_market_messages("") if hasattr(get_market_messages, '__call__') else []
-        
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT * FROM market_messages")
@@ -791,11 +826,10 @@ def reset_notifications(message):
         deleted_count = 0
         failed_count = 0
         
-        # delete each message from telegram
         for msg in messages_to_delete:
             try:
-                chat_id = int(msg[2])  # chat_id is at index 2
-                message_id = int(msg[3])  # message_id is at index 3
+                chat_id = int(msg[2])
+                message_id = int(msg[3])
                 bot.delete_message(chat_id, message_id)
                 deleted_count += 1
                 time.sleep(0.05)
@@ -803,7 +837,6 @@ def reset_notifications(message):
                 logger.error(f"error deleting message {msg[3]} from chat {msg[2]}: {e}")
                 failed_count += 1
         
-        # clear database
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute("DELETE FROM announced_markets")
@@ -858,6 +891,12 @@ def test_notification(message):
             "✅ Notifications: Ready\n\n"
             "Safe to /resume notifications to all users"
         )
+        
+        if ai_client:
+            test_msg += "\n✅ AI Engine: Active"
+        else:
+            test_msg += "\n⚠️ AI Engine: Not Configured"
+        
         bot.send_message(message.chat.id, test_msg)
         logger.info("test notification sent to admin")
     except Exception as e:
@@ -868,9 +907,7 @@ def test_notification(message):
 logger.info("Starting Bot...")
 init_db()
 
-# Register bot commands
 try:
-    # Public commands for everyone
     public_commands = [
         telebot.types.BotCommand("start", "Subscribe to market alerts"),
         telebot.types.BotCommand("help", "Show available commands"),
@@ -881,7 +918,6 @@ try:
     
     bot.set_my_commands(public_commands)
     
-    # Admin commands - show for admin user PLUS the public ones
     admin_commands = public_commands + [
         telebot.types.BotCommand("pause", "Pause all notifications"),
         telebot.types.BotCommand("resume", "Resume notifications"),
@@ -893,7 +929,6 @@ try:
         telebot.types.BotCommand("listusers", "List all users"),
     ]
     
-    # Set admin commands for the admin user
     if ADMIN_ID and ADMIN_ID != 0:
         scope = telebot.types.BotCommandScopeChat(chat_id=ADMIN_ID)
         bot.set_my_commands(admin_commands, scope=scope)
