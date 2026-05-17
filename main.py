@@ -142,18 +142,18 @@ def generate_smart_notification(title, theme, notification_type="new"):
     
     try:
         if notification_type == "new":
-            prompt = f"""you are a crypto prediction market bot. generate a short exciting 2-sentence notification for a new market.
-market: "{title}"
-theme: {theme}
-keep it conversational and fun. make users want to participate."""
+            prompt = f"""you are a b4 opinion market bot. generate a short exciting 2-sentence notification for a new opinion market.
+opinion: "{title}"
+category: {theme}
+keep it conversational and fun. make users want to share their opinion. don't mention prediction or betting."""
         elif notification_type == "1h":
-            prompt = f"""you are a crypto prediction market bot. generate a 2-sentence reminder for a market closing in 1 hour.
-market: "{title}"
-make it compelling but not too urgent. encourage action."""
+            prompt = f"""you are a b4 opinion market bot. generate a 2-sentence reminder for an opinion market closing in 1 hour.
+opinion: "{title}"
+make it compelling but not too urgent. encourage users to share their take."""
         elif notification_type == "10m":
-            prompt = f"""you are a crypto prediction market bot. generate a 2-sentence URGENT reminder for a market closing in 10 minutes.
-market: "{title}"
-make it very urgent and action-oriented. this is their last chance."""
+            prompt = f"""you are a b4 opinion market bot. generate a 2-sentence URGENT reminder for an opinion market closing in 10 minutes.
+opinion: "{title}"
+make it very urgent and action-oriented. this is their last chance to voice their opinion."""
         else:
             return None
 
