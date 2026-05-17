@@ -136,31 +136,30 @@ def get_pause_state():
 
 
 def generate_smart_notification(title, theme, notification_type="new"):
-    """use freemodel ai to generate smart notifications"""
+    """use groq ai to generate short, direct opinion market notifications"""
     if not ai_client:
         return None
     
     try:
         if notification_type == "new":
-            prompt = f"""you are a b4 opinion market bot. generate a short exciting 2-sentence notification for a new opinion market.
+            prompt = f"""you are a b4 opinion market bot. generate a short 1-sentence call to action for a new opinion market.
 opinion: "{title}"
-category: {theme}
-keep it conversational and fun. make users want to share their opinion. don't mention prediction or betting."""
+be direct, brief, casual. no fluff. just get people to share their opinion. no corporate language. lowercase."""
         elif notification_type == "1h":
-            prompt = f"""you are a b4 opinion market bot. generate a 2-sentence reminder for an opinion market closing in 1 hour.
+            prompt = f"""generate a short 1-sentence reminder for an opinion market closing in 1 hour.
 opinion: "{title}"
-make it compelling but not too urgent. encourage users to share their take."""
+be direct. no fluff. just tell them to hurry up and share. lowercase."""
         elif notification_type == "10m":
-            prompt = f"""you are a b4 opinion market bot. generate a 2-sentence URGENT reminder for an opinion market closing in 10 minutes.
+            prompt = f"""generate a short 1-sentence URGENT reminder for an opinion market closing in 10 minutes.
 opinion: "{title}"
-make it very urgent and action-oriented. this is their last chance to voice their opinion."""
+be super direct. this is the last call. no fluff. lowercase."""
         else:
             return None
 
         response = ai_client.chat.completions.create(
             model="llama-3.1-8b-instant",
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=100
+            max_tokens=50
         )
         
         message = response.choices[0].message.content.strip()
