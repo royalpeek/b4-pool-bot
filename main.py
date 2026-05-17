@@ -8,6 +8,7 @@ import psycopg
 from threading import Thread
 from datetime import datetime, timezone
 import requests
+from openai import OpenAI
 
 logging.basicConfig(
     level=logging.INFO,
@@ -21,6 +22,16 @@ bot = telebot.TeleBot(bot_token)
 B4_API_URL = "https://b4app.xyz/api/markets"
 ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
 DATABASE_URL = os.getenv("DATABASE_URL")
+
+# freemodel ai configuration
+FREEMODEL_API_KEY = os.getenv("FREEMODEL_API_KEY")
+FREEMODEL_BASE_URL = os.getenv("FREEMODEL_BASE_URL", "https://cc.freemodel.dev")
+
+# initialize freemodel client
+freemodel_client = OpenAI(
+    api_key=FREEMODEL_API_KEY,
+    base_url=FREEMODEL_BASE_URL
+) if FREEMODEL_API_KEY else None
 
 
 def now_utc():
@@ -391,6 +402,32 @@ def format_theme(theme):
     return theme_map.get(theme, f"💬 {theme.title()}" if theme else "💬 General")
 
 
+def generate_smart_message(title, theme):
+    """generate personalized message using freemodel ai"""
+    try:
+        if not freemodel_client:
+            logger.warning("freemodel not configured, using default message")
+            return f"Place your stake now!"
+        
+        prompt = f"Generate a short, exciting 1-2 sentence call-to-action message for a prediction market. Market Title: '{title}'. Theme: '{theme}'. Keep it under 50 words, casual and compelling."
+        
+        response = freemodel_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=100,
+            temperature=0.7
+        )
+        
+        message = response.choices[0].message.content.strip()
+        logger.info(f"generated smart message: {message}")
+        return message
+    except Exception as e:
+        logger.error(f"error generating smart message: {e}")
+        return "Place your stake now!"
+
+
 def monitor_b4_markets():
     logger.info("b4 market monitoring thread started")
     while True:
@@ -422,17 +459,21 @@ def monitor_b4_markets():
                     existing = get_announced_market(market_id)
                     if not existing:
                         title = str(market.get("title", "")).strip()
-                        theme = format_theme(market.get("theme", "other"))
+                        theme_raw = market.get("theme", "other")
+                        theme = format_theme(theme_raw)
                         end_time_unix = market.get("end_time")
                         end_time = datetime.fromtimestamp(int(end_time_unix), tz=timezone.utc).replace(tzinfo=None)
                         end_time_str = end_time.strftime('%b %d, %Y at %I:%M %p UTC')
+
+                        # generate smart message using freemodel ai
+                        smart_message = generate_smart_message(title, theme_raw)
 
                         notification = (
                             f"🆕 NEW MARKET LIVE\n\n"
                             f"📌 {title}\n\n"
                             f"🏷️ Theme: {theme}\n"
                             f"⏰ Closes: {end_time_str}\n\n"
-                            f"Place your stake now!"
+                            f"{smart_message}"
                         )
 
                         broadcast_to_all(notification, market_id)
@@ -498,7 +539,7 @@ def check_scheduled_notifications():
                         )
                         broadcast_to_all(notification, market_id)
                         update_market_flag(market_id, "notified_5m")
-                        logger.info(f"10 minute reminder sent for: {title}")
+                        logger.info(f"5 minute reminder sent for: {title}")
 
                 else:
                     notification = (
