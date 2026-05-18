@@ -1,5 +1,6 @@
 print("NEW DEPLOY VERSION - WITH FREEMODEL AI")
 import telebot
+from telebot import types
 import json
 import os
 import time
@@ -73,6 +74,7 @@ def init_db():
                         title TEXT,
                         theme TEXT,
                         end_time TEXT,
+                        market_link TEXT,
                         notified_new BOOLEAN DEFAULT FALSE,
                         notified_1h BOOLEAN DEFAULT FALSE,
                         notified_5m BOOLEAN DEFAULT FALSE,
@@ -248,13 +250,14 @@ def get_announced_market(market_id):
 
 def save_announced_market(market_id, title, theme, end_time):
     try:
+        market_link = f"https://b4.app/market/{market_id}"
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
-                    INSERT INTO announced_markets (market_id, title, theme, end_time, notified_new, notified_1h, notified_5m, notified_ended, delete_scheduled, detected_at)
-                    VALUES (%s, %s, %s, %s, TRUE, FALSE, FALSE, FALSE, FALSE, %s)
+                    INSERT INTO announced_markets (market_id, title, theme, end_time, market_link, notified_new, notified_1h, notified_5m, notified_ended, delete_scheduled, detected_at)
+                    VALUES (%s, %s, %s, %s, %s, TRUE, FALSE, FALSE, FALSE, FALSE, %s)
                     ON CONFLICT (market_id) DO NOTHING
-                """, (str(market_id), title, theme, end_time, now_utc().isoformat()))
+                """, (str(market_id), title, theme, end_time, market_link, now_utc().isoformat()))
     except Exception as e:
         logger.error(f"error saving market {market_id}: {e}")
 
@@ -311,13 +314,16 @@ def delete_market_messages_from_db(market_id):
         logger.error(f"error deleting messages for market {market_id}: {e}")
 
 
-def broadcast_to_all(message_text, market_id=None):
+def broadcast_to_all(message_text, market_id=None, keyboard=None):
     try:
         chats = get_all_chats()
         sent = 0
         for chat_id in chats:
             try:
-                sent_msg = bot.send_message(int(chat_id), message_text)
+                if keyboard:
+                    sent_msg = bot.send_message(int(chat_id), message_text, reply_markup=keyboard)
+                else:
+                    sent_msg = bot.send_message(int(chat_id), message_text)
                 sent += 1
                 if market_id:
                     save_message_id(market_id, chat_id, sent_msg.message_id)
@@ -420,7 +426,14 @@ def is_market_active(market):
         return False
 
 
-def format_theme(theme):
+def create_market_keyboard(market_id, market_link):
+    """create inline buttons for market notifications"""
+    keyboard = types.InlineKeyboardMarkup()
+    keyboard.add(
+        types.InlineKeyboardButton("vote now", url=market_link),
+        types.InlineKeyboardButton("refresh", callback_data=f"refresh_{market_id}")
+    )
+    return keyboard
     theme_map = {
         "crypto": "🪙 Crypto",
         "politics": "🏛️ Politics",
@@ -489,7 +502,7 @@ def monitor_b4_markets():
                                 f"Place your stake now!"
                             )
 
-                        broadcast_to_all(notification, market_id)
+                        broadcast_to_all(notification, market_id, keyboard)
                         save_announced_market(market_id, title, theme, end_time.isoformat())
                         logger.info(f"new market announced: {title}")
 
@@ -536,6 +549,7 @@ def check_scheduled_notifications():
                         
                         # try ai message
                         ai_message = generate_smart_notification(title, market_data.get("theme", "other"), "1h")
+                        market_link = market_data.get("market_link", f"https://www.b4app.xyz/m/{market_id}")
                         
                         if ai_message:
                             notification = (
@@ -552,7 +566,8 @@ def check_scheduled_notifications():
                                 f"This is your last chance to stake!"
                             )
                         
-                        broadcast_to_all(notification, market_id)
+                        keyboard = create_market_keyboard(market_id, market_link)
+                        broadcast_to_all(notification, market_id, keyboard)
                         update_market_flag(market_id, "notified_1h")
                         logger.info(f"1 hour reminder sent for: {title}")
 
@@ -560,6 +575,7 @@ def check_scheduled_notifications():
                         
                         # try ai message
                         ai_message = generate_smart_notification(title, market_data.get("theme", "other"), "10m")
+                        market_link = market_data.get("market_link", f"https://www.b4app.xyz/m/{market_id}")
                         
                         if ai_message:
                             notification = (
@@ -575,7 +591,8 @@ def check_scheduled_notifications():
                                 f"Act Now Or Lose This Opportunity!"
                             )
                         
-                        broadcast_to_all(notification, market_id)
+                        keyboard = create_market_keyboard(market_id, market_link)
+                        broadcast_to_all(notification, market_id, keyboard)
                         update_market_flag(market_id, "notified_5m")
                         logger.info(f"10 minute reminder sent for: {title}")
 
@@ -623,7 +640,50 @@ def get_ending_soon_markets():
     return ending_soon
 
 
-@bot.message_handler(commands=['getmyid'])
+@bot.callback_query_handler(func=lambda call: call.data.startswith('refresh_'))
+def refresh_market(call):
+    try:
+        market_id = call.data.replace('refresh_', '')
+        market_data = get_announced_market(market_id)
+        
+        if not market_data:
+            bot.answer_callback_query(call.id, "market not found")
+            return
+        
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        end_time = datetime.fromisoformat(market_data["end_time"])
+        time_until = (end_time - now).total_seconds()
+        
+        if time_until > 0:
+            mins_left = int(time_until / 60)
+            secs_left = int(time_until % 60)
+            
+            title = market_data.get("title", "")
+            theme = market_data.get("theme", "")
+            
+            updated_msg = (
+                f"📌 {title}\n\n"
+                f"🏷️ Theme: {theme}\n"
+                f"⏳ Time Remaining: {mins_left}m {secs_left}s"
+            )
+            
+            market_link = market_data.get("market_link", f"https://www.b4app.xyz/m/{market_id}")
+            keyboard = create_market_keyboard(market_id, market_link)
+            
+            bot.edit_message_text(
+                updated_msg,
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=keyboard
+            )
+            bot.answer_callback_query(call.id, "updated")
+        else:
+            bot.answer_callback_query(call.id, "market has ended")
+            logger.info(f"refresh clicked for ended market {market_id}")
+    
+    except Exception as e:
+        logger.error(f"error in refresh_market: {e}")
+        bot.answer_callback_query(call.id, "error updating market")
 def get_my_id(message):
     try:
         user_id = message.from_user.id
