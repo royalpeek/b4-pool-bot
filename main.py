@@ -314,7 +314,6 @@ def delete_market_messages_from_db(market_id):
 def broadcast_to_all(message_text, market_id=None):
     try:
         chats = get_all_chats()
-        failed = []
         sent = 0
         for chat_id in chats:
             try:
@@ -324,12 +323,8 @@ def broadcast_to_all(message_text, market_id=None):
                     save_message_id(market_id, chat_id, sent_msg.message_id)
             except Exception as e:
                 logger.error(f"error sending to {chat_id}: {e}")
-                failed.append(chat_id)
 
-        for chat_id in failed:
-            remove_chat(chat_id)
-
-        logger.info(f"broadcast sent to {sent} chats, {len(failed)} failed")
+        logger.info(f"broadcast sent to {sent} chats")
     except Exception as e:
         logger.error(f"error in broadcast_to_all: {e}")
 
