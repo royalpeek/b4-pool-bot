@@ -898,6 +898,44 @@ def test_notification(message):
         bot.reply_to(message, f"❌ Error: {e}")
 
 
+@bot.message_handler(commands=['reinvite'])
+def reinvite_users(message):
+    try:
+        if not is_admin(message.from_user.id):
+            bot.reply_to(message, "❌ Permission Denied. Admin Only Command")
+            return
+        
+        users = get_all_users()
+        chats = get_all_chats()
+        chat_ids = set(chats)
+        
+        reinvited = 0
+        failed = 0
+        
+        for user in users:
+            user_id = int(user["user_id"])
+            if str(user_id) not in chat_ids:
+                try:
+                    invite_msg = (
+                        "👋 we noticed you unsubscribed from b4 market alerts.\n\n"
+                        "we've fixed some issues and improved the bot. "
+                        "interested in getting market notifications again?\n\n"
+                        "just use /start to resubscribe."
+                    )
+                    bot.send_message(user_id, invite_msg)
+                    reinvited += 1
+                    time.sleep(0.1)
+                except Exception as e:
+                    logger.error(f"error sending reinvite to {user_id}: {e}")
+                    failed += 1
+        
+        bot.reply_to(message, f"✅ Reinvite sent\n\n📨 Sent to {reinvited} users\n❌ Failed: {failed}")
+        logger.info(f"reinvited {reinvited} users, {failed} failed")
+    except Exception as e:
+        logger.error(f"error in reinvite: {e}")
+        bot.reply_to(message, f"❌ Error: {e}")
+
+
 logger.info("Starting Bot...")
 init_db()
 
