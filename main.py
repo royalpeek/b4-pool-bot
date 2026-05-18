@@ -447,16 +447,6 @@ def format_theme(theme):
         "other": "💬 General"
     }
     return theme_map.get(theme, f"💬 {theme.title()}" if theme else "💬 General")
-    theme_map = {
-        "crypto": "🪙 Crypto",
-        "politics": "🏛️ Politics",
-        "entertainment": "🎬 Entertainment",
-        "sports": "⚽ Sports",
-        "travel": "✈️ Travel",
-        "current_events": "📰 Current Events",
-        "other": "💬 General"
-    }
-    return theme_map.get(theme, f"💬 {theme.title()}" if theme else "💬 General")
 
 
 def monitor_b4_markets():
@@ -494,6 +484,7 @@ def monitor_b4_markets():
                         end_time_unix = market.get("end_time")
                         end_time = datetime.fromtimestamp(int(end_time_unix), tz=timezone.utc).replace(tzinfo=None)
                         end_time_str = end_time.strftime('%b %d, %Y at %I:%M %p UTC')
+                        market_link = f"https://b4.app/market/{market_id}"
 
                         # try to generate ai notification
                         ai_message = generate_smart_notification(title, market.get("theme", "other"), "new")
@@ -515,6 +506,7 @@ def monitor_b4_markets():
                                 f"Place your stake now!"
                             )
 
+                        keyboard = create_market_keyboard(market_id, market_link)
                         broadcast_to_all(notification, market_id, keyboard)
                         save_announced_market(market_id, title, theme, end_time.isoformat())
                         logger.info(f"new market announced: {title}")
@@ -697,6 +689,9 @@ def refresh_market(call):
     except Exception as e:
         logger.error(f"error in refresh_market: {e}")
         bot.answer_callback_query(call.id, "error updating market")
+
+
+@bot.message_handler(commands=['getmyid'])
 def get_my_id(message):
     try:
         user_id = message.from_user.id
