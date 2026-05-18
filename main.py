@@ -434,6 +434,19 @@ def create_market_keyboard(market_id, market_link):
         types.InlineKeyboardButton("refresh", callback_data=f"refresh_{market_id}")
     )
     return keyboard
+
+
+def format_theme(theme):
+    theme_map = {
+        "crypto": "🪙 Crypto",
+        "politics": "🏛️ Politics",
+        "entertainment": "🎬 Entertainment",
+        "sports": "⚽ Sports",
+        "travel": "✈️ Travel",
+        "current_events": "📰 Current Events",
+        "other": "💬 General"
+    }
+    return theme_map.get(theme, f"💬 {theme.title()}" if theme else "💬 General")
     theme_map = {
         "crypto": "🪙 Crypto",
         "politics": "🏛️ Politics",
