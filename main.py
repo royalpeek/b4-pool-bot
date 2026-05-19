@@ -250,8 +250,7 @@ def get_announced_market(market_id):
 
 def save_announced_market(market_id, title, theme, end_time):
     try:
-        # FIX: correct market link format
-        market_link = f"https://www.b4app.xyz/m/{market_id}"
+        market_link = f"https://b4.app/market/{market_id}"
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
@@ -427,26 +426,26 @@ def is_market_active(market):
         return False
 
 
-def create_vote_only_keyboard(market_link):
-    """vote now button only - used for new market notifications"""
-    keyboard = types.InlineKeyboardMarkup()
-    keyboard.add(
-        types.InlineKeyboardButton("vote now", url=market_link)
-    )
-    return keyboard
-
-
 def create_market_keyboard(market_id, market_link):
-    """vote now + refresh buttons - used for reminder notifications only"""
+    """create inline buttons for market notifications"""
     keyboard = types.InlineKeyboardMarkup()
     keyboard.add(
-        types.InlineKeyboardButton("vote now", url=market_link),
-        types.InlineKeyboardButton("refresh", callback_data=f"refresh_{market_id}")
+        types.InlineKeyboardButton("🗳️ Vote Now", url=market_link)
     )
     return keyboard
 
 
 def format_theme(theme):
+    theme_map = {
+        "crypto": "🪙 Crypto",
+        "politics": "🏛️ Politics",
+        "entertainment": "🎬 Entertainment",
+        "sports": "⚽ Sports",
+        "travel": "✈️ Travel",
+        "current_events": "📰 Current Events",
+        "other": "💬 General"
+    }
+    return theme_map.get(theme, f"💬 {theme.title()}" if theme else "💬 General")
     theme_map = {
         "crypto": "🪙 Crypto",
         "politics": "🏛️ Politics",
@@ -494,8 +493,6 @@ def monitor_b4_markets():
                         end_time_unix = market.get("end_time")
                         end_time = datetime.fromtimestamp(int(end_time_unix), tz=timezone.utc).replace(tzinfo=None)
                         end_time_str = end_time.strftime('%b %d, %Y at %I:%M %p UTC')
-                        # FIX: correct market link format
-                        market_link = f"https://www.b4app.xyz/m/{market_id}"
 
                         # try to generate ai notification
                         ai_message = generate_smart_notification(title, market.get("theme", "other"), "new")
@@ -517,8 +514,6 @@ def monitor_b4_markets():
                                 f"Place your stake now!"
                             )
 
-                        # FIX: new market gets vote only keyboard (no refresh button)
-                        keyboard = create_vote_only_keyboard(market_link)
                         broadcast_to_all(notification, market_id, keyboard)
                         save_announced_market(market_id, title, theme, end_time.isoformat())
                         logger.info(f"new market announced: {title}")
@@ -557,9 +552,6 @@ def check_scheduled_notifications():
 
                 logger.info(f"market: {title} | time_until: {time_until:.0f}s | notified_1h: {market_data.get('notified_1h')} | notified_5m: {market_data.get('notified_5m')}")
 
-                # FIX: correct fallback url in all reminder notifications
-                market_link = market_data.get("market_link") or f"https://www.b4app.xyz/m/{market_id}"
-
                 if time_until > 0:
                     hours_until = time_until / 3600
                     minutes_until = time_until / 60
@@ -567,7 +559,9 @@ def check_scheduled_notifications():
                     if hours_until <= 1.0 and not market_data.get("notified_1h"):
                         mins_left = int(minutes_until)
                         
+                        # try ai message
                         ai_message = generate_smart_notification(title, market_data.get("theme", "other"), "1h")
+                        market_link = market_data.get("market_link", f"https://www.b4app.xyz/m/{market_id}")
                         
                         if ai_message:
                             notification = (
@@ -584,7 +578,6 @@ def check_scheduled_notifications():
                                 f"This is your last chance to stake!"
                             )
                         
-                        # reminder gets both buttons
                         keyboard = create_market_keyboard(market_id, market_link)
                         broadcast_to_all(notification, market_id, keyboard)
                         update_market_flag(market_id, "notified_1h")
@@ -592,6 +585,7 @@ def check_scheduled_notifications():
 
                     elif minutes_until <= 10.0 and not market_data.get("notified_5m"):
                         
+                        # try ai message
                         ai_message = generate_smart_notification(title, market_data.get("theme", "other"), "10m")
                         
                         if ai_message:
@@ -608,9 +602,7 @@ def check_scheduled_notifications():
                                 f"Act Now Or Lose This Opportunity!"
                             )
                         
-                        # reminder gets both buttons
-                        keyboard = create_market_keyboard(market_id, market_link)
-                        broadcast_to_all(notification, market_id, keyboard)
+                        broadcast_to_all(notification, market_id)
                         update_market_flag(market_id, "notified_5m")
                         logger.info(f"10 minute reminder sent for: {title}")
 
@@ -661,19 +653,18 @@ def get_ending_soon_markets():
 @bot.callback_query_handler(func=lambda call: call.data.startswith('refresh_'))
 def refresh_market(call):
     try:
+        logger.info(f"refresh button clicked: {call.data}")
         market_id = call.data.replace('refresh_', '')
         market_data = get_announced_market(market_id)
         
         if not market_data:
-            bot.answer_callback_query(call.id, "market not found")
+            bot.answer_callback_query(call.id, "market not found", show_alert=True)
+            logger.warning(f"market {market_id} not found in database")
             return
         
         now = datetime.now(timezone.utc).replace(tzinfo=None)
         end_time = datetime.fromisoformat(market_data["end_time"])
         time_until = (end_time - now).total_seconds()
-        
-        # FIX: correct fallback url
-        market_link = market_data.get("market_link") or f"https://www.b4app.xyz/m/{market_id}"
         
         if time_until > 0:
             mins_left = int(time_until / 60)
@@ -682,41 +673,30 @@ def refresh_market(call):
             title = market_data.get("title", "")
             theme = market_data.get("theme", "")
             
-            # FIX: rebuild the full reminder message so telegram accepts the edit
             updated_msg = (
-                f"🔃 MARKET CLOSING SOON\n\n"
                 f"📌 {title}\n\n"
                 f"🏷️ Theme: {theme}\n"
                 f"⏳ Time Remaining: {mins_left}m {secs_left}s"
             )
             
+            market_link = market_data.get("market_link", f"https://www.b4app.xyz/m/{market_id}")
             keyboard = create_market_keyboard(market_id, market_link)
             
-            try:
-                bot.edit_message_text(
-                    updated_msg,
-                    call.message.chat.id,
-                    call.message.message_id,
-                    reply_markup=keyboard
-                )
-                bot.answer_callback_query(call.id, "updated!")
-            except Exception as edit_err:
-                # if message text is identical telegram throws an error - that's fine
-                if "message is not modified" in str(edit_err).lower():
-                    bot.answer_callback_query(call.id, "already up to date")
-                else:
-                    logger.error(f"error editing message: {edit_err}")
-                    bot.answer_callback_query(call.id, "error updating")
+            bot.edit_message_text(
+                updated_msg,
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=keyboard
+            )
+            bot.answer_callback_query(call.id, "⏳ updated")
+            logger.info(f"refreshed market {market_id}: {mins_left}m {secs_left}s remaining")
         else:
-            bot.answer_callback_query(call.id, "market has already ended")
+            bot.answer_callback_query(call.id, "market has ended", show_alert=True)
             logger.info(f"refresh clicked for ended market {market_id}")
     
     except Exception as e:
-        logger.error(f"error in refresh_market: {e}")
-        bot.answer_callback_query(call.id, "error updating market")
-
-
-@bot.message_handler(commands=['getmyid'])
+        logger.error(f"error in refresh_market: {type(e).__name__} - {str(e)}")
+        bot.answer_callback_query(call.id, f"error: {str(e)}", show_alert=True)
 def get_my_id(message):
     try:
         user_id = message.from_user.id
