@@ -496,6 +496,7 @@ def monitor_b4_markets():
 
                         # try to generate ai notification
                         ai_message = generate_smart_notification(title, market.get("theme", "other"), "new")
+                        market_link = f"https://www.b4app.xyz/m/{market_id}"
                         
                         if ai_message:
                             notification = (
@@ -514,6 +515,7 @@ def monitor_b4_markets():
                                 f"Place your stake now!"
                             )
 
+                        keyboard = create_market_keyboard(market_id, market_link)
                         broadcast_to_all(notification, market_id, keyboard)
                         save_announced_market(market_id, title, theme, end_time.isoformat())
                         logger.info(f"new market announced: {title}")
@@ -578,8 +580,7 @@ def check_scheduled_notifications():
                                 f"This is your last chance to stake!"
                             )
                         
-                        keyboard = create_market_keyboard(market_id, market_link)
-                        broadcast_to_all(notification, market_id, keyboard)
+                        broadcast_to_all(notification, market_id)
                         update_market_flag(market_id, "notified_1h")
                         logger.info(f"1 hour reminder sent for: {title}")
 
