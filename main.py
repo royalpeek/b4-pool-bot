@@ -271,6 +271,15 @@ def update_market_flag(market_id, flag):
         logger.error(f"error updating flag {flag} for market {market_id}: {e}")
 
 
+def delete_announced_market(market_id):
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM announced_markets WHERE market_id = %s", (str(market_id),))
+    except Exception as e:
+        logger.error(f"error deleting announced market {market_id}: {e}")
+
+
 def get_all_announced_markets():
     try:
         with get_db() as conn:
@@ -446,16 +455,6 @@ def format_theme(theme):
         "other": "💬 General"
     }
     return theme_map.get(theme, f"💬 {theme.title()}" if theme else "💬 General")
-    theme_map = {
-        "crypto": "🪙 Crypto",
-        "politics": "🏛️ Politics",
-        "entertainment": "🎬 Entertainment",
-        "sports": "⚽ Sports",
-        "travel": "✈️ Travel",
-        "current_events": "📰 Current Events",
-        "other": "💬 General"
-    }
-    return theme_map.get(theme, f"💬 {theme.title()}" if theme else "💬 General")
 
 
 def monitor_b4_markets():
@@ -469,6 +468,25 @@ def monitor_b4_markets():
             
             markets = fetch_b4_markets()
             logger.info(f"processing {len(markets)} markets")
+            
+            announced_markets = get_all_announced_markets()
+            api_market_ids = set(str(m.get("market_id", "")).strip() for m in markets)
+            
+            for announced in announced_markets:
+                announced_id = str(announced.get("market_id", "")).strip()
+                
+                if announced_id not in api_market_ids:
+                    continue
+                
+                api_market = next((m for m in markets if str(m.get("market_id", "")).strip() == announced_id), None)
+                if not api_market:
+                    continue
+                
+                if api_market.get("hidden", False) and not announced.get("notified_ended"):
+                    logger.info(f"market {announced_id} is now hidden, cleaning up notifications")
+                    delete_all_market_messages(announced_id)
+                    delete_announced_market(announced_id)
+                    logger.info(f"removed hidden market {announced_id} from tracking")
 
             for market in markets:
                 try:
@@ -580,7 +598,8 @@ def check_scheduled_notifications():
                                 f"This is your last chance to stake!"
                             )
                         
-                        broadcast_to_all(notification, market_id)
+                        keyboard = create_market_keyboard(market_id, market_link)
+                        broadcast_to_all(notification, market_id, keyboard)
                         update_market_flag(market_id, "notified_1h")
                         logger.info(f"1 hour reminder sent for: {title}")
 
@@ -588,6 +607,7 @@ def check_scheduled_notifications():
                         
                         # try ai message
                         ai_message = generate_smart_notification(title, market_data.get("theme", "other"), "10m")
+                        market_link = market_data.get("market_link", f"https://www.b4app.xyz/m/{market_id}")
                         
                         if ai_message:
                             notification = (
@@ -603,7 +623,8 @@ def check_scheduled_notifications():
                                 f"Act Now Or Lose This Opportunity!"
                             )
                         
-                        broadcast_to_all(notification, market_id)
+                        keyboard = create_market_keyboard(market_id, market_link)
+                        broadcast_to_all(notification, market_id, keyboard)
                         update_market_flag(market_id, "notified_5m")
                         logger.info(f"10 minute reminder sent for: {title}")
 
@@ -698,6 +719,9 @@ def refresh_market(call):
     except Exception as e:
         logger.error(f"error in refresh_market: {type(e).__name__} - {str(e)}")
         bot.answer_callback_query(call.id, f"error: {str(e)}", show_alert=True)
+
+
+@bot.message_handler(commands=['getmyid'])
 def get_my_id(message):
     try:
         user_id = message.from_user.id
