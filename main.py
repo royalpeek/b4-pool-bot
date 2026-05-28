@@ -467,6 +467,15 @@ def delete_all_tracked_messages():
         raise
 
 
+def delete_callback_message(call):
+    try:
+        bot.delete_message(call.message.chat.id, call.message.message_id)
+        return True
+    except Exception as e:
+        logger.warning(f"could not delete callback message {call.message.message_id}: {e}")
+        return False
+
+
 def broadcast_to_all(message_text, market_id=None, keyboard=None, theme=None, notification_key=None):
     try:
         if notification_key and not can_send_notification(notification_key):
@@ -1034,20 +1043,23 @@ def handle_dashboard_callback(call):
         answer()
 
         if data == "admin_menu":
-            bot.edit_message_text(
-                get_stats_text(),
+            delete_callback_message(call)
+            bot.send_message(
                 call.message.chat.id,
-                call.message.message_id,
+                get_stats_text(),
                 reply_markup=build_admin_keyboard(),
                 parse_mode="HTML"
             )
         elif data == "admin_pause":
             set_pause_state(True)
+            delete_callback_message(call)
             bot.send_message(call.message.chat.id, "⏸️ Notifications paused.", parse_mode="HTML")
         elif data == "admin_resume":
             set_pause_state(False)
+            delete_callback_message(call)
             bot.send_message(call.message.chat.id, "▶️ Notifications resumed.", parse_mode="HTML")
         elif data == "admin_clean":
+            delete_callback_message(call)
             deleted_count, failed_count = delete_all_tracked_messages()
             bot.send_message(
                 call.message.chat.id,
@@ -1055,6 +1067,7 @@ def handle_dashboard_callback(call):
                 parse_mode="HTML"
             )
         elif data == "admin_test":
+            delete_callback_message(call)
             test_text = "🧪 <b>Test Notification</b>\n\nBot is online and ready."
             if ai_client:
                 test_text += "\n✅ AI Engine: Active"
@@ -1062,8 +1075,10 @@ def handle_dashboard_callback(call):
                 test_text += "\n⚠️ AI Engine: Not Configured"
             bot.send_message(call.message.chat.id, test_text, parse_mode="HTML")
         elif data == "admin_stats":
+            delete_callback_message(call)
             bot.send_message(call.message.chat.id, get_stats_text(), reply_markup=build_admin_keyboard(), parse_mode="HTML")
         elif data == "admin_tone":
+            delete_callback_message(call)
             bot.send_message(
                 call.message.chat.id,
                 f"🎛 <b>AI Tone</b>\n\nCurrent tone: <b>{get_ai_tone().title()}</b>",
@@ -1073,6 +1088,7 @@ def handle_dashboard_callback(call):
         elif data.startswith("tone_"):
             tone = data.replace("tone_", "")
             set_ai_tone(tone)
+            delete_callback_message(call)
             bot.send_message(
                 call.message.chat.id,
                 f"🎛 <b>AI Tone</b>\n\nCurrent tone: <b>{tone.title()}</b>",
