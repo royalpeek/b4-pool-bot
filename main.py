@@ -1552,7 +1552,23 @@ flask_thread.start()
 
 logger.info("Bot Is Ready")
 try:
-    bot.infinity_polling()
+    bot.remove_webhook()
+    logger.info("webhook removed before polling")
+
+    bot_info = bot.get_me()
+    logger.info(f"polling as @{bot_info.username} ({bot_info.id})")
+
+    bot.infinity_polling(
+        timeout=20,
+        long_polling_timeout=20,
+        allowed_updates=[
+            "message",
+            "edited_message",
+            "callback_query",
+            "my_chat_member",
+            "chat_member",
+        ],
+    )
 except Exception as e:
     logger.error(f"critical error in bot: {e}")
     time.sleep(10)
