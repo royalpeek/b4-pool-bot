@@ -1006,17 +1006,30 @@ def refresh_market(call):
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('admin_') or call.data.startswith('tone_') or call.data.startswith('theme_'))
 def handle_dashboard_callback(call):
+    answered = False
+
+    def answer(text=None, show_alert=False):
+        nonlocal answered
+        if answered:
+            return
+        try:
+            bot.answer_callback_query(call.id, text, show_alert=show_alert)
+            answered = True
+        except Exception as e:
+            logger.error(f"error answering callback {call.data}: {e}")
+
     try:
         data = call.data
         user_id = call.from_user.id
 
         if data.startswith("admin_") or data.startswith("tone_"):
             if not is_admin(user_id):
-                bot.answer_callback_query(call.id, "admin only", show_alert=True)
+                answer("admin only", show_alert=True)
                 return
 
+        answer()
+
         if data == "admin_menu":
-            bot.answer_callback_query(call.id)
             bot.edit_message_text(
                 get_stats_text(),
                 call.message.chat.id,
@@ -1026,22 +1039,18 @@ def handle_dashboard_callback(call):
             )
         elif data == "admin_pause":
             set_pause_state(True)
-            bot.answer_callback_query(call.id, "notifications paused")
-            bot.edit_message_text(get_stats_text(), call.message.chat.id, call.message.message_id, reply_markup=build_admin_keyboard(), parse_mode="HTML")
+            bot.send_message(call.message.chat.id, "⏸️ Notifications paused.", parse_mode="HTML")
         elif data == "admin_resume":
             set_pause_state(False)
-            bot.answer_callback_query(call.id, "notifications resumed")
-            bot.edit_message_text(get_stats_text(), call.message.chat.id, call.message.message_id, reply_markup=build_admin_keyboard(), parse_mode="HTML")
+            bot.send_message(call.message.chat.id, "▶️ Notifications resumed.", parse_mode="HTML")
         elif data == "admin_clean":
             deleted_count, failed_count = delete_all_tracked_messages()
-            bot.answer_callback_query(call.id, "cleanup complete")
             bot.send_message(
                 call.message.chat.id,
                 f"✅ <b>Message Cleanup Complete</b>\n\n🗑️ Deleted {deleted_count}\n❌ Failed {failed_count}",
                 parse_mode="HTML"
             )
         elif data == "admin_test":
-            bot.answer_callback_query(call.id, "test sent")
             test_text = "🧪 <b>Test Notification</b>\n\nBot is online and ready."
             if ai_client:
                 test_text += "\n✅ AI Engine: Active"
@@ -1049,10 +1058,8 @@ def handle_dashboard_callback(call):
                 test_text += "\n⚠️ AI Engine: Not Configured"
             bot.send_message(call.message.chat.id, test_text, parse_mode="HTML")
         elif data == "admin_stats":
-            bot.answer_callback_query(call.id)
-            bot.edit_message_text(get_stats_text(), call.message.chat.id, call.message.message_id, reply_markup=build_admin_keyboard(), parse_mode="HTML")
+            bot.send_message(call.message.chat.id, get_stats_text(), reply_markup=build_admin_keyboard(), parse_mode="HTML")
         elif data == "admin_tone":
-            bot.answer_callback_query(call.id)
             bot.send_message(
                 call.message.chat.id,
                 f"🎛 <b>AI Tone</b>\n\nCurrent tone: <b>{get_ai_tone().title()}</b>",
@@ -1062,11 +1069,9 @@ def handle_dashboard_callback(call):
         elif data.startswith("tone_"):
             tone = data.replace("tone_", "")
             set_ai_tone(tone)
-            bot.answer_callback_query(call.id, f"tone set to {tone}")
-            bot.edit_message_text(
-                f"🎛 <b>AI Tone</b>\n\nCurrent tone: <b>{tone.title()}</b>",
+            bot.send_message(
                 call.message.chat.id,
-                call.message.message_id,
+                f"🎛 <b>AI Tone</b>\n\nCurrent tone: <b>{tone.title()}</b>",
                 reply_markup=build_tone_keyboard(),
                 parse_mode="HTML"
             )
@@ -1087,12 +1092,11 @@ def handle_dashboard_callback(call):
                     updated = ["all"]
 
             set_chat_themes(chat_id, updated)
-            bot.answer_callback_query(call.id, "preferences updated")
             bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=build_theme_keyboard(updated))
 
     except Exception as e:
         logger.error(f"error handling callback {call.data}: {e}")
-        bot.answer_callback_query(call.id, "something went wrong", show_alert=True)
+        answer("something went wrong", show_alert=True)
 
 
 @bot.message_handler(commands=['getmyid'])
