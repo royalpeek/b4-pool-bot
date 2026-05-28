@@ -28,6 +28,7 @@ if not os.getenv("DATABASE_URL"):
 bot = telebot.TeleBot(bot_token)
 
 B4_API_URL = "https://b4app.xyz/api/markets"
+MARKET_LINK_BASE = os.getenv("MARKET_LINK_BASE", "https://b4app.xyz/m").rstrip("/")
 ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
 DATABASE_URL = os.getenv("DATABASE_URL")
 
@@ -58,6 +59,10 @@ else:
 
 def now_utc():
     return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def build_market_link(market_id):
+    return f"{MARKET_LINK_BASE}/{market_id}"
 
 
 def get_db():
@@ -125,6 +130,11 @@ def init_db():
                     UPDATE announced_markets
                     SET market_link = REPLACE(market_link, '/market/', '/m/')
                     WHERE market_link LIKE '%/market/%'
+                """)
+                cur.execute("""
+                    UPDATE announced_markets
+                    SET market_link = REPLACE(market_link, 'https://www.b4app.xyz', 'https://b4app.xyz')
+                    WHERE market_link LIKE 'https://www.b4app.xyz%'
                 """)
         logger.info("database tables ready")
     except Exception as e:
@@ -362,7 +372,7 @@ def get_announced_market(market_id):
 
 def save_announced_market(market_id, title, theme, end_time):
     try:
-        market_link = f"https://www.b4app.xyz/m/{market_id}"
+        market_link = build_market_link(market_id)
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
@@ -844,7 +854,7 @@ def monitor_b4_markets():
 
                         # try to generate ai notification
                         ai_message = generate_smart_notification(title, raw_theme, "new")
-                        market_link = f"https://www.b4app.xyz/m/{market_id}"
+                        market_link = build_market_link(market_id)
                         
                         if ai_message:
                             notification = (
@@ -919,7 +929,7 @@ def check_scheduled_notifications():
                         
                         # try ai message
                         ai_message = generate_smart_notification(title, market_data.get("theme", "other"), "1h")
-                        market_link = market_data.get("market_link", f"https://www.b4app.xyz/m/{market_id}")
+                        market_link = market_data.get("market_link", build_market_link(market_id))
                         
                         if ai_message:
                             notification = (
@@ -951,7 +961,7 @@ def check_scheduled_notifications():
                         
                         # try ai message
                         ai_message = generate_smart_notification(title, market_data.get("theme", "other"), "10m")
-                        market_link = market_data.get("market_link", f"https://www.b4app.xyz/m/{market_id}")
+                        market_link = market_data.get("market_link", build_market_link(market_id))
                         
                         if ai_message:
                             notification = (
@@ -1055,7 +1065,7 @@ def refresh_market(call):
                 f"⏳ Time Remaining: {mins_left}m {secs_left}s"
             )
             
-            market_link = market_data.get("market_link", f"https://www.b4app.xyz/m/{market_id}")
+            market_link = market_data.get("market_link", build_market_link(market_id))
             keyboard = create_market_keyboard(market_id, market_link)
             
             bot.edit_message_text(
