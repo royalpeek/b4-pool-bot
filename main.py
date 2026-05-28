@@ -955,7 +955,6 @@ def get_ending_soon_markets():
     return ending_soon
 
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith('refresh_'))
 def refresh_market(call):
     try:
         logger.info(f"refresh button clicked: {call.data}")
@@ -1004,7 +1003,7 @@ def refresh_market(call):
         bot.answer_callback_query(call.id, f"error: {str(e)}", show_alert=True)
 
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith('admin_') or call.data.startswith('tone_') or call.data.startswith('theme_'))
+@bot.callback_query_handler(func=lambda call: True)
 def handle_dashboard_callback(call):
     answered = False
 
@@ -1019,8 +1018,13 @@ def handle_dashboard_callback(call):
             logger.error(f"error answering callback {call.data}: {e}")
 
     try:
-        data = call.data
+        data = call.data or ""
+        logger.info(f"callback received: {data}")
         user_id = call.from_user.id
+
+        if data.startswith("refresh_"):
+            refresh_market(call)
+            return
 
         if data.startswith("admin_") or data.startswith("tone_"):
             if not is_admin(user_id):
@@ -1093,6 +1097,8 @@ def handle_dashboard_callback(call):
 
             set_chat_themes(chat_id, updated)
             bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=build_theme_keyboard(updated))
+        else:
+            bot.send_message(call.message.chat.id, f"Unknown button action: {escape_text(data)}", parse_mode="HTML")
 
     except Exception as e:
         logger.error(f"error handling callback {call.data}: {e}")
