@@ -657,7 +657,7 @@ def build_theme_keyboard(selected_themes):
     return keyboard
 
 
-def build_main_menu_keyboard(user_id=None):
+def build_main_menu_keyboard(user_id=None, chat_type=None):
     keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     keyboard.add(types.KeyboardButton("📊 Status"))
     keyboard.add(
@@ -668,7 +668,7 @@ def build_main_menu_keyboard(user_id=None):
         types.KeyboardButton("ℹ️ Help"),
         types.KeyboardButton("🆔 My ID"),
     )
-    if user_id and is_admin(user_id):
+    if chat_type == "private" and user_id and is_admin(user_id):
         keyboard.add(types.KeyboardButton("🛠 Admin"))
     return keyboard
 
@@ -1167,7 +1167,11 @@ def send_welcome(message):
             "✅ You Are Now Subscribed\n\n"
             "Sit Back And Receive Alerts!"
         )
-        bot.reply_to(message, welcome_msg, reply_markup=build_main_menu_keyboard(message.from_user.id))
+        bot.reply_to(
+            message,
+            welcome_msg,
+            reply_markup=build_main_menu_keyboard(message.from_user.id, message.chat.type)
+        )
     except Exception as e:
         logger.error(f"error in start: {e}")
 
@@ -1183,7 +1187,7 @@ def show_main_menu(message):
         bot.reply_to(
             message,
             "📋 Menu opened. Choose an option below.",
-            reply_markup=build_main_menu_keyboard(message.from_user.id)
+            reply_markup=build_main_menu_keyboard(message.from_user.id, message.chat.type)
         )
     except Exception as e:
         logger.error(f"error in menu: {e}")
