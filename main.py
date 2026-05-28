@@ -1,4 +1,4 @@
-print("NEW DEPLOY VERSION - WITH FREEMODEL AI")
+print("NEW DEPLOY VERSION - WITH CONFIGURABLE AI")
 import telebot
 from telebot import types
 import json
@@ -18,22 +18,35 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 bot_token = os.getenv("BOT_TOKEN")
+if not bot_token:
+    raise RuntimeError("BOT_TOKEN environment variable is required")
+
+if not os.getenv("DATABASE_URL"):
+    raise RuntimeError("DATABASE_URL environment variable is required")
+
 bot = telebot.TeleBot(bot_token)
 
 B4_API_URL = "https://b4app.xyz/api/markets"
 ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# Freemodel AI client
-freemodel_api_key = os.getenv("FREEMODEL_API_KEY")
-freemodel_base_url = os.getenv("FREEMODEL_BASE_URL")
+# OpenAI-compatible AI client. Supports Groq, OpenRouter, OpenAI-compatible
+# gateways, and the older FREEMODEL_* env names as a fallback.
+ai_api_key = os.getenv("AI_API_KEY") or os.getenv("GROQ_API_KEY") or os.getenv("FREEMODEL_API_KEY")
+ai_base_url = (
+    os.getenv("AI_BASE_URL")
+    or os.getenv("GROQ_BASE_URL")
+    or os.getenv("FREEMODEL_BASE_URL")
+    or ("https://api.groq.com/openai/v1" if os.getenv("GROQ_API_KEY") else None)
+)
+ai_model = os.getenv("AI_MODEL", "llama-3.1-8b-instant")
 
 ai_client = None
-if freemodel_api_key and freemodel_base_url:
-    ai_client = OpenAI(api_key=freemodel_api_key, base_url=freemodel_base_url)
-    logger.info("freemodel ai client initialized")
+if ai_api_key and ai_base_url:
+    ai_client = OpenAI(api_key=ai_api_key, base_url=ai_base_url)
+    logger.info("ai client initialized with model %s", ai_model)
 else:
-    logger.warning("freemodel not configured, using template notifications")
+    logger.warning("ai not configured, using template notifications")
 
 
 def now_utc():
@@ -66,8 +79,6 @@ def init_db():
                     )
                 """)
                 
-                cur.execute("DROP TABLE IF EXISTS announced_markets")
-
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS announced_markets (
                         market_id TEXT PRIMARY KEY,
@@ -97,6 +108,11 @@ def init_db():
                         key TEXT PRIMARY KEY,
                         value TEXT
                     )
+                """)
+                cur.execute("""
+                    UPDATE announced_markets
+                    SET market_link = REPLACE(market_link, '/market/', '/m/')
+                    WHERE market_link LIKE '%/market/%'
                 """)
         logger.info("database tables ready")
     except Exception as e:
@@ -138,7 +154,7 @@ def get_pause_state():
 
 
 def generate_smart_notification(title, theme, notification_type="new"):
-    """use groq ai to generate short, direct opinion market notifications"""
+    """Generate short, direct opinion market notifications."""
     if not ai_client:
         return None
     
@@ -159,7 +175,7 @@ be super direct. this is the last call. no fluff. lowercase."""
             return None
 
         response = ai_client.chat.completions.create(
-            model="llama-3.1-8b-instant",
+            model=ai_model,
             messages=[{"role": "user", "content": prompt}],
             max_tokens=50
         )
@@ -250,7 +266,7 @@ def get_announced_market(market_id):
 
 def save_announced_market(market_id, title, theme, end_time):
     try:
-        market_link = f"https://b4.app/market/{market_id}"
+        market_link = f"https://www.b4app.xyz/m/{market_id}"
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
@@ -263,6 +279,11 @@ def save_announced_market(market_id, title, theme, end_time):
 
 
 def update_market_flag(market_id, flag):
+    allowed_flags = {"notified_new", "notified_1h", "notified_5m", "notified_ended", "delete_scheduled"}
+    if flag not in allowed_flags:
+        logger.error(f"invalid market flag requested: {flag}")
+        return
+
     try:
         with get_db() as conn:
             with conn.cursor() as cur:
@@ -321,6 +342,34 @@ def delete_market_messages_from_db(market_id):
                 cur.execute("DELETE FROM market_messages WHERE market_id = %s", (str(market_id),))
     except Exception as e:
         logger.error(f"error deleting messages for market {market_id}: {e}")
+
+
+def delete_all_tracked_messages():
+    try:
+        with get_db() as conn:
+            with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
+                cur.execute("SELECT * FROM market_messages")
+                messages = cur.fetchall()
+
+        deleted = 0
+        failed = 0
+        for msg in messages:
+            try:
+                bot.delete_message(int(msg["chat_id"]), int(msg["message_id"]))
+                deleted += 1
+                time.sleep(0.05)
+            except Exception as e:
+                logger.error(f"error deleting message {msg['message_id']} in chat {msg['chat_id']}: {e}")
+                failed += 1
+
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM market_messages")
+
+        return deleted, failed
+    except Exception as e:
+        logger.error(f"error deleting all tracked messages: {e}")
+        raise
 
 
 def broadcast_to_all(message_text, market_id=None, keyboard=None):
@@ -941,6 +990,27 @@ def reset_notifications(message):
         bot.reply_to(message, f"❌ Error: {e}")
 
 
+@bot.message_handler(commands=['cleanmessages'])
+def clean_messages(message):
+    try:
+        if not is_admin(message.from_user.id):
+            bot.reply_to(message, "❌ Permission Denied. Admin Only Command")
+            return
+
+        deleted_count, failed_count = delete_all_tracked_messages()
+        bot.reply_to(
+            message,
+            f"✅ Message Cleanup Complete\n\n"
+            f"🗑️ Deleted {deleted_count} tracked messages\n"
+            f"❌ Failed: {failed_count}\n\n"
+            f"Market history was preserved, so active markets will not be announced as new again."
+        )
+        logger.info(f"tracked messages cleaned by admin - deleted {deleted_count}, failed {failed_count}")
+    except Exception as e:
+        logger.error(f"error in cleanmessages: {e}")
+        bot.reply_to(message, f"❌ Error: {e}")
+
+
 @bot.message_handler(commands=['pause'])
 def pause_notifications(message):
     try:
@@ -1053,6 +1123,7 @@ try:
         telebot.types.BotCommand("resume", "Resume notifications"),
         telebot.types.BotCommand("test", "Send test notification"),
         telebot.types.BotCommand("reset", "Reset all data"),
+        telebot.types.BotCommand("cleanmessages", "Delete tracked messages only"),
         telebot.types.BotCommand("broadcast", "Broadcast message"),
         telebot.types.BotCommand("stats", "Show bot statistics"),
         telebot.types.BotCommand("users", "Show user count"),
@@ -1083,7 +1154,8 @@ def hello():
 
 def run_flask():
     try:
-        app.run(host='0.0.0.0', port=5000)
+        port = int(os.getenv("PORT", "5000"))
+        app.run(host='0.0.0.0', port=port)
     except Exception as e:
         logger.error(f"error running flask: {e}")
 
