@@ -6,6 +6,7 @@ import os
 import time
 import logging
 import psycopg
+import html
 from threading import Thread
 from datetime import datetime, timezone
 import requests
@@ -40,6 +41,11 @@ ai_base_url = (
     or ("https://api.groq.com/openai/v1" if os.getenv("GROQ_API_KEY") else None)
 )
 ai_model = os.getenv("AI_MODEL", "llama-3.1-8b-instant")
+NOTIFICATION_COOLDOWN_SECONDS = int(os.getenv("NOTIFICATION_COOLDOWN_SECONDS", "2"))
+SEND_DELAY_SECONDS = float(os.getenv("SEND_DELAY_SECONDS", "0.1"))
+DAILY_SUMMARY_UTC_HOUR = int(os.getenv("DAILY_SUMMARY_UTC_HOUR", "9"))
+VALID_THEMES = ["all", "crypto", "politics", "entertainment", "sports", "travel", "current_events", "other"]
+VALID_TONES = ["casual", "urgent", "premium", "degen", "professional"]
 
 ai_client = None
 if ai_api_key and ai_base_url:
@@ -66,8 +72,13 @@ def init_db():
                     CREATE TABLE IF NOT EXISTS subscribed_chats (
                         chat_id TEXT PRIMARY KEY,
                         chat_name TEXT,
+                        themes TEXT DEFAULT 'all',
                         created_at TIMESTAMP DEFAULT NOW()
                     )
+                """)
+                cur.execute("""
+                    ALTER TABLE subscribed_chats
+                    ADD COLUMN IF NOT EXISTS themes TEXT DEFAULT 'all'
                 """)
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS users (
@@ -126,31 +137,106 @@ def is_admin(user_id):
     return user_id == ADMIN_ID
 
 
-def set_pause_state(paused):
+def set_bot_state(key, value):
     try:
         with get_db() as conn:
             with conn.cursor() as cur:
-                cur.execute("DELETE FROM bot_state WHERE key = 'paused'")
                 cur.execute("""
                     INSERT INTO bot_state (key, value)
-                    VALUES ('paused', %s)
-                """, (str(paused),))
+                    VALUES (%s, %s)
+                    ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+                """, (key, str(value)))
     except Exception as e:
-        logger.error(f"error setting pause state: {e}")
+        logger.error(f"error setting bot state {key}: {e}")
+
+
+def get_bot_state(key, default=None):
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT value FROM bot_state WHERE key = %s", (key,))
+                result = cur.fetchone()
+                if result:
+                    return result[0]
+        return default
+    except Exception as e:
+        logger.error(f"error getting bot state {key}: {e}")
+        return default
+
+
+def set_pause_state(paused):
+    set_bot_state("paused", paused)
 
 
 def get_pause_state():
+    return get_bot_state("paused", "False") == "True"
+
+
+def set_ai_tone(tone):
+    if tone not in VALID_TONES:
+        return False
+    set_bot_state("ai_tone", tone)
+    return True
+
+
+def get_ai_tone():
+    return get_bot_state("ai_tone", "casual")
+
+
+def set_chat_themes(chat_id, themes):
+    cleaned_themes = [theme for theme in themes if theme in VALID_THEMES]
+    if not cleaned_themes:
+        cleaned_themes = ["all"]
+    if "all" in cleaned_themes:
+        cleaned_themes = ["all"]
+
     try:
         with get_db() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT value FROM bot_state WHERE key = 'paused'")
-                result = cur.fetchone()
-                if result:
-                    return result[0] == 'True'
-        return False
+                cur.execute("""
+                    UPDATE subscribed_chats
+                    SET themes = %s
+                    WHERE chat_id = %s
+                """, (",".join(cleaned_themes), str(chat_id)))
     except Exception as e:
-        logger.error(f"error getting pause state: {e}")
+        logger.error(f"error setting chat themes for {chat_id}: {e}")
+
+
+def get_chat_themes(chat_id):
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT themes FROM subscribed_chats WHERE chat_id = %s", (str(chat_id),))
+                result = cur.fetchone()
+                if result and result[0]:
+                    return [theme for theme in result[0].split(",") if theme]
+    except Exception as e:
+        logger.error(f"error getting chat themes for {chat_id}: {e}")
+    return ["all"]
+
+
+def chat_wants_theme(chat_id, theme):
+    themes = get_chat_themes(chat_id)
+    return "all" in themes or theme in themes
+
+
+def clean_ai_message(message):
+    message = message.strip().strip('"').strip("'")
+    return html.escape(message[:240])
+
+
+def escape_text(value):
+    return html.escape(str(value or "").strip())
+
+
+def can_send_notification(notification_key):
+    now_ts = time.time()
+    last_sent = float(get_bot_state(f"last_sent_{notification_key}", "0") or 0)
+    if now_ts - last_sent < NOTIFICATION_COOLDOWN_SECONDS:
+        logger.warning(f"cooldown blocked notification {notification_key}")
         return False
+    set_bot_state(f"last_sent_{notification_key}", now_ts)
+    return True
 
 
 def generate_smart_notification(title, theme, notification_type="new"):
@@ -159,18 +245,27 @@ def generate_smart_notification(title, theme, notification_type="new"):
         return None
     
     try:
+        tone = get_ai_tone()
+        tone_instruction = {
+            "casual": "sound casual, warm, and direct.",
+            "urgent": "sound urgent without sounding spammy.",
+            "premium": "sound polished, confident, and concise.",
+            "degen": "sound crypto-native, playful, and sharp, but avoid offensive language.",
+            "professional": "sound clear, professional, and calm.",
+        }.get(tone, "sound casual, warm, and direct.")
+
         if notification_type == "new":
             prompt = f"""you are a b4 opinion market bot. generate a short 1-sentence call to action for a new opinion market.
 opinion: "{title}"
-be direct, brief, casual. no fluff. just get people to share their opinion. no corporate language. lowercase."""
+{tone_instruction} no fluff. just get people to share their opinion. lowercase."""
         elif notification_type == "1h":
             prompt = f"""generate a short 1-sentence reminder for an opinion market closing in 1 hour.
 opinion: "{title}"
-be direct. no fluff. just tell them to hurry up and share. lowercase."""
+{tone_instruction} no fluff. just tell them to hurry up and share. lowercase."""
         elif notification_type == "10m":
             prompt = f"""generate a short 1-sentence URGENT reminder for an opinion market closing in 10 minutes.
 opinion: "{title}"
-be super direct. this is the last call. no fluff. lowercase."""
+{tone_instruction} this is the last call. no fluff. lowercase."""
         else:
             return None
 
@@ -180,7 +275,7 @@ be super direct. this is the last call. no fluff. lowercase."""
             max_tokens=50
         )
         
-        message = response.choices[0].message.content.strip()
+        message = clean_ai_message(response.choices[0].message.content)
         logger.info(f"generated ai notification for {notification_type}: {message[:50]}...")
         return message
     except Exception as e:
@@ -372,19 +467,26 @@ def delete_all_tracked_messages():
         raise
 
 
-def broadcast_to_all(message_text, market_id=None, keyboard=None):
+def broadcast_to_all(message_text, market_id=None, keyboard=None, theme=None, notification_key=None):
     try:
+        if notification_key and not can_send_notification(notification_key):
+            return
+
         chats = get_all_chats()
         sent = 0
         for chat_id in chats:
             try:
+                if theme and not chat_wants_theme(chat_id, theme):
+                    continue
+
                 if keyboard:
-                    sent_msg = bot.send_message(int(chat_id), message_text, reply_markup=keyboard)
+                    sent_msg = bot.send_message(int(chat_id), message_text, reply_markup=keyboard, parse_mode="HTML")
                 else:
-                    sent_msg = bot.send_message(int(chat_id), message_text)
+                    sent_msg = bot.send_message(int(chat_id), message_text, parse_mode="HTML")
                 sent += 1
                 if market_id:
                     save_message_id(market_id, chat_id, sent_msg.message_id)
+                time.sleep(SEND_DELAY_SECONDS)
             except Exception as e:
                 logger.error(f"error sending to {chat_id}: {e}")
 
@@ -494,6 +596,7 @@ def create_market_keyboard(market_id, market_link):
 
 
 def format_theme(theme):
+    theme = normalize_theme(theme)
     theme_map = {
         "crypto": "🪙 Crypto",
         "politics": "🏛️ Politics",
@@ -504,6 +607,111 @@ def format_theme(theme):
         "other": "💬 General"
     }
     return theme_map.get(theme, f"💬 {theme.title()}" if theme else "💬 General")
+
+
+def normalize_theme(theme):
+    theme_text = str(theme or "other").lower()
+    for valid_theme in VALID_THEMES:
+        if valid_theme != "all" and valid_theme in theme_text:
+            return valid_theme
+    return "other"
+
+
+def build_admin_keyboard():
+    keyboard = types.InlineKeyboardMarkup(row_width=2)
+    keyboard.add(
+        types.InlineKeyboardButton("⏸ Pause", callback_data="admin_pause"),
+        types.InlineKeyboardButton("▶️ Resume", callback_data="admin_resume"),
+        types.InlineKeyboardButton("🧪 Test", callback_data="admin_test"),
+        types.InlineKeyboardButton("🧹 Clean", callback_data="admin_clean"),
+        types.InlineKeyboardButton("📊 Stats", callback_data="admin_stats"),
+        types.InlineKeyboardButton("🎛 Tone", callback_data="admin_tone"),
+    )
+    return keyboard
+
+
+def build_tone_keyboard():
+    keyboard = types.InlineKeyboardMarkup(row_width=2)
+    for tone in VALID_TONES:
+        keyboard.add(types.InlineKeyboardButton(tone.title(), callback_data=f"tone_{tone}"))
+    keyboard.add(types.InlineKeyboardButton("⬅️ Admin", callback_data="admin_menu"))
+    return keyboard
+
+
+def build_theme_keyboard(selected_themes):
+    keyboard = types.InlineKeyboardMarkup(row_width=2)
+    selected = set(selected_themes)
+    for theme in VALID_THEMES:
+        label = "All Markets" if theme == "all" else format_theme(theme)
+        prefix = "✅" if theme in selected else "☑️"
+        keyboard.add(types.InlineKeyboardButton(f"{prefix} {label}", callback_data=f"theme_{theme}"))
+    return keyboard
+
+
+def get_stats_text():
+    all_markets = get_all_announced_markets()
+    total_users = len(get_all_users())
+    total_markets = len(all_markets)
+    total_chats = len(get_all_chats())
+    active = sum(1 for m in all_markets if not m.get("notified_ended"))
+    paused = "Paused" if get_pause_state() else "Running"
+    tone = get_ai_tone().title()
+
+    return (
+        f"📊 <b>Bot Statistics</b>\n\n"
+        f"👥 Users: <b>{total_users}</b>\n"
+        f"💬 Subscribed Chats: <b>{total_chats}</b>\n"
+        f"🔍 Markets Tracked: <b>{total_markets}</b>\n"
+        f"🟢 Active Markets: <b>{active}</b>\n"
+        f"🎛 AI Tone: <b>{tone}</b>\n"
+        f"✅ Status: <b>{paused}</b>"
+    )
+
+
+def build_daily_summary_text():
+    markets = get_all_announced_markets()
+    active_markets = [m for m in markets if not m.get("notified_ended")]
+    ending_soon = get_ending_soon_markets()
+
+    theme_counts = {}
+    for market in active_markets:
+        theme = normalize_theme(market.get("theme", "other"))
+        theme_counts[theme] = theme_counts.get(theme, 0) + 1
+
+    top_themes = sorted(theme_counts.items(), key=lambda item: item[1], reverse=True)[:3]
+    theme_line = ", ".join(f"{format_theme(theme)} ({count})" for theme, count in top_themes) if top_themes else "No active themes yet"
+
+    summary = (
+        f"☀️ <b>Daily B4 Market Summary</b>\n\n"
+        f"🟢 Active Markets: <b>{len(active_markets)}</b>\n"
+        f"⏰ Ending Within 1 Hour: <b>{len(ending_soon)}</b>\n"
+        f"🏷️ Top Themes: {escape_text(theme_line)}"
+    )
+
+    if ending_soon:
+        summary += "\n\n<b>Closing Soon</b>\n"
+        for market in ending_soon[:5]:
+            mins = int(market["time_until"] / 60)
+            summary += f"• {escape_text(market['title'])} - {mins}m\n"
+
+    return summary
+
+
+def send_daily_summary_if_due():
+    now = datetime.now(timezone.utc)
+    if now.hour != DAILY_SUMMARY_UTC_HOUR:
+        return
+
+    today_key = now.strftime("%Y-%m-%d")
+    if get_bot_state("last_daily_summary_date") == today_key:
+        return
+
+    broadcast_to_all(
+        build_daily_summary_text(),
+        notification_key=f"daily_summary_{today_key}",
+    )
+    set_bot_state("last_daily_summary_date", today_key)
+    logger.info(f"daily summary sent for {today_key}")
 
 
 def monitor_b4_markets():
@@ -556,41 +764,49 @@ def monitor_b4_markets():
                     existing = get_announced_market(market_id)
                     if not existing:
                         title = str(market.get("title", "")).strip()
-                        theme = format_theme(market.get("theme", "other"))
+                        raw_theme = normalize_theme(market.get("theme", "other"))
+                        theme = format_theme(raw_theme)
                         end_time_unix = market.get("end_time")
                         end_time = datetime.fromtimestamp(int(end_time_unix), tz=timezone.utc).replace(tzinfo=None)
                         end_time_str = end_time.strftime('%b %d, %Y at %I:%M %p UTC')
 
                         # try to generate ai notification
-                        ai_message = generate_smart_notification(title, market.get("theme", "other"), "new")
+                        ai_message = generate_smart_notification(title, raw_theme, "new")
                         market_link = f"https://www.b4app.xyz/m/{market_id}"
                         
                         if ai_message:
                             notification = (
-                                f"🆕 NEW MARKET LIVE\n\n"
-                                f"📌 {title}\n\n"
-                                f"🏷️ Theme: {theme}\n"
-                                f"⏰ Closes: {end_time_str}\n\n"
+                                f"🆕 <b>NEW MARKET LIVE</b>\n\n"
+                                f"📌 <b>{escape_text(title)}</b>\n\n"
+                                f"🏷️ Theme: {escape_text(theme)}\n"
+                                f"⏰ Closes: {escape_text(end_time_str)}\n\n"
                                 f"{ai_message}"
                             )
                         else:
                             notification = (
-                                f"🆕 NEW MARKET LIVE\n\n"
-                                f"📌 {title}\n\n"
-                                f"🏷️ Theme: {theme}\n"
-                                f"⏰ Closes: {end_time_str}\n\n"
+                                f"🆕 <b>NEW MARKET LIVE</b>\n\n"
+                                f"📌 <b>{escape_text(title)}</b>\n\n"
+                                f"🏷️ Theme: {escape_text(theme)}\n"
+                                f"⏰ Closes: {escape_text(end_time_str)}\n\n"
                                 f"Place your stake now!"
                             )
 
                         keyboard = create_market_keyboard(market_id, market_link)
-                        broadcast_to_all(notification, market_id, keyboard)
-                        save_announced_market(market_id, title, theme, end_time.isoformat())
+                        broadcast_to_all(
+                            notification,
+                            market_id,
+                            keyboard,
+                            theme=raw_theme,
+                            notification_key=f"new_{market_id}",
+                        )
+                        save_announced_market(market_id, title, raw_theme, end_time.isoformat())
                         logger.info(f"new market announced: {title}")
 
                 except Exception as e:
                     logger.error(f"error processing market: {e}")
 
             check_scheduled_notifications()
+            send_daily_summary_if_due()
             time.sleep(30)
 
         except Exception as e:
@@ -612,6 +828,7 @@ def check_scheduled_notifications():
 
                 end_time_str = market_data.get("end_time")
                 title = market_data.get("title", "").strip()
+                raw_theme = normalize_theme(market_data.get("theme", "other"))
 
                 if not end_time_str or not title:
                     continue
@@ -634,21 +851,27 @@ def check_scheduled_notifications():
                         
                         if ai_message:
                             notification = (
-                                f"🔃 MARKET CLOSING SOON\n\n"
-                                f"📌 {title}\n\n"
-                                f"⏳ Time Remaining: {mins_left} Minutes\n\n"
+                                f"🔃 <b>MARKET CLOSING SOON</b>\n\n"
+                                f"📌 <b>{escape_text(title)}</b>\n\n"
+                                f"⏳ Time Remaining: <b>{mins_left} Minutes</b>\n\n"
                                 f"{ai_message}"
                             )
                         else:
                             notification = (
-                                f"🔃 MARKET CLOSING SOON\n\n"
-                                f"📌 {title}\n\n"
-                                f"⏳ Time Remaining: {mins_left} Minutes\n\n"
+                                f"🔃 <b>MARKET CLOSING SOON</b>\n\n"
+                                f"📌 <b>{escape_text(title)}</b>\n\n"
+                                f"⏳ Time Remaining: <b>{mins_left} Minutes</b>\n\n"
                                 f"This is your last chance to stake!"
                             )
                         
                         keyboard = create_market_keyboard(market_id, market_link)
-                        broadcast_to_all(notification, market_id, keyboard)
+                        broadcast_to_all(
+                            notification,
+                            market_id,
+                            keyboard,
+                            theme=raw_theme,
+                            notification_key=f"1h_{market_id}",
+                        )
                         update_market_flag(market_id, "notified_1h")
                         logger.info(f"1 hour reminder sent for: {title}")
 
@@ -660,32 +883,43 @@ def check_scheduled_notifications():
                         
                         if ai_message:
                             notification = (
-                                f"🚨 URGENT: MARKET CLOSING IN 10 MINUTES\n\n"
-                                f"📌 {title}\n\n"
+                                f"🚨 <b>URGENT: MARKET CLOSING IN 10 MINUTES</b>\n\n"
+                                f"📌 <b>{escape_text(title)}</b>\n\n"
                                 f"{ai_message}"
                             )
                         else:
                             notification = (
-                                f"🚨 URGENT: MARKET CLOSING IN 10 MINUTES\n\n"
-                                f"📌 {title}\n\n"
-                                f"⏳ Time Remaining: 10 Minutes\n\n"
+                                f"🚨 <b>URGENT: MARKET CLOSING IN 10 MINUTES</b>\n\n"
+                                f"📌 <b>{escape_text(title)}</b>\n\n"
+                                f"⏳ Time Remaining: <b>10 Minutes</b>\n\n"
                                 f"Act Now Or Lose This Opportunity!"
                             )
                         
                         keyboard = create_market_keyboard(market_id, market_link)
-                        broadcast_to_all(notification, market_id, keyboard)
+                        broadcast_to_all(
+                            notification,
+                            market_id,
+                            keyboard,
+                            theme=raw_theme,
+                            notification_key=f"10m_{market_id}",
+                        )
                         update_market_flag(market_id, "notified_5m")
                         logger.info(f"10 minute reminder sent for: {title}")
 
                 else:
                     notification = (
-                        f"⛔ MARKET CLOSED\n\n"
-                        f"📌 {title}\n\n"
+                        f"⛔ <b>MARKET CLOSED</b>\n\n"
+                        f"📌 <b>{escape_text(title)}</b>\n\n"
                         f"💰 Reward Distribution In Progress\n"
                         f"Check Your Wallet For Returns!\n\n"
                         f"🗑️ This message will be deleted in 10 minutes"
                     )
-                    broadcast_to_all(notification, market_id)
+                    broadcast_to_all(
+                        notification,
+                        market_id,
+                        theme=raw_theme,
+                        notification_key=f"closed_{market_id}",
+                    )
                     update_market_flag(market_id, "notified_ended")
                     logger.info(f"ended notification sent for: {title}")
                     schedule_message_deletion(market_id, title)
@@ -770,6 +1004,98 @@ def refresh_market(call):
         bot.answer_callback_query(call.id, f"error: {str(e)}", show_alert=True)
 
 
+@bot.callback_query_handler(func=lambda call: call.data.startswith('admin_') or call.data.startswith('tone_') or call.data.startswith('theme_'))
+def handle_dashboard_callback(call):
+    try:
+        data = call.data
+        user_id = call.from_user.id
+
+        if data.startswith("admin_") or data.startswith("tone_"):
+            if not is_admin(user_id):
+                bot.answer_callback_query(call.id, "admin only", show_alert=True)
+                return
+
+        if data == "admin_menu":
+            bot.edit_message_text(
+                get_stats_text(),
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=build_admin_keyboard(),
+                parse_mode="HTML"
+            )
+            bot.answer_callback_query(call.id)
+        elif data == "admin_pause":
+            set_pause_state(True)
+            bot.answer_callback_query(call.id, "notifications paused")
+            bot.edit_message_text(get_stats_text(), call.message.chat.id, call.message.message_id, reply_markup=build_admin_keyboard(), parse_mode="HTML")
+        elif data == "admin_resume":
+            set_pause_state(False)
+            bot.answer_callback_query(call.id, "notifications resumed")
+            bot.edit_message_text(get_stats_text(), call.message.chat.id, call.message.message_id, reply_markup=build_admin_keyboard(), parse_mode="HTML")
+        elif data == "admin_clean":
+            deleted_count, failed_count = delete_all_tracked_messages()
+            bot.answer_callback_query(call.id, "cleanup complete")
+            bot.send_message(
+                call.message.chat.id,
+                f"✅ <b>Message Cleanup Complete</b>\n\n🗑️ Deleted {deleted_count}\n❌ Failed {failed_count}",
+                parse_mode="HTML"
+            )
+        elif data == "admin_test":
+            bot.answer_callback_query(call.id, "test sent")
+            test_text = "🧪 <b>Test Notification</b>\n\nBot is online and ready."
+            if ai_client:
+                test_text += "\n✅ AI Engine: Active"
+            else:
+                test_text += "\n⚠️ AI Engine: Not Configured"
+            bot.send_message(call.message.chat.id, test_text, parse_mode="HTML")
+        elif data == "admin_stats":
+            bot.answer_callback_query(call.id)
+            bot.edit_message_text(get_stats_text(), call.message.chat.id, call.message.message_id, reply_markup=build_admin_keyboard(), parse_mode="HTML")
+        elif data == "admin_tone":
+            bot.edit_message_text(
+                f"🎛 <b>AI Tone</b>\n\nCurrent tone: <b>{get_ai_tone().title()}</b>",
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=build_tone_keyboard(),
+                parse_mode="HTML"
+            )
+            bot.answer_callback_query(call.id)
+        elif data.startswith("tone_"):
+            tone = data.replace("tone_", "")
+            set_ai_tone(tone)
+            bot.answer_callback_query(call.id, f"tone set to {tone}")
+            bot.edit_message_text(
+                f"🎛 <b>AI Tone</b>\n\nCurrent tone: <b>{tone.title()}</b>",
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=build_tone_keyboard(),
+                parse_mode="HTML"
+            )
+        elif data.startswith("theme_"):
+            chat_id = call.message.chat.id
+            theme = data.replace("theme_", "")
+            current = get_chat_themes(chat_id)
+
+            if theme == "all":
+                updated = ["all"]
+            else:
+                updated = [item for item in current if item != "all"]
+                if theme in updated:
+                    updated.remove(theme)
+                else:
+                    updated.append(theme)
+                if not updated:
+                    updated = ["all"]
+
+            set_chat_themes(chat_id, updated)
+            bot.answer_callback_query(call.id, "preferences updated")
+            bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=build_theme_keyboard(updated))
+
+    except Exception as e:
+        logger.error(f"error handling callback {call.data}: {e}")
+        bot.answer_callback_query(call.id, "something went wrong", show_alert=True)
+
+
 @bot.message_handler(commands=['getmyid'])
 def get_my_id(message):
     try:
@@ -816,6 +1142,7 @@ def send_help(message):
             "/help - Show This Message\n"
             "/status - Check Bot Status\n"
             "/liveending - Show Markets Ending Soon\n"
+            "/preferences - Choose Market Categories\n"
             "/getmyid - Get Your Telegram ID\n\n"
             "❓ What I Do:\n\n"
             "I Continuously Monitor B4 Markets And Send "
@@ -826,6 +1153,66 @@ def send_help(message):
         bot.reply_to(message, help_text)
     except Exception as e:
         logger.error(f"error in help: {e}")
+
+
+@bot.message_handler(commands=['preferences'])
+def preferences(message):
+    try:
+        save_user(message)
+        add_chat(
+            str(message.chat.id),
+            message.chat.title if message.chat.type != 'private' else f"user_{message.from_user.username or message.from_user.id}"
+        )
+        selected = get_chat_themes(message.chat.id)
+        bot.reply_to(
+            message,
+            "🏷️ <b>Market Preferences</b>\n\nChoose the market categories this chat should receive.",
+            reply_markup=build_theme_keyboard(selected),
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.error(f"error in preferences: {e}")
+
+
+@bot.message_handler(commands=['admin'])
+def admin_dashboard(message):
+    try:
+        if not is_admin(message.from_user.id):
+            bot.reply_to(message, "❌ Permission Denied. Admin Only Command")
+            return
+
+        bot.reply_to(message, get_stats_text(), reply_markup=build_admin_keyboard(), parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"error in admin dashboard: {e}")
+
+
+@bot.message_handler(commands=['tone'])
+def tone_command(message):
+    try:
+        if not is_admin(message.from_user.id):
+            bot.reply_to(message, "❌ Permission Denied. Admin Only Command")
+            return
+
+        bot.reply_to(
+            message,
+            f"🎛 <b>AI Tone</b>\n\nCurrent tone: <b>{get_ai_tone().title()}</b>",
+            reply_markup=build_tone_keyboard(),
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.error(f"error in tone command: {e}")
+
+
+@bot.message_handler(commands=['summary'])
+def summary_command(message):
+    try:
+        if not is_admin(message.from_user.id):
+            bot.reply_to(message, "❌ Permission Denied. Admin Only Command")
+            return
+
+        bot.reply_to(message, build_daily_summary_text(), parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"error in summary command: {e}")
 
 
 @bot.message_handler(commands=['status'])
@@ -914,21 +1301,7 @@ def show_stats(message):
             bot.reply_to(message, "❌ Permission Denied. Admin Only Command")
             return
 
-        all_markets = get_all_announced_markets()
-        total_users = len(get_all_users())
-        total_markets = len(all_markets)
-        total_chats = len(get_all_chats())
-        active = sum(1 for m in all_markets if not m.get("notified_ended"))
-
-        stats_msg = (
-            f"📊 Bot Statistics\n\n"
-            f"👥 Total Users: {total_users}\n"
-            f"🔍 Total Markets: {total_markets}\n"
-            f"🟢 Active Markets: {active}\n"
-            f"💬 Subscribed Chats: {total_chats}\n\n"
-            f"✅ Status: Running"
-        )
-        bot.reply_to(message, stats_msg)
+        bot.reply_to(message, get_stats_text(), parse_mode="HTML")
     except Exception as e:
         logger.error(f"error in stats: {e}")
 
@@ -945,7 +1318,7 @@ def broadcast_command(message):
             bot.reply_to(message, "Format: /broadcast Your Message Here")
             return
 
-        broadcast_msg = args[1]
+        broadcast_msg = escape_text(args[1])
         broadcast_to_all(broadcast_msg)
         bot.reply_to(message, f"📢 Message Sent To {len(get_all_chats())} Chats")
     except Exception as e:
@@ -1113,15 +1486,19 @@ try:
         telebot.types.BotCommand("help", "Show available commands"),
         telebot.types.BotCommand("status", "Check bot status"),
         telebot.types.BotCommand("liveending", "Show markets ending soon"),
+        telebot.types.BotCommand("preferences", "Choose market categories"),
         telebot.types.BotCommand("getmyid", "Get your telegram id"),
     ]
     
     bot.set_my_commands(public_commands)
     
     admin_commands = public_commands + [
+        telebot.types.BotCommand("admin", "Open admin dashboard"),
         telebot.types.BotCommand("pause", "Pause all notifications"),
         telebot.types.BotCommand("resume", "Resume notifications"),
         telebot.types.BotCommand("test", "Send test notification"),
+        telebot.types.BotCommand("tone", "Change AI message tone"),
+        telebot.types.BotCommand("summary", "Preview daily summary"),
         telebot.types.BotCommand("reset", "Reset all data"),
         telebot.types.BotCommand("cleanmessages", "Delete tracked messages only"),
         telebot.types.BotCommand("broadcast", "Broadcast message"),
