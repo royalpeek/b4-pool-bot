@@ -43,6 +43,7 @@ ai_base_url = (
 ai_model = os.getenv("AI_MODEL", "llama-3.1-8b-instant")
 NOTIFICATION_COOLDOWN_SECONDS = int(os.getenv("NOTIFICATION_COOLDOWN_SECONDS", "2"))
 SEND_DELAY_SECONDS = float(os.getenv("SEND_DELAY_SECONDS", "0.1"))
+TEMP_RESPONSE_DELETE_SECONDS = int(os.getenv("TEMP_RESPONSE_DELETE_SECONDS", "180"))
 DAILY_SUMMARY_UTC_HOUR = int(os.getenv("DAILY_SUMMARY_UTC_HOUR", "9"))
 VALID_THEMES = ["all", "crypto", "politics", "entertainment", "sports", "travel", "current_events", "other"]
 VALID_TONES = ["casual", "urgent", "premium", "degen", "professional"]
@@ -474,6 +475,40 @@ def delete_callback_message(call):
     except Exception as e:
         logger.warning(f"could not delete callback message {call.message.message_id}: {e}")
         return False
+
+
+def schedule_delete_message(chat_id, message_id, delay_seconds=None):
+    delay = TEMP_RESPONSE_DELETE_SECONDS if delay_seconds is None else delay_seconds
+    if delay <= 0:
+        return
+
+    def delete_after_delay():
+        time.sleep(delay)
+        try:
+            bot.delete_message(chat_id, message_id)
+        except Exception as e:
+            logger.info(f"could not auto-delete message {message_id} in chat {chat_id}: {e}")
+
+    Thread(target=delete_after_delay, daemon=True).start()
+
+
+def send_temp_message(chat_id, text, reply_markup=None, parse_mode=None, reply_to_message_id=None):
+    sent = bot.send_message(
+        chat_id,
+        text,
+        reply_markup=reply_markup,
+        parse_mode=parse_mode,
+        reply_to_message_id=reply_to_message_id,
+    )
+    schedule_delete_message(chat_id, sent.message_id)
+    return sent
+
+
+def reply_temp(message, text, reply_markup=None, parse_mode=None):
+    sent = bot.reply_to(message, text, reply_markup=reply_markup, parse_mode=parse_mode)
+    schedule_delete_message(message.chat.id, sent.message_id)
+    schedule_delete_message(message.chat.id, message.message_id)
+    return sent
 
 
 def broadcast_to_all(message_text, market_id=None, keyboard=None, theme=None, notification_key=None):
@@ -1060,7 +1095,7 @@ def handle_dashboard_callback(call):
 
         if data == "admin_menu":
             delete_callback_message(call)
-            bot.send_message(
+            send_temp_message(
                 call.message.chat.id,
                 get_stats_text(),
                 reply_markup=build_admin_keyboard(),
@@ -1069,15 +1104,15 @@ def handle_dashboard_callback(call):
         elif data == "admin_pause":
             set_pause_state(True)
             delete_callback_message(call)
-            bot.send_message(call.message.chat.id, "⏸️ Notifications paused.", parse_mode="HTML")
+            send_temp_message(call.message.chat.id, "⏸️ Notifications paused.", parse_mode="HTML")
         elif data == "admin_resume":
             set_pause_state(False)
             delete_callback_message(call)
-            bot.send_message(call.message.chat.id, "▶️ Notifications resumed.", parse_mode="HTML")
+            send_temp_message(call.message.chat.id, "▶️ Notifications resumed.", parse_mode="HTML")
         elif data == "admin_clean":
             delete_callback_message(call)
             deleted_count, failed_count = delete_all_tracked_messages()
-            bot.send_message(
+            send_temp_message(
                 call.message.chat.id,
                 f"✅ <b>Message Cleanup Complete</b>\n\n🗑️ Deleted {deleted_count}\n❌ Failed {failed_count}",
                 parse_mode="HTML"
@@ -1089,13 +1124,13 @@ def handle_dashboard_callback(call):
                 test_text += "\n✅ AI Engine: Active"
             else:
                 test_text += "\n⚠️ AI Engine: Not Configured"
-            bot.send_message(call.message.chat.id, test_text, parse_mode="HTML")
+            send_temp_message(call.message.chat.id, test_text, parse_mode="HTML")
         elif data == "admin_stats":
             delete_callback_message(call)
-            bot.send_message(call.message.chat.id, get_stats_text(), reply_markup=build_admin_keyboard(), parse_mode="HTML")
+            send_temp_message(call.message.chat.id, get_stats_text(), reply_markup=build_admin_keyboard(), parse_mode="HTML")
         elif data == "admin_tone":
             delete_callback_message(call)
-            bot.send_message(
+            send_temp_message(
                 call.message.chat.id,
                 f"🎛 <b>AI Tone</b>\n\nCurrent tone: <b>{get_ai_tone().title()}</b>",
                 reply_markup=build_tone_keyboard(),
@@ -1105,7 +1140,7 @@ def handle_dashboard_callback(call):
             tone = data.replace("tone_", "")
             set_ai_tone(tone)
             delete_callback_message(call)
-            bot.send_message(
+            send_temp_message(
                 call.message.chat.id,
                 f"🎛 <b>AI Tone</b>\n\nCurrent tone: <b>{tone.title()}</b>",
                 reply_markup=build_tone_keyboard(),
@@ -1130,7 +1165,7 @@ def handle_dashboard_callback(call):
             set_chat_themes(chat_id, updated)
             bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=build_theme_keyboard(updated))
         else:
-            bot.send_message(call.message.chat.id, f"Unknown button action: {escape_text(data)}", parse_mode="HTML")
+            send_temp_message(call.message.chat.id, f"Unknown button action: {escape_text(data)}", parse_mode="HTML")
 
     except Exception as e:
         logger.error(f"error handling callback {call.data}: {e}")
@@ -1143,7 +1178,7 @@ def get_my_id(message):
         user_id = message.from_user.id
         username = message.from_user.username or "No Username"
         reply = f"📱 Your Telegram ID: {user_id}\n👤 Your Username: @{username}"
-        bot.reply_to(message, reply)
+        reply_temp(message, reply)
     except Exception as e:
         logger.error(f"error in getmyid: {e}")
 
@@ -1167,7 +1202,7 @@ def send_welcome(message):
             "✅ You Are Now Subscribed\n\n"
             "Sit Back And Receive Alerts!"
         )
-        bot.reply_to(
+        reply_temp(
             message,
             welcome_msg,
             reply_markup=build_main_menu_keyboard(message.from_user.id, message.chat.type)
@@ -1184,7 +1219,7 @@ def show_main_menu(message):
             str(message.chat.id),
             message.chat.title if message.chat.type != 'private' else f"user_{message.from_user.username or message.from_user.id}"
         )
-        bot.reply_to(
+        reply_temp(
             message,
             "📋 Menu opened. Choose an option below.",
             reply_markup=build_main_menu_keyboard(message.from_user.id, message.chat.type)
@@ -1213,7 +1248,7 @@ def send_help(message):
             "Messages Are Auto-Deleted 10 Minutes After Market Closes.\n\n"
             "Never Miss A Market Opportunity!"
         )
-        bot.reply_to(message, help_text)
+        reply_temp(message, help_text)
     except Exception as e:
         logger.error(f"error in help: {e}")
 
@@ -1227,7 +1262,7 @@ def preferences(message):
             message.chat.title if message.chat.type != 'private' else f"user_{message.from_user.username or message.from_user.id}"
         )
         selected = get_chat_themes(message.chat.id)
-        bot.reply_to(
+        reply_temp(
             message,
             "🏷️ <b>Market Preferences</b>\n\nChoose the market categories this chat should receive.",
             reply_markup=build_theme_keyboard(selected),
@@ -1241,10 +1276,10 @@ def preferences(message):
 def admin_dashboard(message):
     try:
         if not is_admin(message.from_user.id):
-            bot.reply_to(message, "❌ Permission Denied. Admin Only Command")
+            reply_temp(message, "❌ Permission Denied. Admin Only Command")
             return
 
-        bot.reply_to(message, get_stats_text(), reply_markup=build_admin_keyboard(), parse_mode="HTML")
+        reply_temp(message, get_stats_text(), reply_markup=build_admin_keyboard(), parse_mode="HTML")
     except Exception as e:
         logger.error(f"error in admin dashboard: {e}")
 
@@ -1253,10 +1288,10 @@ def admin_dashboard(message):
 def tone_command(message):
     try:
         if not is_admin(message.from_user.id):
-            bot.reply_to(message, "❌ Permission Denied. Admin Only Command")
+            reply_temp(message, "❌ Permission Denied. Admin Only Command")
             return
 
-        bot.reply_to(
+        reply_temp(
             message,
             f"🎛 <b>AI Tone</b>\n\nCurrent tone: <b>{get_ai_tone().title()}</b>",
             reply_markup=build_tone_keyboard(),
@@ -1270,10 +1305,10 @@ def tone_command(message):
 def summary_command(message):
     try:
         if not is_admin(message.from_user.id):
-            bot.reply_to(message, "❌ Permission Denied. Admin Only Command")
+            reply_temp(message, "❌ Permission Denied. Admin Only Command")
             return
 
-        bot.reply_to(message, build_daily_summary_text(), parse_mode="HTML")
+        reply_temp(message, build_daily_summary_text(), parse_mode="HTML")
     except Exception as e:
         logger.error(f"error in summary command: {e}")
 
@@ -1315,7 +1350,7 @@ def market_status(message):
             f"👥 Subscribed Users/Groups: {total_chats}\n\n"
             f"✅ Status: Running & Monitoring"
         )
-        bot.reply_to(message, status_msg)
+        reply_temp(message, status_msg)
     except Exception as e:
         logger.error(f"error in status: {e}")
 
@@ -1327,7 +1362,7 @@ def live_ending(message):
         ending_soon = get_ending_soon_markets()
 
         if not ending_soon:
-            bot.reply_to(message, "⏰ No Markets Ending Within The Next Hour")
+            reply_temp(message, "⏰ No Markets Ending Within The Next Hour")
             return
 
         msg = "⏰ Markets Ending Soon\n\n"
@@ -1335,7 +1370,7 @@ def live_ending(message):
             mins = int(market["time_until"] / 60)
             msg += f"📌 {market['title']}\n⏳ Time Left: {mins} Minutes\n\n"
 
-        bot.reply_to(message, msg)
+        reply_temp(message, msg)
     except Exception as e:
         logger.error(f"error in liveending: {e}")
 
@@ -1344,10 +1379,10 @@ def live_ending(message):
 def show_users(message):
     try:
         if not is_admin(message.from_user.id):
-            bot.reply_to(message, "❌ Permission Denied. Admin Only Command")
+            reply_temp(message, "❌ Permission Denied. Admin Only Command")
             return
         total_users = len(get_all_users())
-        bot.reply_to(message, f"📊 User Statistics\n\n👥 Total Users: {total_users}")
+        reply_temp(message, f"📊 User Statistics\n\n👥 Total Users: {total_users}")
     except Exception as e:
         logger.error(f"error in users: {e}")
 
@@ -1356,12 +1391,12 @@ def show_users(message):
 def list_users(message):
     try:
         if not is_admin(message.from_user.id):
-            bot.reply_to(message, "❌ Permission Denied. Admin Only Command")
+            reply_temp(message, "❌ Permission Denied. Admin Only Command")
             return
 
         users = get_all_users()
         if not users:
-            bot.reply_to(message, "No Users Yet")
+            reply_temp(message, "No Users Yet")
             return
 
         users_list = "📋 Registered Users\n\n"
@@ -1371,7 +1406,7 @@ def list_users(message):
             join_date = user.get("join_date", "Unknown")
             users_list += f"ID: {user['user_id']}\nName: {first_name}\nUsername: @{username}\nJoined: {join_date}\n\n"
 
-        bot.reply_to(message, users_list)
+        reply_temp(message, users_list)
     except Exception as e:
         logger.error(f"error in listusers: {e}")
 
@@ -1380,10 +1415,10 @@ def list_users(message):
 def show_stats(message):
     try:
         if not is_admin(message.from_user.id):
-            bot.reply_to(message, "❌ Permission Denied. Admin Only Command")
+            reply_temp(message, "❌ Permission Denied. Admin Only Command")
             return
 
-        bot.reply_to(message, get_stats_text(), parse_mode="HTML")
+        reply_temp(message, get_stats_text(), parse_mode="HTML")
     except Exception as e:
         logger.error(f"error in stats: {e}")
 
@@ -1392,17 +1427,17 @@ def show_stats(message):
 def broadcast_command(message):
     try:
         if not is_admin(message.from_user.id):
-            bot.reply_to(message, "❌ Permission Denied. Admin Only Command")
+            reply_temp(message, "❌ Permission Denied. Admin Only Command")
             return
 
         args = message.text.split(maxsplit=1)
         if len(args) < 2:
-            bot.reply_to(message, "Format: /broadcast Your Message Here")
+            reply_temp(message, "Format: /broadcast Your Message Here")
             return
 
         broadcast_msg = escape_text(args[1])
         broadcast_to_all(broadcast_msg)
-        bot.reply_to(message, f"📢 Message Sent To {len(get_all_chats())} Chats")
+        reply_temp(message, f"📢 Message Sent To {len(get_all_chats())} Chats")
     except Exception as e:
         logger.error(f"error in broadcast: {e}")
 
@@ -1411,7 +1446,7 @@ def broadcast_command(message):
 def reset_notifications(message):
     try:
         if not is_admin(message.from_user.id):
-            bot.reply_to(message, "❌ Permission Denied. Admin Only Command")
+            reply_temp(message, "❌ Permission Denied. Admin Only Command")
             return
 
         with get_db() as conn:
@@ -1438,22 +1473,22 @@ def reset_notifications(message):
                 cur.execute("DELETE FROM announced_markets")
                 cur.execute("DELETE FROM market_messages")
         
-        bot.reply_to(message, f"✅ Reset Complete\n\n🗑️ Deleted {deleted_count} messages\n❌ Failed: {failed_count}\n\nBot will start fresh.")
+        reply_temp(message, f"✅ Reset Complete\n\n🗑️ Deleted {deleted_count} messages\n❌ Failed: {failed_count}\n\nBot will start fresh.")
         logger.info(f"notifications reset by admin - deleted {deleted_count} messages, {failed_count} failed")
     except Exception as e:
         logger.error(f"error in reset: {e}")
-        bot.reply_to(message, f"❌ Error: {e}")
+        reply_temp(message, f"❌ Error: {e}")
 
 
 @bot.message_handler(commands=['cleanmessages'])
 def clean_messages(message):
     try:
         if not is_admin(message.from_user.id):
-            bot.reply_to(message, "❌ Permission Denied. Admin Only Command")
+            reply_temp(message, "❌ Permission Denied. Admin Only Command")
             return
 
         deleted_count, failed_count = delete_all_tracked_messages()
-        bot.reply_to(
+        reply_temp(
             message,
             f"✅ Message Cleanup Complete\n\n"
             f"🗑️ Deleted {deleted_count} tracked messages\n"
@@ -1463,18 +1498,18 @@ def clean_messages(message):
         logger.info(f"tracked messages cleaned by admin - deleted {deleted_count}, failed {failed_count}")
     except Exception as e:
         logger.error(f"error in cleanmessages: {e}")
-        bot.reply_to(message, f"❌ Error: {e}")
+        reply_temp(message, f"❌ Error: {e}")
 
 
 @bot.message_handler(commands=['pause'])
 def pause_notifications(message):
     try:
         if not is_admin(message.from_user.id):
-            bot.reply_to(message, "❌ Permission Denied. Admin Only Command")
+            reply_temp(message, "❌ Permission Denied. Admin Only Command")
             return
         
         set_pause_state(True)
-        bot.reply_to(message, "⏸️ Notifications PAUSED\n\nNo more market alerts will be sent until you /resume")
+        reply_temp(message, "⏸️ Notifications PAUSED\n\nNo more market alerts will be sent until you /resume")
         logger.info("notifications paused by admin")
     except Exception as e:
         logger.error(f"error in pause: {e}")
@@ -1484,11 +1519,11 @@ def pause_notifications(message):
 def resume_notifications(message):
     try:
         if not is_admin(message.from_user.id):
-            bot.reply_to(message, "❌ Permission Denied. Admin Only Command")
+            reply_temp(message, "❌ Permission Denied. Admin Only Command")
             return
         
         set_pause_state(False)
-        bot.reply_to(message, "▶️ Notifications RESUMED\n\nMarket alerts are now active again")
+        reply_temp(message, "▶️ Notifications RESUMED\n\nMarket alerts are now active again")
         logger.info("notifications resumed by admin")
     except Exception as e:
         logger.error(f"error in resume: {e}")
@@ -1498,7 +1533,7 @@ def resume_notifications(message):
 def test_notification(message):
     try:
         if not is_admin(message.from_user.id):
-            bot.reply_to(message, "❌ Permission Denied. Admin Only Command")
+            reply_temp(message, "❌ Permission Denied. Admin Only Command")
             return
         
         test_msg = (
@@ -1514,18 +1549,18 @@ def test_notification(message):
         else:
             test_msg += "\n⚠️ AI Engine: Not Configured"
         
-        bot.send_message(message.chat.id, test_msg)
+        send_temp_message(message.chat.id, test_msg)
         logger.info("test notification sent to admin")
     except Exception as e:
         logger.error(f"error in test: {e}")
-        bot.reply_to(message, f"❌ Error: {e}")
+        reply_temp(message, f"❌ Error: {e}")
 
 
 @bot.message_handler(commands=['reinvite'])
 def reinvite_users(message):
     try:
         if not is_admin(message.from_user.id):
-            bot.reply_to(message, "❌ Permission Denied. Admin Only Command")
+            reply_temp(message, "❌ Permission Denied. Admin Only Command")
             return
         
         users = get_all_users()
@@ -1552,11 +1587,11 @@ def reinvite_users(message):
                     logger.error(f"error sending reinvite to {user_id}: {e}")
                     failed += 1
         
-        bot.reply_to(message, f"✅ Reinvite sent\n\n📨 Sent to {reinvited} users\n❌ Failed: {failed}")
+        reply_temp(message, f"✅ Reinvite sent\n\n📨 Sent to {reinvited} users\n❌ Failed: {failed}")
         logger.info(f"reinvited {reinvited} users, {failed} failed")
     except Exception as e:
         logger.error(f"error in reinvite: {e}")
-        bot.reply_to(message, f"❌ Error: {e}")
+        reply_temp(message, f"❌ Error: {e}")
 
 
 logger.info("Starting Bot...")
@@ -1648,3 +1683,5 @@ try:
 except Exception as e:
     logger.error(f"critical error in bot: {e}")
     time.sleep(10)
+
+
