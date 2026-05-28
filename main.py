@@ -1016,6 +1016,7 @@ def handle_dashboard_callback(call):
                 return
 
         if data == "admin_menu":
+            bot.answer_callback_query(call.id)
             bot.edit_message_text(
                 get_stats_text(),
                 call.message.chat.id,
@@ -1023,7 +1024,6 @@ def handle_dashboard_callback(call):
                 reply_markup=build_admin_keyboard(),
                 parse_mode="HTML"
             )
-            bot.answer_callback_query(call.id)
         elif data == "admin_pause":
             set_pause_state(True)
             bot.answer_callback_query(call.id, "notifications paused")
@@ -1052,14 +1052,13 @@ def handle_dashboard_callback(call):
             bot.answer_callback_query(call.id)
             bot.edit_message_text(get_stats_text(), call.message.chat.id, call.message.message_id, reply_markup=build_admin_keyboard(), parse_mode="HTML")
         elif data == "admin_tone":
-            bot.edit_message_text(
-                f"🎛 <b>AI Tone</b>\n\nCurrent tone: <b>{get_ai_tone().title()}</b>",
+            bot.answer_callback_query(call.id)
+            bot.send_message(
                 call.message.chat.id,
-                call.message.message_id,
+                f"🎛 <b>AI Tone</b>\n\nCurrent tone: <b>{get_ai_tone().title()}</b>",
                 reply_markup=build_tone_keyboard(),
                 parse_mode="HTML"
             )
-            bot.answer_callback_query(call.id)
         elif data.startswith("tone_"):
             tone = data.replace("tone_", "")
             set_ai_tone(tone)
