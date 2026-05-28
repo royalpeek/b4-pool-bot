@@ -492,6 +492,18 @@ def schedule_delete_message(chat_id, message_id, delay_seconds=None):
     Thread(target=delete_after_delay, daemon=True).start()
 
 
+def try_delete_user_message(message):
+    try:
+        bot.delete_message(message.chat.id, message.message_id)
+        return True
+    except Exception as e:
+        logger.info(
+            f"could not delete user message {message.message_id} in chat {message.chat.id}; "
+            f"bot may need group admin delete permission: {e}"
+        )
+        return False
+
+
 def send_temp_message(chat_id, text, reply_markup=None, parse_mode=None, reply_to_message_id=None):
     sent = bot.send_message(
         chat_id,
@@ -507,7 +519,7 @@ def send_temp_message(chat_id, text, reply_markup=None, parse_mode=None, reply_t
 def reply_temp(message, text, reply_markup=None, parse_mode=None):
     sent = bot.reply_to(message, text, reply_markup=reply_markup, parse_mode=parse_mode)
     schedule_delete_message(message.chat.id, sent.message_id)
-    schedule_delete_message(message.chat.id, message.message_id)
+    try_delete_user_message(message)
     return sent
 
 
