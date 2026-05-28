@@ -136,6 +136,12 @@ def init_db():
                     SET market_link = REPLACE(market_link, 'https://www.b4app.xyz', 'https://b4app.xyz')
                     WHERE market_link LIKE 'https://www.b4app.xyz%'
                 """)
+                cur.execute("""
+                    UPDATE announced_markets
+                    SET market_link = %s || '/' || market_id
+                    WHERE market_link IS NULL
+                       OR market_link NOT LIKE %s
+                """, (MARKET_LINK_BASE, f"{MARKET_LINK_BASE}/%"))
         logger.info("database tables ready")
     except Exception as e:
         logger.error(f"error initialising database: {e}")
@@ -582,6 +588,46 @@ def delete_all_market_messages(market_id):
         logger.info(f"deleted {deleted} messages for market {market_id}, {failed} failed")
     except Exception as e:
         logger.error(f"error in delete_all_market_messages: {e}")
+
+
+def refresh_market_message_buttons():
+    refreshed = 0
+    failed = 0
+    markets = get_all_announced_markets()
+
+    for market in markets:
+        market_id = str(market.get("market_id", "")).strip()
+        if not market_id:
+            continue
+
+        market_link = build_market_link(market_id)
+        keyboard = create_market_keyboard(market_id, market_link)
+        messages = get_market_messages(market_id)
+
+        try:
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE announced_markets SET market_link = %s WHERE market_id = %s",
+                        (market_link, market_id)
+                    )
+        except Exception as e:
+            logger.error(f"error updating stored link for {market_id}: {e}")
+
+        for msg in messages:
+            try:
+                bot.edit_message_reply_markup(
+                    int(msg["chat_id"]),
+                    int(msg["message_id"]),
+                    reply_markup=keyboard
+                )
+                refreshed += 1
+                time.sleep(0.05)
+            except Exception as e:
+                logger.error(f"error refreshing button for market {market_id}: {e}")
+                failed += 1
+
+    return refreshed, failed
 
 
 def schedule_message_deletion(market_id, title):
@@ -1523,6 +1569,26 @@ def clean_messages(message):
         reply_temp(message, f"❌ Error: {e}")
 
 
+@bot.message_handler(commands=['refreshlinks'])
+def refresh_links(message):
+    try:
+        if not is_admin(message.from_user.id):
+            reply_temp(message, "❌ Permission Denied. Admin Only Command")
+            return
+
+        refreshed, failed = refresh_market_message_buttons()
+        reply_temp(
+            message,
+            f"✅ Link Refresh Complete\n\n"
+            f"🔗 Updated buttons: {refreshed}\n"
+            f"❌ Failed: {failed}\n\n"
+            f"Current base: {MARKET_LINK_BASE}"
+        )
+    except Exception as e:
+        logger.error(f"error in refreshlinks: {e}")
+        reply_temp(message, f"❌ Error: {e}")
+
+
 @bot.message_handler(commands=['pause'])
 def pause_notifications(message):
     try:
@@ -1643,6 +1709,7 @@ try:
         telebot.types.BotCommand("summary", "Preview daily summary"),
         telebot.types.BotCommand("reset", "Reset all data"),
         telebot.types.BotCommand("cleanmessages", "Delete tracked messages only"),
+        telebot.types.BotCommand("refreshlinks", "Refresh market button links"),
         telebot.types.BotCommand("broadcast", "Broadcast message"),
         telebot.types.BotCommand("stats", "Show bot statistics"),
         telebot.types.BotCommand("users", "Show user count"),
