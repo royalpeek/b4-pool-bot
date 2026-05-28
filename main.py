@@ -657,6 +657,22 @@ def build_theme_keyboard(selected_themes):
     return keyboard
 
 
+def build_main_menu_keyboard(user_id=None):
+    keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    keyboard.add(types.KeyboardButton("📊 Status"))
+    keyboard.add(
+        types.KeyboardButton("⏰ Ending Soon"),
+        types.KeyboardButton("🏷 Preferences"),
+    )
+    keyboard.add(
+        types.KeyboardButton("ℹ️ Help"),
+        types.KeyboardButton("🆔 My ID"),
+    )
+    if user_id and is_admin(user_id):
+        keyboard.add(types.KeyboardButton("🛠 Admin"))
+    return keyboard
+
+
 def get_stats_text():
     all_markets = get_all_announced_markets()
     total_users = len(get_all_users())
@@ -1151,9 +1167,26 @@ def send_welcome(message):
             "✅ You Are Now Subscribed\n\n"
             "Sit Back And Receive Alerts!"
         )
-        bot.reply_to(message, welcome_msg)
+        bot.reply_to(message, welcome_msg, reply_markup=build_main_menu_keyboard(message.from_user.id))
     except Exception as e:
         logger.error(f"error in start: {e}")
+
+
+@bot.message_handler(commands=['menu'])
+def show_main_menu(message):
+    try:
+        save_user(message)
+        add_chat(
+            str(message.chat.id),
+            message.chat.title if message.chat.type != 'private' else f"user_{message.from_user.username or message.from_user.id}"
+        )
+        bot.reply_to(
+            message,
+            "📋 Menu opened. Choose an option below.",
+            reply_markup=build_main_menu_keyboard(message.from_user.id)
+        )
+    except Exception as e:
+        logger.error(f"error in menu: {e}")
 
 
 @bot.message_handler(commands=['help'])
@@ -1164,6 +1197,7 @@ def send_help(message):
             "📖 B4 Market Alert Bot\n\n"
             "⚙️ Available Commands:\n\n"
             "/start - Subscribe To Market Alerts\n"
+            "/menu - Open Button Menu\n"
             "/help - Show This Message\n"
             "/status - Check Bot Status\n"
             "/liveending - Show Markets Ending Soon\n"
@@ -1238,6 +1272,25 @@ def summary_command(message):
         bot.reply_to(message, build_daily_summary_text(), parse_mode="HTML")
     except Exception as e:
         logger.error(f"error in summary command: {e}")
+
+
+@bot.message_handler(func=lambda message: message.text in ["📊 Status", "⏰ Ending Soon", "🏷 Preferences", "ℹ️ Help", "🆔 My ID", "🛠 Admin"])
+def handle_menu_button(message):
+    try:
+        if message.text == "📊 Status":
+            market_status(message)
+        elif message.text == "⏰ Ending Soon":
+            live_ending(message)
+        elif message.text == "🏷 Preferences":
+            preferences(message)
+        elif message.text == "ℹ️ Help":
+            send_help(message)
+        elif message.text == "🆔 My ID":
+            get_my_id(message)
+        elif message.text == "🛠 Admin":
+            admin_dashboard(message)
+    except Exception as e:
+        logger.error(f"error handling menu button: {e}")
 
 
 @bot.message_handler(commands=['status'])
@@ -1508,6 +1561,7 @@ init_db()
 try:
     public_commands = [
         telebot.types.BotCommand("start", "Subscribe to market alerts"),
+        telebot.types.BotCommand("menu", "Open button menu"),
         telebot.types.BotCommand("help", "Show available commands"),
         telebot.types.BotCommand("status", "Check bot status"),
         telebot.types.BotCommand("liveending", "Show markets ending soon"),
