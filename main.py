@@ -1516,6 +1516,8 @@ try:
     ]
     
     bot.set_my_commands(public_commands)
+    bot.set_my_commands(public_commands, scope=telebot.types.BotCommandScopeAllPrivateChats())
+    bot.set_my_commands(public_commands, scope=telebot.types.BotCommandScopeAllGroupChats())
     
     admin_commands = public_commands + [
         telebot.types.BotCommand("admin", "Open admin dashboard"),
