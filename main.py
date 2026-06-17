@@ -8,6 +8,7 @@ import logging
 import psycopg
 import html
 from threading import Thread
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 import requests
 from openai import OpenAI
@@ -27,7 +28,7 @@ if not os.getenv("DATABASE_URL"):
 
 bot = telebot.TeleBot(bot_token)
 
-B4_API_URL = "https://b4app.xyz/api/markets"
+B4_API_URL = os.getenv("B4_API_URL", "https://www.b4app.xyz/api/markets")
 MARKET_LINK_BASE = os.getenv("MARKET_LINK_BASE", "https://b4app.xyz/m").rstrip("/")
 ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -44,6 +45,8 @@ ai_base_url = (
 ai_model = os.getenv("AI_MODEL", "llama-3.1-8b-instant")
 NOTIFICATION_COOLDOWN_SECONDS = int(os.getenv("NOTIFICATION_COOLDOWN_SECONDS", "2"))
 SEND_DELAY_SECONDS = float(os.getenv("SEND_DELAY_SECONDS", "0.1"))
+BROADCAST_WORKERS = max(1, int(os.getenv("BROADCAST_WORKERS", "4")))
+MARKET_POLL_SECONDS = float(os.getenv("MARKET_POLL_SECONDS", "5"))
 TEMP_RESPONSE_DELETE_SECONDS = int(os.getenv("TEMP_RESPONSE_DELETE_SECONDS", "180"))
 DAILY_SUMMARY_UTC_HOUR = int(os.getenv("DAILY_SUMMARY_UTC_HOUR", "9"))
 VALID_THEMES = ["all", "crypto", "politics", "entertainment", "sports", "travel", "current_events", "other"]
@@ -385,9 +388,12 @@ def save_announced_market(market_id, title, theme, end_time):
                     INSERT INTO announced_markets (market_id, title, theme, end_time, market_link, notified_new, notified_1h, notified_5m, notified_ended, delete_scheduled, detected_at)
                     VALUES (%s, %s, %s, %s, %s, TRUE, FALSE, FALSE, FALSE, FALSE, %s)
                     ON CONFLICT (market_id) DO NOTHING
+                    RETURNING market_id
                 """, (str(market_id), title, theme, end_time, market_link, now_utc().isoformat()))
+                return cur.fetchone() is not None
     except Exception as e:
         logger.error(f"error saving market {market_id}: {e}")
+    return False
 
 
 def update_market_flag(market_id, flag):
@@ -539,28 +545,63 @@ def reply_temp(message, text, reply_markup=None, parse_mode=None):
     return sent
 
 
-def broadcast_to_all(message_text, market_id=None, keyboard=None, theme=None, notification_key=None):
+def send_notification_to_chat(chat_id, message_text, market_id=None, keyboard=None, photo_url=None):
+    sent_msg = None
+    if photo_url:
+        try:
+            sent_msg = bot.send_photo(
+                int(chat_id),
+                photo_url,
+                caption=message_text,
+                reply_markup=keyboard,
+                parse_mode="HTML",
+            )
+        except Exception as e:
+            logger.warning(f"photo send failed for {chat_id}, falling back to text: {e}")
+
+    if not sent_msg:
+        if keyboard:
+            sent_msg = bot.send_message(int(chat_id), message_text, reply_markup=keyboard, parse_mode="HTML")
+        else:
+            sent_msg = bot.send_message(int(chat_id), message_text, parse_mode="HTML")
+
+    if market_id:
+        save_message_id(market_id, chat_id, sent_msg.message_id)
+    time.sleep(SEND_DELAY_SECONDS)
+    return True
+
+
+def broadcast_to_all(message_text, market_id=None, keyboard=None, theme=None, notification_key=None, photo_url=None):
     try:
         if notification_key and not can_send_notification(notification_key):
             return
 
-        chats = get_all_chats()
+        chats = [
+            chat_id for chat_id in get_all_chats()
+            if not theme or chat_wants_theme(chat_id, theme)
+        ]
         sent = 0
-        for chat_id in chats:
-            try:
-                if theme and not chat_wants_theme(chat_id, theme):
-                    continue
 
-                if keyboard:
-                    sent_msg = bot.send_message(int(chat_id), message_text, reply_markup=keyboard, parse_mode="HTML")
-                else:
-                    sent_msg = bot.send_message(int(chat_id), message_text, parse_mode="HTML")
-                sent += 1
-                if market_id:
-                    save_message_id(market_id, chat_id, sent_msg.message_id)
-                time.sleep(SEND_DELAY_SECONDS)
-            except Exception as e:
-                logger.error(f"error sending to {chat_id}: {e}")
+        if BROADCAST_WORKERS <= 1 or len(chats) <= 1:
+            for chat_id in chats:
+                try:
+                    if send_notification_to_chat(chat_id, message_text, market_id, keyboard, photo_url):
+                        sent += 1
+                except Exception as e:
+                    logger.error(f"error sending to {chat_id}: {e}")
+        else:
+            with ThreadPoolExecutor(max_workers=BROADCAST_WORKERS) as executor:
+                futures = {
+                    executor.submit(send_notification_to_chat, chat_id, message_text, market_id, keyboard, photo_url): chat_id
+                    for chat_id in chats
+                }
+                for future in as_completed(futures):
+                    chat_id = futures[future]
+                    try:
+                        if future.result():
+                            sent += 1
+                    except Exception as e:
+                        logger.error(f"error sending to {chat_id}: {e}")
 
         logger.info(f"broadcast sent to {sent} chats")
     except Exception as e:
@@ -644,7 +685,12 @@ def schedule_message_deletion(market_id, title):
 
 def fetch_b4_markets():
     try:
-        response = requests.get(B4_API_URL, timeout=15)
+        response = requests.get(
+            B4_API_URL,
+            params={"_": int(time.time())},
+            headers={"Cache-Control": "no-cache", "Pragma": "no-cache"},
+            timeout=15,
+        )
         response.raise_for_status()
         data = response.json()
 
@@ -719,6 +765,62 @@ def format_theme(theme):
         "other": "💬 General"
     }
     return theme_map.get(theme, f"💬 {theme.title()}" if theme else "💬 General")
+
+
+def get_market_cover_image(market):
+    if market.get("cover_image_status") != "ready":
+        return None
+    cover_url = str(market.get("cover_image_url") or "").strip()
+    return cover_url or None
+
+
+def build_market_promo_text(market):
+    lines = []
+
+    if market.get("first_staker_promo_available"):
+        match_amount = market.get("first_staker_match_usdc")
+        min_stake = market.get("first_staker_min_stake_usdc")
+        if match_amount and min_stake:
+            lines.append(
+                f"🎁 First-staker promo: ${escape_text(match_amount)} match for ${escape_text(min_stake)}+ stake"
+            )
+        else:
+            lines.append("🎁 First-staker promo available")
+
+    sponsor_count = int(market.get("sponsor_match_count") or 0)
+    if sponsor_count > 0:
+        label = "sponsor boost" if sponsor_count == 1 else "sponsor boosts"
+        lines.append(f"🤝 {sponsor_count} {label} active")
+
+    return "\n".join(lines)
+
+
+def build_new_market_notification(market, ai_message):
+    title = str(market.get("title", "")).strip()
+    raw_theme = normalize_theme(market.get("theme", "other"))
+    theme = format_theme(raw_theme)
+    end_time_unix = market.get("end_time")
+    end_time = datetime.fromtimestamp(int(end_time_unix), tz=timezone.utc).replace(tzinfo=None)
+    end_time_str = end_time.strftime('%b %d, %Y at %I:%M %p UTC')
+    promo_text = build_market_promo_text(market)
+
+    message = (
+        f"🆕 <b>NEW MARKET LIVE</b>\n\n"
+        f"📌 <b>{escape_text(title)}</b>\n\n"
+        f"🏷️ Theme: {escape_text(theme)}\n"
+        f"⏰ Closes: {escape_text(end_time_str)}"
+    )
+
+    if promo_text:
+        message += f"\n{promo_text}"
+
+    message += "\n\n"
+    if ai_message:
+        message += ai_message
+    else:
+        message += "Share your opinion before the market moves."
+
+    return message
 
 
 def normalize_theme(theme):
@@ -920,22 +1022,28 @@ def monitor_b4_markets():
                             )
 
                         keyboard = create_market_keyboard(market_id, market_link)
-                        broadcast_to_all(
-                            notification,
-                            market_id,
-                            keyboard,
-                            theme=raw_theme,
-                            notification_key=f"new_{market_id}",
-                        )
-                        save_announced_market(market_id, title, raw_theme, end_time.isoformat())
-                        logger.info(f"new market announced: {title}")
+                        notification = build_new_market_notification(market, ai_message)
+                        cover_image_url = get_market_cover_image(market)
+
+                        if save_announced_market(market_id, title, raw_theme, end_time.isoformat()):
+                            broadcast_to_all(
+                                notification,
+                                market_id,
+                                keyboard,
+                                theme=raw_theme,
+                                notification_key=f"new_{market_id}",
+                                photo_url=cover_image_url,
+                            )
+                            logger.info(f"new market announced: {title}")
+                        else:
+                            logger.info(f"market {market_id} was already reserved for announcement")
 
                 except Exception as e:
                     logger.error(f"error processing market: {e}")
 
             check_scheduled_notifications()
             send_daily_summary_if_due()
-            time.sleep(30)
+            time.sleep(MARKET_POLL_SECONDS)
 
         except Exception as e:
             logger.error(f"error in monitor_b4_markets: {e}")
