@@ -47,6 +47,8 @@ NOTIFICATION_COOLDOWN_SECONDS = int(os.getenv("NOTIFICATION_COOLDOWN_SECONDS", "
 SEND_DELAY_SECONDS = float(os.getenv("SEND_DELAY_SECONDS", "0.1"))
 BROADCAST_WORKERS = max(1, int(os.getenv("BROADCAST_WORKERS", "4")))
 MARKET_POLL_SECONDS = float(os.getenv("MARKET_POLL_SECONDS", "5"))
+COVER_IMAGE_WAIT_SECONDS = float(os.getenv("COVER_IMAGE_WAIT_SECONDS", "8"))
+COVER_IMAGE_RETRY_SECONDS = float(os.getenv("COVER_IMAGE_RETRY_SECONDS", "1"))
 TEMP_RESPONSE_DELETE_SECONDS = int(os.getenv("TEMP_RESPONSE_DELETE_SECONDS", "180"))
 DAILY_SUMMARY_UTC_HOUR = int(os.getenv("DAILY_SUMMARY_UTC_HOUR", "9"))
 VALID_THEMES = ["all", "crypto", "politics", "entertainment", "sports", "travel", "current_events", "other"]
@@ -774,6 +776,32 @@ def get_market_cover_image(market):
     return cover_url or None
 
 
+def wait_for_market_cover_image(market_id, market):
+    cover_url = get_market_cover_image(market)
+    if cover_url or COVER_IMAGE_WAIT_SECONDS <= 0:
+        return cover_url
+
+    deadline = time.time() + COVER_IMAGE_WAIT_SECONDS
+    while time.time() < deadline:
+        time.sleep(COVER_IMAGE_RETRY_SECONDS)
+        for latest_market in fetch_b4_markets():
+            latest_id = str(latest_market.get("market_id", "")).strip()
+            if latest_id != str(market_id):
+                continue
+            cover_url = get_market_cover_image(latest_market)
+            if cover_url:
+                logger.info(f"cover image ready for market {market_id}")
+                return cover_url
+            logger.info(
+                f"cover image not ready for market {market_id}; "
+                f"status={latest_market.get('cover_image_status')}"
+            )
+            break
+
+    logger.info(f"cover image unavailable before notification for market {market_id}")
+    return None
+
+
 def build_market_promo_text(market):
     lines = []
 
@@ -1023,7 +1051,7 @@ def monitor_b4_markets():
 
                         keyboard = create_market_keyboard(market_id, market_link)
                         notification = build_new_market_notification(market, ai_message)
-                        cover_image_url = get_market_cover_image(market)
+                        cover_image_url = wait_for_market_cover_image(market_id, market)
 
                         if save_announced_market(market_id, title, raw_theme, end_time.isoformat()):
                             broadcast_to_all(
