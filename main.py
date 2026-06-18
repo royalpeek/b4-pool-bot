@@ -27,6 +27,7 @@ if not os.getenv("DATABASE_URL"):
     raise RuntimeError("DATABASE_URL environment variable is required")
 
 bot = telebot.TeleBot(bot_token)
+TELEGRAM_API_URL = f"https://api.telegram.org/bot{bot_token}"
 
 B4_API_URL = os.getenv("B4_API_URL", "https://www.b4app.xyz/api/markets")
 MARKET_LINK_BASE = os.getenv("MARKET_LINK_BASE", "https://www.b4app.xyz/m").rstrip("/")
@@ -666,8 +667,60 @@ def reply_temp(message, text, reply_markup=None, parse_mode=None):
     return sent
 
 
-def send_notification_to_chat(chat_id, message_text, market_id=None, keyboard=None, photo_url=None):
+def keyboard_to_payload(keyboard):
+    if not keyboard:
+        return None
+    try:
+        return json.loads(keyboard.to_json())
+    except Exception as e:
+        logger.warning(f"could not encode keyboard for rich message: {e}")
+        return None
+
+
+def send_rich_message_to_chat(chat_id, rich_html, keyboard=None):
+    payload = {
+        "chat_id": int(chat_id),
+        "rich_message": {"html": rich_html},
+    }
+    reply_markup = keyboard_to_payload(keyboard)
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+
+    response = requests.post(
+        f"{TELEGRAM_API_URL}/sendRichMessage",
+        json=payload,
+        timeout=20,
+    )
+    response.raise_for_status()
+    data = response.json()
+    if not data.get("ok"):
+        raise RuntimeError(data.get("description", "sendRichMessage failed"))
+    return int(data["result"]["message_id"])
+
+
+def send_temp_rich(chat_id, rich_html, fallback_text, reply_markup=None):
+    try:
+        message_id = send_rich_message_to_chat(chat_id, rich_html, reply_markup)
+        schedule_delete_message(chat_id, message_id)
+        return message_id
+    except Exception as e:
+        logger.warning(f"rich temp message failed, falling back to text: {e}")
+        sent = send_temp_message(chat_id, fallback_text, reply_markup=reply_markup, parse_mode="HTML")
+        return sent.message_id
+
+
+def send_notification_to_chat(chat_id, message_text, market_id=None, keyboard=None, photo_url=None, rich_html=None):
     sent_msg = None
+    if rich_html:
+        try:
+            message_id = send_rich_message_to_chat(chat_id, rich_html, keyboard)
+            if market_id:
+                save_message_id(market_id, chat_id, message_id)
+            time.sleep(SEND_DELAY_SECONDS)
+            return True
+        except Exception as e:
+            logger.warning(f"rich message send failed for {chat_id}, falling back: {e}")
+
     if photo_url:
         try:
             sent_msg = bot.send_photo(
@@ -692,7 +745,7 @@ def send_notification_to_chat(chat_id, message_text, market_id=None, keyboard=No
     return True
 
 
-def broadcast_to_all(message_text, market_id=None, keyboard=None, theme=None, notification_key=None, photo_url=None, premium_only=False):
+def broadcast_to_all(message_text, market_id=None, keyboard=None, theme=None, notification_key=None, photo_url=None, premium_only=False, rich_html=None):
     try:
         if notification_key and not can_send_notification(notification_key):
             return
@@ -709,14 +762,14 @@ def broadcast_to_all(message_text, market_id=None, keyboard=None, theme=None, no
         if BROADCAST_WORKERS <= 1 or len(chats) <= 1:
             for chat_id in chats:
                 try:
-                    if send_notification_to_chat(chat_id, message_text, market_id, keyboard, photo_url):
+                    if send_notification_to_chat(chat_id, message_text, market_id, keyboard, photo_url, rich_html):
                         sent += 1
                 except Exception as e:
                     logger.error(f"error sending to {chat_id}: {e}")
         else:
             with ThreadPoolExecutor(max_workers=BROADCAST_WORKERS) as executor:
                 futures = {
-                    executor.submit(send_notification_to_chat, chat_id, message_text, market_id, keyboard, photo_url): chat_id
+                    executor.submit(send_notification_to_chat, chat_id, message_text, market_id, keyboard, photo_url, rich_html): chat_id
                     for chat_id in chats
                 }
                 for future in as_completed(futures):
@@ -1014,6 +1067,108 @@ def build_go_live_reminder_notification(market_data):
     )
 
 
+def build_rich_media_block(image_url, caption):
+    if not image_url:
+        return ""
+    return (
+        f'<figure><img src="{escape_text(image_url)}"/>'
+        f"<figcaption>{escape_text(caption)}</figcaption></figure>"
+    )
+
+
+def build_rich_scheduled_market(market):
+    title = str(market.get("title", "")).strip()
+    raw_theme = normalize_theme(market.get("theme", "other"))
+    go_live_at = get_market_go_live_at(market)
+    end_time_unix = market.get("end_time")
+    end_time = datetime.fromtimestamp(int(end_time_unix), tz=timezone.utc).replace(tzinfo=None)
+    cover_url = get_market_cover_image(market)
+    promo_text = build_market_promo_text(market) or "No promo details attached yet."
+    go_live_text = go_live_at.strftime('%b %d, %Y at %I:%M %p UTC') if go_live_at else "Soon"
+
+    return (
+        f"<h2>Premium Early Market Alert</h2>"
+        f"{build_rich_media_block(cover_url, title)}"
+        f"<p><b>{escape_text(title)}</b></p>"
+        f"<table>"
+        f"<tr><th>Theme</th><td>{escape_text(format_theme(raw_theme))}</td></tr>"
+        f"<tr><th>Goes Live</th><td>{escape_text(go_live_text)}</td></tr>"
+        f"<tr><th>Closes</th><td>{escape_text(end_time.strftime('%b %d, %Y at %I:%M %p UTC'))}</td></tr>"
+        f"</table>"
+        f"<blockquote>{escape_text(promo_text)}</blockquote>"
+        f"<p>Premium users are seeing this before the public live alert.</p>"
+    )
+
+
+def build_rich_digest():
+    markets = get_all_announced_markets()
+    scheduled = [
+        market for market in markets
+        if market.get("is_scheduled") and not market.get("notified_new") and not market.get("notified_ended")
+    ][:8]
+    active = [
+        market for market in markets
+        if market.get("notified_new") and not market.get("notified_ended")
+    ][:8]
+
+    rows = ""
+    for market in scheduled:
+        go_live_at = market.get("go_live_at")
+        parsed = go_live_at if isinstance(go_live_at, datetime) else parse_api_datetime(go_live_at)
+        go_live_text = parsed.strftime('%b %d, %I:%M %p UTC') if parsed else "Soon"
+        rows += (
+            f"<tr><td>{escape_text(market.get('title'))}</td>"
+            f"<td>Scheduled</td><td>{escape_text(go_live_text)}</td></tr>"
+        )
+    for market in active:
+        rows += (
+            f"<tr><td>{escape_text(market.get('title'))}</td>"
+            f"<td>Live</td><td>Now</td></tr>"
+        )
+    if not rows:
+        rows = "<tr><td>No markets tracked yet</td><td>-</td><td>-</td></tr>"
+
+    return (
+        f"<h2>Daily B4 Market Digest</h2>"
+        f"<p>Clean summary of scheduled and live markets. No vote counts, no volume.</p>"
+        f"<table><tr><th>Market</th><th>Status</th><th>Timing</th></tr>{rows}</table>"
+    )
+
+
+def build_rich_health():
+    checks = [
+        ("API checks", get_bot_state("last_api_check", "never")),
+        ("Last market", get_bot_state("last_market_detected", "none")),
+        ("Last notification", get_bot_state("last_notification_sent", "none")),
+        ("AI", "Active" if ai_client else "Not configured"),
+        ("Status", "Paused" if get_pause_state() else "Running"),
+    ]
+    rows = "".join(
+        f"<tr><td>{escape_text(label)}</td><td>{escape_text(value)}</td></tr>"
+        for label, value in checks
+    )
+    return (
+        f"<h2>Notify Bot Health</h2>"
+        f"<table><tr><th>Check</th><th>Value</th></tr>{rows}</table>"
+        f"<blockquote>Poll: {MARKET_POLL_SECONDS}s | Image wait: {COVER_IMAGE_WAIT_SECONDS}s</blockquote>"
+    )
+
+
+def build_rich_recent():
+    markets = get_recent_announced_markets()
+    rows = ""
+    for market in markets:
+        status = "Scheduled" if market.get("is_scheduled") and not market.get("notified_new") else "Live"
+        rows += (
+            f"<tr><td>{escape_text(market.get('title'))}</td>"
+            f"<td>{escape_text(status)}</td>"
+            f"<td>{escape_text(market.get('market_id'))}</td></tr>"
+        )
+    if not rows:
+        rows = "<tr><td>No markets yet</td><td>-</td><td>-</td></tr>"
+    return f"<h2>Recent Announced Markets</h2><table><tr><th>Market</th><th>Status</th><th>ID</th></tr>{rows}</table>"
+
+
 def schedule_image_followup(market_id, title, theme):
     if IMAGE_FOLLOWUP_WAIT_SECONDS <= 0:
         return
@@ -1231,6 +1386,7 @@ def send_daily_summary_if_due():
     broadcast_to_all(
         build_daily_summary_text(),
         notification_key=f"daily_summary_{today_key}",
+        rich_html=build_rich_digest(),
     )
     broadcast_to_all(
         build_premium_digest_text(),
@@ -1321,6 +1477,7 @@ def announce_scheduled_market_to_premium(market):
         notification_key=f"scheduled_{market_id}",
         photo_url=cover_image_url,
         premium_only=True,
+        rich_html=build_rich_scheduled_market(market),
     )
     update_market_flag(market_id, "notified_scheduled")
     set_bot_state("last_market_detected", f"{market_id} | {title} (scheduled)")
@@ -2061,7 +2218,8 @@ def health_command(message):
         if not is_admin(message.from_user.id):
             reply_temp(message, "❌ Permission Denied. Admin Only Command")
             return
-        reply_temp(message, get_health_text(), parse_mode="HTML")
+        send_temp_rich(message.chat.id, build_rich_health(), get_health_text())
+        try_delete_user_message(message)
     except Exception as e:
         logger.error(f"error in health: {e}")
 
@@ -2072,7 +2230,8 @@ def recent_command(message):
         if not is_admin(message.from_user.id):
             reply_temp(message, "❌ Permission Denied. Admin Only Command")
             return
-        reply_temp(message, build_recent_markets_text(), parse_mode="HTML")
+        send_temp_rich(message.chat.id, build_rich_recent(), build_recent_markets_text())
+        try_delete_user_message(message)
     except Exception as e:
         logger.error(f"error in recent: {e}")
 
@@ -2094,9 +2253,15 @@ def preview_command(message):
         raw_theme = normalize_theme(market.get("theme", "other"))
         if is_scheduled_market(market):
             preview_text = build_scheduled_market_notification(market)
+            rich_preview = build_rich_scheduled_market(market)
         else:
             ai_message = generate_smart_notification(str(market.get("title", "")).strip(), raw_theme, "new")
             preview_text = build_new_market_notification(market, ai_message)
+            rich_preview = (
+                f"<h2>Preview: New Market Live</h2>"
+                f"{build_rich_media_block(get_market_cover_image(market), str(market.get('title', '')).strip())}"
+                f"<blockquote>{preview_text}</blockquote>"
+            )
 
         cover_image_url = get_market_cover_image(market)
         send_notification_to_chat(
@@ -2105,6 +2270,7 @@ def preview_command(message):
             market_id=None,
             keyboard=create_market_keyboard(market_id, build_market_link(market_id)),
             photo_url=cover_image_url,
+            rich_html=rich_preview,
         )
         try_delete_user_message(message)
     except Exception as e:
