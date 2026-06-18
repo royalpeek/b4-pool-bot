@@ -360,6 +360,14 @@ def set_premium_wallet(wallet):
     return wallet
 
 
+def set_user_premium_interest(user_id, plan):
+    set_bot_state(f"premium_interest_{user_id}", normalize_premium_plan(plan))
+
+
+def get_user_premium_interest(user_id):
+    return get_bot_state(f"premium_interest_{user_id}", "")
+
+
 def add_premium_chat(chat_id, added_by, plan="monthly", expires_at=None):
     plan = normalize_premium_plan(plan)
     expires_at = expires_at or premium_expiry_for_plan(plan)
@@ -696,6 +704,48 @@ def get_all_users():
         return []
 
 
+def describe_user_for_admin(user):
+    username = f"@{user.username}" if getattr(user, "username", None) else "No username"
+    first_name = getattr(user, "first_name", "") or "No name"
+    return (
+        f"Name: <b>{escape_text(first_name)}</b>\n"
+        f"Username: <b>{escape_text(username)}</b>\n"
+        f"Telegram ID: <code>{escape_text(user.id)}</code>"
+    )
+
+
+def notify_admin_premium_event(user, plan, event_title, extra_text=None):
+    if not ADMIN_ID:
+        return
+    plan = normalize_premium_plan(plan)
+    price = PREMIUM_PLAN_PRICES.get(plan, PREMIUM_PLAN_PRICES["monthly"])
+    text = (
+        f"<b>{escape_text(event_title)}</b>\n\n"
+        f"{describe_user_for_admin(user)}\n\n"
+        f"Plan: <b>{escape_text(plan)}</b> ({escape_text(price)})\n\n"
+        "Activate after payment confirmation:\n"
+        f"<code>/premium_add {escape_text(user.id)} {escape_text(plan)}</code>"
+    )
+    if extra_text:
+        text += f"\n\n{extra_text}"
+    try:
+        rich_html = (
+            f"<h2>{escape_text(event_title)}</h2>"
+            "<table>"
+            f"<tr><th>Name</th><td>{escape_text(getattr(user, 'first_name', '') or 'No name')}</td></tr>"
+            f"<tr><th>Username</th><td>{escape_text('@' + user.username if getattr(user, 'username', None) else 'No username')}</td></tr>"
+            f"<tr><th>Telegram ID</th><td>{escape_text(user.id)}</td></tr>"
+            f"<tr><th>Plan</th><td>{escape_text(plan)} ({escape_text(price)})</td></tr>"
+            "</table>"
+            f"<blockquote>/premium_add {escape_text(user.id)} {escape_text(plan)}</blockquote>"
+        )
+        if extra_text:
+            rich_html += f"<p>{extra_text}</p>"
+        send_persistent_rich(ADMIN_ID, rich_html, text)
+    except Exception as e:
+        logger.error(f"error notifying admin about premium event: {e}")
+
+
 def get_announced_market(market_id):
     try:
         with get_db() as conn:
@@ -922,6 +972,16 @@ def send_persistent_message(chat_id, text, reply_markup=None, parse_mode=None):
         reply_markup=reply_markup,
         parse_mode=parse_mode,
     )
+
+
+def send_persistent_rich(chat_id, rich_html, fallback_text, reply_markup=None):
+    try:
+        message_id = send_rich_message_to_chat(chat_id, rich_html, reply_markup)
+        return message_id
+    except Exception as e:
+        logger.warning(f"persistent rich message failed, falling back to text: {e}")
+        sent = send_persistent_message(chat_id, fallback_text, reply_markup=reply_markup, parse_mode="HTML")
+        return sent.message_id
 
 
 def reply_persistent(message, text, reply_markup=None, parse_mode=None):
@@ -1673,7 +1733,7 @@ def build_upgrade_keyboard():
     return keyboard
 
 
-def get_upgrade_text(selected_plan=None):
+def get_upgrade_text(selected_plan=None, user_id=None):
     wallet = get_premium_wallet()
     plan_lines = [
         f"Monthly - {PREMIUM_PLAN_PRICES['monthly']}",
@@ -1703,8 +1763,50 @@ def get_upgrade_text(selected_plan=None):
     if selected_plan:
         plan = normalize_premium_plan(selected_plan)
         text += f"Selected plan: <b>{escape_text(plan)}</b> ({PREMIUM_PLAN_PRICES.get(plan, '$3')})\n\n"
+    if user_id:
+        text += f"Your Telegram ID: <code>{escape_text(user_id)}</code>\n\n"
     text += escape_text(PREMIUM_PAYMENT_TEXT)
     return text
+
+
+def get_upgrade_rich(selected_plan=None, user_id=None):
+    wallet = get_premium_wallet()
+    plan = normalize_premium_plan(selected_plan) if selected_plan else None
+    selected_row = ""
+    if plan:
+        selected_row = f"<tr><th>Selected</th><td>{escape_text(plan)} ({escape_text(PREMIUM_PLAN_PRICES.get(plan, '$3'))})</td></tr>"
+    user_row = f"<tr><th>Your ID</th><td>{escape_text(user_id)}</td></tr>" if user_id else ""
+    wallet_html = (
+        f"<blockquote>{escape_text(wallet)}</blockquote>"
+        if wallet else
+        "<blockquote>Payment address is being updated by admin.</blockquote>"
+    )
+    return (
+        "<h2>B4 Premium Access</h2>"
+        "<p>Get earlier market signals before public alerts go out.</p>"
+        "<h3>Benefits</h3>"
+        "<ul>"
+        "<li>Early scheduled-market alerts before public live alerts</li>"
+        "<li>Exact go-live time for scheduled markets</li>"
+        "<li>2-minute go-live reminders before scheduled markets open</li>"
+        "<li>Faster first-hand notice when premium opportunities appear</li>"
+        "<li>Early first-staker and sponsor promo notices when available</li>"
+        "<li>Premium market digest for upcoming and live opportunities</li>"
+        "<li>Priority access to new premium alert features</li>"
+        "</ul>"
+        "<h3>Plans</h3>"
+        "<table>"
+        f"<tr><th>Monthly</th><td>{escape_text(PREMIUM_PLAN_PRICES['monthly'])}</td></tr>"
+        f"<tr><th>3 Months</th><td>{escape_text(PREMIUM_PLAN_PRICES['3months'])}</td></tr>"
+        f"<tr><th>6 Months</th><td>{escape_text(PREMIUM_PLAN_PRICES['6months'])}</td></tr>"
+        f"<tr><th>1 Year</th><td>{escape_text(PREMIUM_PLAN_PRICES['yearly'])}</td></tr>"
+        f"{selected_row}{user_row}"
+        "</table>"
+        "<h3>Payment</h3>"
+        "<p>Pay USDC on Solana network to:</p>"
+        f"{wallet_html}"
+        f"<p>{escape_text(PREMIUM_PAYMENT_TEXT)}</p>"
+    )
 
 
 def build_admin_keyboard():
@@ -2467,20 +2569,23 @@ def handle_dashboard_callback(call):
                 answer("open the bot privately to upgrade", show_alert=True)
                 return
             if data == "upgrade_back":
-                bot.edit_message_text(
-                    "Menu is available below. Choose what you need next.",
+                delete_callback_message(call)
+                send_persistent_message(
                     call.message.chat.id,
-                    call.message.message_id,
+                    "Menu is available below. Choose what you need next.",
+                    reply_markup=build_main_menu_keyboard(call.from_user.id, call.message.chat.type),
                     parse_mode="HTML",
                 )
                 return
             plan = data.replace("upgrade_", "")
-            bot.edit_message_text(
-                get_upgrade_text(plan),
-                call.message.chat.id,
-                call.message.message_id,
+            set_user_premium_interest(call.from_user.id, plan)
+            notify_admin_premium_event(call.from_user, plan, "Premium Plan Selected")
+            delete_callback_message(call)
+            send_persistent_rich(
                 reply_markup=build_upgrade_keyboard(),
-                parse_mode="HTML"
+                chat_id=call.message.chat.id,
+                rich_html=get_upgrade_rich(plan, call.from_user.id),
+                fallback_text=get_upgrade_text(plan, call.from_user.id),
             )
         else:
             send_temp_message(call.message.chat.id, f"Unknown button action: {escape_text(data)}", parse_mode="HTML")
@@ -2580,11 +2685,12 @@ def upgrade_command(message):
         if message.chat.type != "private":
             reply_temp(message, "Please open the bot in private chat to view premium plans.")
             return
-        reply_persistent(
-            message,
-            get_upgrade_text(),
+        notify_admin_premium_event(message.from_user, "monthly", "Premium Upgrade Viewed")
+        send_persistent_rich(
+            message.chat.id,
+            get_upgrade_rich(user_id=message.from_user.id),
+            get_upgrade_text(user_id=message.from_user.id),
             reply_markup=build_upgrade_keyboard(),
-            parse_mode="HTML",
         )
     except Exception as e:
         logger.error(f"error in upgrade: {e}")
@@ -2941,6 +3047,39 @@ def handle_clean_menu_button(message):
             admin_dashboard(message)
     except Exception as e:
         logger.error(f"error handling clean menu button: {e}")
+
+
+@bot.message_handler(
+    content_types=['text', 'photo', 'document'],
+    func=lambda message: (
+        message.chat.type == "private"
+        and not is_admin(message.from_user.id)
+        and bool(get_user_premium_interest(message.from_user.id))
+        and (message.content_type != "text" or not str(message.text or "").startswith("/"))
+    )
+)
+def handle_premium_payment_proof(message):
+    try:
+        plan = get_user_premium_interest(message.from_user.id)
+
+        notify_admin_premium_event(
+            message.from_user,
+            plan,
+            "Premium Payment Proof Received",
+            extra_text="The user's proof message is forwarded below.",
+        )
+        if ADMIN_ID:
+            try:
+                bot.forward_message(ADMIN_ID, message.chat.id, message.message_id)
+            except Exception as e:
+                logger.error(f"error forwarding premium proof: {e}")
+
+        reply_persistent(
+            message,
+            "Payment proof received. Admin will confirm and activate your premium access after checking it.",
+        )
+    except Exception as e:
+        logger.error(f"error handling premium proof: {e}")
 
 
 @bot.message_handler(commands=['status'])
