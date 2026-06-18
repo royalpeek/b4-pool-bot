@@ -70,6 +70,13 @@ PREMIUM_PLAN_DAYS = {
     "6months": 180,
     "yearly": 365,
 }
+CUSTOM_EMOJI_IDS = {
+    "live": "5416081784641168838",
+    "premium": "5251203410396458957",
+    "one_hour": "5260280853841321805",
+    "ten_minutes": "5317000131822760128",
+    "ended": "5206204230582425091",
+}
 VALID_THEMES = ["all", "crypto", "politics", "entertainment", "sports", "travel", "current_events", "other"]
 VALID_TONES = ["casual", "urgent", "premium", "degen", "professional"]
 STUDIO_BUTTON_SCOPES = {
@@ -583,6 +590,13 @@ def clean_ai_message(message):
 
 def escape_text(value):
     return html.escape(str(value or "").strip())
+
+
+def custom_emoji(key, fallback):
+    emoji_id = CUSTOM_EMOJI_IDS.get(key)
+    if not emoji_id:
+        return escape_text(fallback)
+    return f'<tg-emoji emoji-id="{emoji_id}">{escape_text(fallback)}</tg-emoji>'
 
 
 def can_send_notification(notification_key):
@@ -1391,8 +1405,8 @@ def build_new_market_notification(market, ai_message):
     promo_text = build_market_promo_text(market)
 
     message = (
-        f"🆕 <b>NEW MARKET LIVE</b>\n\n"
-        f"<b>📌 {escape_text(title)}</b>\n\n"
+        f"{custom_emoji('live', '🟢')} <b>LIVE MARKET</b>\n\n"
+        f"🔥 <b>{escape_text(title)}</b>\n\n"
         f"⏰ Closes: {escape_text(end_time_str)}"
     )
 
@@ -1415,8 +1429,8 @@ def build_scheduled_market_notification(market):
     promo_text = build_market_promo_text(market)
 
     message = (
-        f"⭐ <b>PREMIUM EARLY MARKET ALERT</b>\n\n"
-        f"<b>📌 {escape_text(title)}</b>\n\n"
+        f"{custom_emoji('premium', '🛡')} <b>PREMIUM EARLY ACCESS</b>\n\n"
+        f"⚡ <b>{escape_text(title)}</b>\n\n"
         f"🚀 Goes Live: <b>{escape_text(go_live_text)}</b>"
     )
     if promo_text:
@@ -1436,8 +1450,8 @@ def build_go_live_reminder_notification(market_data):
         go_live_text = parsed.strftime('%I:%M %p UTC') if parsed else "very soon"
 
     return (
-        f"⏱️ <b>PREMIUM 2-MINUTE LIVE REMINDER</b>\n\n"
-        f"<b>📌 {escape_text(title)}</b>\n\n"
+        f"{custom_emoji('premium', '🛡')} <b>PREMIUM 2-MINUTE LIVE REMINDER</b>\n\n"
+        f"⚡ <b>{escape_text(title)}</b>\n\n"
         f"This market goes live at <b>{escape_text(go_live_text)}</b>."
     )
 
@@ -1461,9 +1475,9 @@ def build_rich_scheduled_market(market):
     go_live_text = go_live_at.strftime('%b %d, %Y at %I:%M %p UTC') if go_live_at else "Soon"
 
     fallback = (
-        f"<h2>Premium Early Market Alert</h2>"
+        f"<h3>{custom_emoji('premium', '🛡')} Premium Early Access</h3>"
         f"{build_rich_media_block(cover_url, title)}"
-        f"<h3>{escape_text(title)}</h3>"
+        f"<h2>{escape_text(title)}</h2>"
         f"<table>"
         f"<tr><th>Goes Live</th><td>{escape_text(go_live_text)}</td></tr>"
         f"<tr><th>Closes</th><td>{escape_text(end_time.strftime('%b %d, %Y at %I:%M %p UTC'))}</td></tr>"
@@ -1482,9 +1496,9 @@ def build_rich_new_market(market, ai_message, heading="New Market Live", cover_u
     promo_text = build_market_promo_text(market)
 
     html_parts = [
-        f"<h2>{escape_text(heading)}</h2>",
+        f"<h3>{custom_emoji('live', '🟢')} {escape_text(heading)}</h3>",
         build_rich_media_block(cover_url, title),
-        f"<h3>{escape_text(title)}</h3>",
+        f"<h2>{escape_text(title)}</h2>",
         "<table>",
         f"<tr><th>Closes</th><td>{escape_text(end_time.strftime('%b %d, %Y at %I:%M %p UTC'))}</td></tr>",
         "</table>",
@@ -1500,11 +1514,13 @@ def build_rich_new_market(market, ai_message, heading="New Market Live", cover_u
 
 
 def build_rich_reminder(title, minutes_left, ai_message=None, urgent=False):
-    heading = "Urgent: Market Closing Soon" if urgent else "Market Closing Soon"
+    heading = "10 Minutes Left" if urgent else "1 Hour Left"
+    emoji_key = "ten_minutes" if urgent else "one_hour"
+    emoji_fallback = "4️⃣" if urgent else "❌"
     time_text = "10 minutes" if urgent else f"{int(minutes_left)} minutes"
     html_parts = [
-        f"<h2>{heading}</h2>",
-        f"<h3>{escape_text(title)}</h3>",
+        f"<h3>{custom_emoji(emoji_key, emoji_fallback)} {heading}</h3>",
+        f"<h2>{escape_text(title)}</h2>",
         "<table>",
         f"<tr><th>Time Left</th><td>{escape_text(time_text)}</td></tr>",
         f"<tr><th>Status</th><td>{'Final call' if urgent else 'Closing soon'}</td></tr>",
@@ -1531,8 +1547,8 @@ def build_rich_go_live_reminder(market_data):
     parsed = go_live_at if isinstance(go_live_at, datetime) else parse_api_datetime(go_live_at)
     go_live_text = parsed.strftime('%I:%M %p UTC') if parsed else "very soon"
     fallback = (
-        "<h2>Premium Go-Live Reminder</h2>"
-        f"<h3>{escape_text(title)}</h3>"
+        f"<h3>{custom_emoji('premium', '🛡')} Premium Go-Live Reminder</h3>"
+        f"<h2>{escape_text(title)}</h2>"
         "<table>"
         f"<tr><th>Goes Live</th><td>{escape_text(go_live_text)}</td></tr>"
         "<tr><th>Access</th><td>Premium early reminder</td></tr>"
@@ -1548,8 +1564,8 @@ def build_rich_go_live_reminder(market_data):
 
 def build_rich_market_closed(title):
     fallback = (
-        "<h2>Market Closed</h2>"
-        f"<h3>{escape_text(title)}</h3>"
+        f"<h3>{custom_emoji('ended', '▫️')} Market Ended</h3>"
+        f"<h2>{escape_text(title)}</h2>"
         "<table>"
         "<tr><th>Status</th><td>Closed</td></tr>"
         "<tr><th>Messages</th><td>Scheduled for cleanup</td></tr>"
@@ -1563,7 +1579,7 @@ def build_rich_image_followup(title, cover_url):
     return (
         "<h2>Market Cover Ready</h2>"
         f"{build_rich_media_block(cover_url, title)}"
-        f"<h3>{escape_text(title)}</h3>"
+        f"<h2>{escape_text(title)}</h2>"
     )
 
 
@@ -2277,16 +2293,16 @@ def check_scheduled_notifications():
                         
                         if ai_message:
                             notification = (
-                                f"🔃 <b>MARKET CLOSING SOON</b>\n\n"
-                                f"<b>?? {escape_text(title)}</b>\n\n"
-                                f"⏳ Time Remaining: <b>{mins_left} Minutes</b>\n\n"
+                                f"{custom_emoji('one_hour', '!')} <b>1 HOUR LEFT</b>\n\n"
+                                f"<b>{escape_text(title)}</b>\n\n"
+                                f"Time Remaining: <b>{mins_left} Minutes</b>\n\n"
                                 f"{ai_message}"
                             )
                         else:
                             notification = (
-                                f"🔃 <b>MARKET CLOSING SOON</b>\n\n"
-                                f"<b>?? {escape_text(title)}</b>\n\n"
-                                f"⏳ Time Remaining: <b>{mins_left} Minutes</b>\n\n"
+                                f"{custom_emoji('one_hour', '!')} <b>1 HOUR LEFT</b>\n\n"
+                                f"<b>{escape_text(title)}</b>\n\n"
+                                f"Time Remaining: <b>{mins_left} Minutes</b>\n\n"
                                 f"This is your last chance to stake!"
                             )
                         
@@ -2310,15 +2326,15 @@ def check_scheduled_notifications():
                         
                         if ai_message:
                             notification = (
-                                f"🚨 <b>URGENT: MARKET CLOSING IN 10 MINUTES</b>\n\n"
-                                f"<b>?? {escape_text(title)}</b>\n\n"
+                                f"{custom_emoji('ten_minutes', '4')} <b>10 MINUTES LEFT</b>\n\n"
+                                f"<b>{escape_text(title)}</b>\n\n"
                                 f"{ai_message}"
                             )
                         else:
                             notification = (
-                                f"🚨 <b>URGENT: MARKET CLOSING IN 10 MINUTES</b>\n\n"
-                                f"<b>?? {escape_text(title)}</b>\n\n"
-                                f"⏳ Time Remaining: <b>10 Minutes</b>\n\n"
+                                f"{custom_emoji('ten_minutes', '4')} <b>10 MINUTES LEFT</b>\n\n"
+                                f"<b>{escape_text(title)}</b>\n\n"
+                                f"Time Remaining: <b>10 Minutes</b>\n\n"
                                 f"Act Now Or Lose This Opportunity!"
                             )
                         
@@ -2336,9 +2352,9 @@ def check_scheduled_notifications():
 
                 else:
                     notification = (
-                        f"⛔ <b>MARKET CLOSED</b>\n\n"
-                        f"<b>?? {escape_text(title)}</b>\n\n"
-                        f"💰 Reward Distribution In Progress\n"
+                        f"{custom_emoji('ended', '.')} <b>MARKET ENDED</b>\n\n"
+                        f"<b>{escape_text(title)}</b>\n\n"
+                        f"Reward Distribution In Progress\n"
                         f"Check Your Wallet For Returns!\n\n"
                         f"🗑️ This message will be deleted in 10 minutes"
                     )
