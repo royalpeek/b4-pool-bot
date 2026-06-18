@@ -1100,16 +1100,16 @@ def build_rich_scheduled_market(market):
     )
 
 
-def build_rich_new_market_preview(market, ai_message):
+def build_rich_new_market(market, ai_message, heading="New Market Live", cover_url=None):
     title = str(market.get("title", "")).strip()
     raw_theme = normalize_theme(market.get("theme", "other"))
     end_time_unix = market.get("end_time")
     end_time = datetime.fromtimestamp(int(end_time_unix), tz=timezone.utc).replace(tzinfo=None)
-    cover_url = get_market_cover_image(market)
+    cover_url = cover_url or get_market_cover_image(market)
     promo_text = build_market_promo_text(market)
 
     html_parts = [
-        "<h2>Preview: New Market Live</h2>",
+        f"<h2>{escape_text(heading)}</h2>",
         build_rich_media_block(cover_url, title),
         f"<p><b>{escape_text(title)}</b></p>",
         "<table>",
@@ -1124,6 +1124,60 @@ def build_rich_new_market_preview(market, ai_message):
     else:
         html_parts.append("<p>Share your opinion before the market moves.</p>")
     return "".join(html_parts)
+
+
+def build_rich_reminder(title, minutes_left, ai_message=None, urgent=False):
+    heading = "Urgent: Market Closing Soon" if urgent else "Market Closing Soon"
+    time_text = "10 minutes" if urgent else f"{int(minutes_left)} minutes"
+    html_parts = [
+        f"<h2>{heading}</h2>",
+        f"<p><b>{escape_text(title)}</b></p>",
+        "<table>",
+        f"<tr><th>Time Left</th><td>{escape_text(time_text)}</td></tr>",
+        f"<tr><th>Status</th><td>{'Final call' if urgent else 'Closing soon'}</td></tr>",
+        "</table>",
+    ]
+    if ai_message:
+        html_parts.append(f"<blockquote>{ai_message}</blockquote>")
+    else:
+        html_parts.append("<p>Share your opinion before the market closes.</p>")
+    return "".join(html_parts)
+
+
+def build_rich_go_live_reminder(market_data):
+    title = market_data.get("title", "").strip()
+    go_live_at = market_data.get("go_live_at")
+    parsed = go_live_at if isinstance(go_live_at, datetime) else parse_api_datetime(go_live_at)
+    go_live_text = parsed.strftime('%I:%M %p UTC') if parsed else "very soon"
+    return (
+        "<h2>Premium Go-Live Reminder</h2>"
+        f"<p><b>{escape_text(title)}</b></p>"
+        "<table>"
+        f"<tr><th>Goes Live</th><td>{escape_text(go_live_text)}</td></tr>"
+        "<tr><th>Access</th><td>Premium early reminder</td></tr>"
+        "</table>"
+        "<p>This market is almost live.</p>"
+    )
+
+
+def build_rich_market_closed(title):
+    return (
+        "<h2>Market Closed</h2>"
+        f"<p><b>{escape_text(title)}</b></p>"
+        "<table>"
+        "<tr><th>Status</th><td>Closed</td></tr>"
+        "<tr><th>Messages</th><td>Scheduled for cleanup</td></tr>"
+        "</table>"
+        "<p>Reward distribution may now be in progress.</p>"
+    )
+
+
+def build_rich_image_followup(title, cover_url):
+    return (
+        "<h2>Market Cover Ready</h2>"
+        f"{build_rich_media_block(cover_url, title)}"
+        f"<p><b>{escape_text(title)}</b></p>"
+    )
 
 
 def build_rich_digest():
@@ -1230,6 +1284,7 @@ def schedule_image_followup(market_id, title, theme):
                     theme=theme,
                     notification_key=f"image_followup_{market_id}",
                     photo_url=cover_url,
+                    rich_html=build_rich_image_followup(title, cover_url),
                 )
                 update_market_flag(market_id, "image_followup_sent")
                 logger.info(f"image follow-up sent for market {market_id}")
@@ -1467,6 +1522,7 @@ def announce_live_market(market, existing=None):
         theme=raw_theme,
         notification_key=f"new_{market_id}",
         photo_url=cover_image_url,
+        rich_html=build_rich_new_market(market, ai_message, cover_url=cover_image_url),
     )
     set_bot_state("last_market_detected", f"{market_id} | {title}")
     if not cover_image_url:
@@ -1613,6 +1669,7 @@ def check_scheduled_notifications():
                                 theme=raw_theme,
                                 notification_key=f"go_live_2m_{market_id}",
                                 premium_only=True,
+                                rich_html=build_rich_go_live_reminder(market_data),
                             )
                             update_market_flag(market_id, "notified_go_live_2m")
                             logger.info(f"premium go-live reminder sent for: {title}")
@@ -1655,6 +1712,7 @@ def check_scheduled_notifications():
                             keyboard,
                             theme=raw_theme,
                             notification_key=f"1h_{market_id}",
+                            rich_html=build_rich_reminder(title, mins_left, ai_message, urgent=False),
                         )
                         update_market_flag(market_id, "notified_1h")
                         logger.info(f"1 hour reminder sent for: {title}")
@@ -1686,6 +1744,7 @@ def check_scheduled_notifications():
                             keyboard,
                             theme=raw_theme,
                             notification_key=f"10m_{market_id}",
+                            rich_html=build_rich_reminder(title, 10, ai_message, urgent=True),
                         )
                         update_market_flag(market_id, "notified_5m")
                         logger.info(f"10 minute reminder sent for: {title}")
@@ -1703,6 +1762,7 @@ def check_scheduled_notifications():
                         market_id,
                         theme=raw_theme,
                         notification_key=f"closed_{market_id}",
+                        rich_html=build_rich_market_closed(title),
                     )
                     update_market_flag(market_id, "notified_ended")
                     logger.info(f"ended notification sent for: {title}")
@@ -2313,7 +2373,7 @@ def preview_command(message):
         else:
             ai_message = generate_smart_notification(str(market.get("title", "")).strip(), raw_theme, "new")
             preview_text = build_new_market_notification(market, ai_message)
-            rich_preview = build_rich_new_market_preview(market, ai_message)
+            rich_preview = build_rich_new_market(market, ai_message, heading="Preview: New Market Live")
 
         cover_image_url = get_market_cover_image(market)
         send_notification_to_chat(
