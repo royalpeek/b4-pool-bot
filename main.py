@@ -1100,6 +1100,32 @@ def build_rich_scheduled_market(market):
     )
 
 
+def build_rich_new_market_preview(market, ai_message):
+    title = str(market.get("title", "")).strip()
+    raw_theme = normalize_theme(market.get("theme", "other"))
+    end_time_unix = market.get("end_time")
+    end_time = datetime.fromtimestamp(int(end_time_unix), tz=timezone.utc).replace(tzinfo=None)
+    cover_url = get_market_cover_image(market)
+    promo_text = build_market_promo_text(market)
+
+    html_parts = [
+        "<h2>Preview: New Market Live</h2>",
+        build_rich_media_block(cover_url, title),
+        f"<p><b>{escape_text(title)}</b></p>",
+        "<table>",
+        f"<tr><th>Theme</th><td>{escape_text(format_theme(raw_theme))}</td></tr>",
+        f"<tr><th>Closes</th><td>{escape_text(end_time.strftime('%b %d, %Y at %I:%M %p UTC'))}</td></tr>",
+        "</table>",
+    ]
+    if promo_text:
+        html_parts.append(f"<blockquote>{escape_text(promo_text)}</blockquote>")
+    if ai_message:
+        html_parts.append(f"<p>{ai_message}</p>")
+    else:
+        html_parts.append("<p>Share your opinion before the market moves.</p>")
+    return "".join(html_parts)
+
+
 def build_rich_digest():
     markets = get_all_announced_markets()
     scheduled = [
@@ -1111,27 +1137,38 @@ def build_rich_digest():
         if market.get("notified_new") and not market.get("notified_ended")
     ][:8]
 
-    rows = ""
-    for market in scheduled:
+    stat_rows = (
+        f"<tr><td>Scheduled</td><td>{len(scheduled)}</td></tr>"
+        f"<tr><td>Live</td><td>{len(active)}</td></tr>"
+        f"<tr><td>Ending Soon</td><td>{len(get_ending_soon_markets())}</td></tr>"
+    )
+
+    scheduled_items = ""
+    for market in scheduled[:5]:
         go_live_at = market.get("go_live_at")
         parsed = go_live_at if isinstance(go_live_at, datetime) else parse_api_datetime(go_live_at)
         go_live_text = parsed.strftime('%b %d, %I:%M %p UTC') if parsed else "Soon"
-        rows += (
-            f"<tr><td>{escape_text(market.get('title'))}</td>"
-            f"<td>Scheduled</td><td>{escape_text(go_live_text)}</td></tr>"
+        scheduled_items += (
+            f"<li><b>{escape_text(market.get('title'))}</b><br/>"
+            f"Goes live: {escape_text(go_live_text)}</li>"
         )
-    for market in active:
-        rows += (
-            f"<tr><td>{escape_text(market.get('title'))}</td>"
-            f"<td>Live</td><td>Now</td></tr>"
+    if not scheduled_items:
+        scheduled_items = "<li>No scheduled markets tracked right now.</li>"
+
+    live_items = ""
+    for market in active[:5]:
+        live_items += (
+            f"<li><b>{escape_text(market.get('title'))}</b><br/>"
+            f"Status: Live</li>"
         )
-    if not rows:
-        rows = "<tr><td>No markets tracked yet</td><td>-</td><td>-</td></tr>"
+    if not live_items:
+        live_items = "<li>No live markets tracked right now.</li>"
 
     return (
         f"<h2>Daily B4 Market Digest</h2>"
-        f"<p>Clean summary of scheduled and live markets. No vote counts, no volume.</p>"
-        f"<table><tr><th>Market</th><th>Status</th><th>Timing</th></tr>{rows}</table>"
+        f"<table><tr><th>Category</th><th>Total</th></tr>{stat_rows}</table>"
+        f"<h3>Scheduled</h3><ul>{scheduled_items}</ul>"
+        f"<h3>Live Now</h3><ul>{live_items}</ul>"
     )
 
 
@@ -1157,16 +1194,15 @@ def build_rich_health():
 def build_rich_recent():
     markets = get_recent_announced_markets()
     rows = ""
-    for market in markets:
+    for market in markets[:8]:
         status = "Scheduled" if market.get("is_scheduled") and not market.get("notified_new") else "Live"
         rows += (
             f"<tr><td>{escape_text(market.get('title'))}</td>"
-            f"<td>{escape_text(status)}</td>"
-            f"<td>{escape_text(market.get('market_id'))}</td></tr>"
+            f"<td>{escape_text(status)}</td></tr>"
         )
     if not rows:
-        rows = "<tr><td>No markets yet</td><td>-</td><td>-</td></tr>"
-    return f"<h2>Recent Announced Markets</h2><table><tr><th>Market</th><th>Status</th><th>ID</th></tr>{rows}</table>"
+        rows = "<tr><td>No markets yet</td><td>-</td></tr>"
+    return f"<h2>Recent Announced Markets</h2><table><tr><th>Market</th><th>Status</th></tr>{rows}</table>"
 
 
 def schedule_image_followup(market_id, title, theme):
@@ -1210,16 +1246,23 @@ def normalize_theme(theme):
     return "other"
 
 
-def build_admin_keyboard():
-    keyboard = types.InlineKeyboardMarkup(row_width=2)
+def build_main_menu_keyboard(user_id=None, chat_type=None):
+    keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    keyboard.add(types.KeyboardButton("Status"))
     keyboard.add(
-        types.InlineKeyboardButton("⏸ Pause", callback_data="admin_pause"),
-        types.InlineKeyboardButton("▶️ Resume", callback_data="admin_resume"),
-        types.InlineKeyboardButton("🧪 Test", callback_data="admin_test"),
-        types.InlineKeyboardButton("🧹 Clean", callback_data="admin_clean"),
-        types.InlineKeyboardButton("📊 Stats", callback_data="admin_stats"),
-        types.InlineKeyboardButton("🎛 Tone", callback_data="admin_tone"),
+        types.KeyboardButton("Ending Soon"),
+        types.KeyboardButton("Preferences"),
     )
+    keyboard.add(
+        types.KeyboardButton("Recent"),
+        types.KeyboardButton("Daily Summary"),
+    )
+    keyboard.add(
+        types.KeyboardButton("Help"),
+        types.KeyboardButton("My ID"),
+    )
+    if chat_type == "private" and user_id and is_admin(user_id):
+        keyboard.add(types.KeyboardButton("Admin"))
     return keyboard
 
 
@@ -1241,20 +1284,6 @@ def build_theme_keyboard(selected_themes):
     return keyboard
 
 
-def build_main_menu_keyboard(user_id=None, chat_type=None):
-    keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    keyboard.add(types.KeyboardButton("📊 Status"))
-    keyboard.add(
-        types.KeyboardButton("⏰ Ending Soon"),
-        types.KeyboardButton("🏷 Preferences"),
-    )
-    keyboard.add(
-        types.KeyboardButton("ℹ️ Help"),
-        types.KeyboardButton("🆔 My ID"),
-    )
-    if chat_type == "private" and user_id and is_admin(user_id):
-        keyboard.add(types.KeyboardButton("🛠 Admin"))
-    return keyboard
 
 
 def get_stats_text():
@@ -1302,7 +1331,6 @@ def build_recent_markets_text():
         status = "scheduled" if market.get("is_scheduled") and not market.get("notified_new") else "live"
         lines.append(
             f"\n<b>{escape_text(market.get('title', 'Untitled'))}</b>\n"
-            f"ID: <code>{escape_text(market.get('market_id'))}</code>\n"
             f"Status: {escape_text(status)}"
         )
     return "\n".join(lines)
@@ -1936,6 +1964,8 @@ def send_help(message):
             "/help - Show This Message\n"
             "/status - Check Bot Status\n"
             "/liveending - Show Markets Ending Soon\n"
+            "/recent - Show Recent Announced Markets\n"
+            "/summary - Show Daily Market Summary\n"
             "/preferences - Choose Market Categories\n"
             "/getmyid - Get Your Telegram ID\n\n"
             "❓ What I Do:\n\n"
@@ -2000,11 +2030,13 @@ def tone_command(message):
 @bot.message_handler(commands=['summary'])
 def summary_command(message):
     try:
-        if not is_admin(message.from_user.id):
-            reply_temp(message, "❌ Permission Denied. Admin Only Command")
-            return
-
-        reply_temp(message, build_daily_summary_text(), parse_mode="HTML")
+        save_user(message)
+        add_chat(
+            str(message.chat.id),
+            message.chat.title if message.chat.type != 'private' else f"user_{message.from_user.username or message.from_user.id}"
+        )
+        send_temp_rich(message.chat.id, build_rich_digest(), build_daily_summary_text())
+        try_delete_user_message(message)
     except Exception as e:
         logger.error(f"error in summary command: {e}")
 
@@ -2026,6 +2058,29 @@ def handle_menu_button(message):
             admin_dashboard(message)
     except Exception as e:
         logger.error(f"error handling menu button: {e}")
+
+
+@bot.message_handler(func=lambda message: message.text in ["Status", "Ending Soon", "Preferences", "Recent", "Daily Summary", "Help", "My ID", "Admin"])
+def handle_clean_menu_button(message):
+    try:
+        if message.text == "Status":
+            market_status(message)
+        elif message.text == "Ending Soon":
+            live_ending(message)
+        elif message.text == "Preferences":
+            preferences(message)
+        elif message.text == "Recent":
+            recent_command(message)
+        elif message.text == "Daily Summary":
+            summary_command(message)
+        elif message.text == "Help":
+            send_help(message)
+        elif message.text == "My ID":
+            get_my_id(message)
+        elif message.text == "Admin":
+            admin_dashboard(message)
+    except Exception as e:
+        logger.error(f"error handling clean menu button: {e}")
 
 
 @bot.message_handler(commands=['status'])
@@ -2223,13 +2278,14 @@ def health_command(message):
     except Exception as e:
         logger.error(f"error in health: {e}")
 
-
 @bot.message_handler(commands=['recent'])
 def recent_command(message):
     try:
-        if not is_admin(message.from_user.id):
-            reply_temp(message, "❌ Permission Denied. Admin Only Command")
-            return
+        save_user(message)
+        add_chat(
+            str(message.chat.id),
+            message.chat.title if message.chat.type != 'private' else f"user_{message.from_user.username or message.from_user.id}"
+        )
         send_temp_rich(message.chat.id, build_rich_recent(), build_recent_markets_text())
         try_delete_user_message(message)
     except Exception as e:
@@ -2257,11 +2313,7 @@ def preview_command(message):
         else:
             ai_message = generate_smart_notification(str(market.get("title", "")).strip(), raw_theme, "new")
             preview_text = build_new_market_notification(market, ai_message)
-            rich_preview = (
-                f"<h2>Preview: New Market Live</h2>"
-                f"{build_rich_media_block(get_market_cover_image(market), str(market.get('title', '')).strip())}"
-                f"<blockquote>{preview_text}</blockquote>"
-            )
+            rich_preview = build_rich_new_market_preview(market, ai_message)
 
         cover_image_url = get_market_cover_image(market)
         send_notification_to_chat(
@@ -2460,6 +2512,8 @@ try:
         telebot.types.BotCommand("help", "Show available commands"),
         telebot.types.BotCommand("status", "Check bot status"),
         telebot.types.BotCommand("liveending", "Show markets ending soon"),
+        telebot.types.BotCommand("recent", "Show recent announced markets"),
+        telebot.types.BotCommand("summary", "Show daily market summary"),
         telebot.types.BotCommand("preferences", "Choose market categories"),
         telebot.types.BotCommand("getmyid", "Get your telegram id"),
     ]
@@ -2474,10 +2528,8 @@ try:
         telebot.types.BotCommand("resume", "Resume notifications"),
         telebot.types.BotCommand("test", "Send test notification"),
         telebot.types.BotCommand("tone", "Change AI message tone"),
-        telebot.types.BotCommand("summary", "Preview daily summary"),
         telebot.types.BotCommand("preview", "Preview latest market alert"),
         telebot.types.BotCommand("health", "Show bot health"),
-        telebot.types.BotCommand("recent", "Show recent announced markets"),
         telebot.types.BotCommand("premium_add", "Add premium user or chat"),
         telebot.types.BotCommand("premium_remove", "Remove premium user or chat"),
         telebot.types.BotCommand("premium_users", "List premium users or chats"),
