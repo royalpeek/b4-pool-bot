@@ -56,6 +56,16 @@ TEMP_RESPONSE_DELETE_SECONDS = int(os.getenv("TEMP_RESPONSE_DELETE_SECONDS", "18
 DAILY_SUMMARY_UTC_HOUR = int(os.getenv("DAILY_SUMMARY_UTC_HOUR", "9"))
 VALID_THEMES = ["all", "crypto", "politics", "entertainment", "sports", "travel", "current_events", "other"]
 VALID_TONES = ["casual", "urgent", "premium", "degen", "professional"]
+STUDIO_BUTTON_SCOPES = {
+    "all",
+    "new_market",
+    "scheduled_market",
+    "reminder_1h",
+    "reminder_10m",
+    "go_live_reminder",
+    "image_followup",
+    "broadcast",
+}
 
 ai_client = None
 if ai_api_key and ai_base_url:
@@ -165,6 +175,25 @@ def init_db():
                     CREATE TABLE IF NOT EXISTS premium_chats (
                         chat_id TEXT PRIMARY KEY,
                         added_by TEXT,
+                        created_at TIMESTAMP DEFAULT NOW()
+                    )
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS message_templates (
+                        template_key TEXT PRIMARY KEY,
+                        body TEXT NOT NULL,
+                        rich_body TEXT,
+                        updated_at TIMESTAMP DEFAULT NOW()
+                    )
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS custom_buttons (
+                        id SERIAL PRIMARY KEY,
+                        scope TEXT NOT NULL,
+                        label TEXT NOT NULL,
+                        url TEXT NOT NULL,
+                        sort_order INTEGER DEFAULT 100,
+                        enabled BOOLEAN DEFAULT TRUE,
                         created_at TIMESTAMP DEFAULT NOW()
                     )
                 """)
@@ -318,6 +347,164 @@ def get_premium_chat_ids():
 
 def is_premium_chat(chat_id):
     return str(chat_id) in set(get_premium_chat_ids())
+
+
+class SafeFormatDict(dict):
+    def __missing__(self, key):
+        return "{" + key + "}"
+
+
+def get_template(template_key):
+    try:
+        with get_db() as conn:
+            with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
+                cur.execute("SELECT * FROM message_templates WHERE template_key = %s", (template_key,))
+                return cur.fetchone()
+    except Exception as e:
+        logger.error(f"error fetching template {template_key}: {e}")
+        return None
+
+
+def save_template(template_key, body, rich_body=None):
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO message_templates (template_key, body, rich_body, updated_at)
+                    VALUES (%s, %s, %s, NOW())
+                    ON CONFLICT (template_key)
+                    DO UPDATE SET body = EXCLUDED.body, rich_body = EXCLUDED.rich_body, updated_at = NOW()
+                """, (template_key, body, rich_body))
+        return True
+    except Exception as e:
+        logger.error(f"error saving template {template_key}: {e}")
+        return False
+
+
+def delete_template(template_key):
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM message_templates WHERE template_key = %s", (template_key,))
+                return cur.rowcount > 0
+    except Exception as e:
+        logger.error(f"error deleting template {template_key}: {e}")
+        return False
+
+
+def list_templates():
+    try:
+        with get_db() as conn:
+            with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
+                cur.execute("SELECT * FROM message_templates ORDER BY template_key")
+                return cur.fetchall()
+    except Exception as e:
+        logger.error(f"error listing templates: {e}")
+        return []
+
+
+def simple_rich_markup(text):
+    lines = []
+    for raw_line in str(text or "").splitlines():
+        line = escape_text(raw_line)
+        if line.startswith("# "):
+            lines.append(f"<h2>{line[2:]}</h2>")
+        elif line.startswith("## "):
+            lines.append(f"<h3>{line[3:]}</h3>")
+        elif line.startswith("&gt; "):
+            lines.append(f"<blockquote>{line[5:]}</blockquote>")
+        elif line.startswith("- "):
+            lines.append(f"<li>{line[2:]}</li>")
+        elif line:
+            lines.append(f"<p>{line}</p>")
+    return "".join(lines).replace("**", "<b>", 1).replace("**", "</b>", 1)
+
+
+def render_template_text(template_key, context, fallback):
+    template = get_template(template_key)
+    body = template.get("body") if template else None
+    source = body or fallback
+    try:
+        return str(source).format_map(SafeFormatDict(context))
+    except Exception as e:
+        logger.error(f"error rendering template {template_key}: {e}")
+        return fallback
+
+
+def render_template_rich(template_key, context, fallback_rich):
+    template = get_template(template_key)
+    source = (template.get("rich_body") or template.get("body")) if template else None
+    if not source:
+        return fallback_rich
+    try:
+        rendered = str(source).format_map(SafeFormatDict(context))
+        return rendered if "<" in rendered and ">" in rendered else simple_rich_markup(rendered)
+    except Exception as e:
+        logger.error(f"error rendering rich template {template_key}: {e}")
+        return fallback_rich
+
+
+def add_custom_button(scope, label, url, sort_order=100):
+    scope = str(scope or "").strip().lower()
+    label = str(label or "").strip()
+    url = str(url or "").strip()
+    if scope not in STUDIO_BUTTON_SCOPES:
+        logger.warning(f"invalid studio button scope: {scope}")
+        return None
+    if not label or not url:
+        return None
+    if not (url.startswith("http://") or url.startswith("https://") or url.startswith("tg://") or "{" in url):
+        logger.warning(f"invalid studio button url: {url}")
+        return None
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO custom_buttons (scope, label, url, sort_order)
+                    VALUES (%s, %s, %s, %s)
+                    RETURNING id
+                """, (scope, label, url, sort_order))
+                row = cur.fetchone()
+                return row[0] if row else None
+    except Exception as e:
+        logger.error(f"error adding button {scope}: {e}")
+        return None
+
+
+def delete_custom_button(button_id):
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM custom_buttons WHERE id = %s", (button_id,))
+                return cur.rowcount > 0
+    except Exception as e:
+        logger.error(f"error deleting button {button_id}: {e}")
+        return False
+
+
+def get_custom_buttons(scope=None):
+    try:
+        with get_db() as conn:
+            with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
+                if scope:
+                    cur.execute("""
+                        SELECT * FROM custom_buttons
+                        WHERE enabled = TRUE AND scope IN ('all', %s)
+                        ORDER BY sort_order, id
+                    """, (scope,))
+                else:
+                    cur.execute("SELECT * FROM custom_buttons ORDER BY scope, sort_order, id")
+                return cur.fetchall()
+    except Exception as e:
+        logger.error(f"error fetching buttons: {e}")
+        return []
+
+
+def render_url(url, context):
+    try:
+        return str(url).format_map(SafeFormatDict(context))
+    except Exception:
+        return str(url)
 
 
 def clean_ai_message(message):
@@ -925,13 +1112,37 @@ def is_market_active(market):
         return False
 
 
-def create_market_keyboard(market_id, market_link):
+def create_market_keyboard(market_id, market_link, scope="new_market", context=None):
     """create inline buttons for market notifications"""
+    context = context or {}
+    context.setdefault("market_id", market_id)
+    context.setdefault("market_link", market_link)
     keyboard = types.InlineKeyboardMarkup()
-    keyboard.add(
-        types.InlineKeyboardButton("🗳️ Vote Now", url=market_link)
-    )
+    keyboard.add(types.InlineKeyboardButton("Vote Now", url=market_link))
+    for button in get_custom_buttons(scope):
+        keyboard.add(
+            types.InlineKeyboardButton(
+                str(button.get("label")),
+                url=render_url(button.get("url"), context),
+            )
+        )
     return keyboard
+
+
+def create_custom_keyboard(scope="broadcast", context=None):
+    """create inline buttons without the default market vote button"""
+    context = context or {}
+    keyboard = types.InlineKeyboardMarkup()
+    has_buttons = False
+    for button in get_custom_buttons(scope):
+        keyboard.add(
+            types.InlineKeyboardButton(
+                str(button.get("label")),
+                url=render_url(button.get("url"), context),
+            )
+        )
+        has_buttons = True
+    return keyboard if has_buttons else None
 
 
 def format_theme(theme):
@@ -1002,6 +1213,30 @@ def build_market_promo_text(market):
     return "\n".join(lines)
 
 
+def build_market_template_context(market, ai_message=None):
+    market_id = str(market.get("market_id", "")).strip()
+    raw_theme = normalize_theme(market.get("theme", "other"))
+    end_time_unix = market.get("end_time")
+    end_time = datetime.fromtimestamp(int(end_time_unix), tz=timezone.utc).replace(tzinfo=None) if end_time_unix else None
+    go_live_at = get_market_go_live_at(market)
+    context = {
+        "market_id": market_id,
+        "market_link": build_market_link(market_id) if market_id else "",
+        "title": escape_text(market.get("title", "")),
+        "theme": escape_text(format_theme(raw_theme)),
+        "raw_theme": escape_text(raw_theme),
+        "close_time": escape_text(end_time.strftime('%b %d, %Y at %I:%M %p UTC') if end_time else ""),
+        "go_live_time": escape_text(go_live_at.strftime('%b %d, %Y at %I:%M %p UTC') if go_live_at else ""),
+        "promo_text": escape_text(build_market_promo_text(market)),
+        "ai_text": ai_message or "",
+        "cover_image": escape_text(get_market_cover_image(market) or ""),
+        "first_staker_match_usdc": escape_text(market.get("first_staker_match_usdc", "")),
+        "first_staker_min_stake_usdc": escape_text(market.get("first_staker_min_stake_usdc", "")),
+        "sponsor_match_count": escape_text(market.get("sponsor_match_count", "")),
+    }
+    return context
+
+
 def build_new_market_notification(market, ai_message):
     title = str(market.get("title", "")).strip()
     raw_theme = normalize_theme(market.get("theme", "other"))
@@ -1027,7 +1262,7 @@ def build_new_market_notification(market, ai_message):
     else:
         message += "Share your opinion before the market moves."
 
-    return message
+    return render_template_text("new_market_text", build_market_template_context(market, ai_message), message)
 
 
 def build_scheduled_market_notification(market):
@@ -1048,7 +1283,7 @@ def build_scheduled_market_notification(market):
         message += f"\n{promo_text}"
 
     message += "\n\nPremium users are seeing this before the public live alert."
-    return message
+    return render_template_text("scheduled_market_text", build_market_template_context(market), message)
 
 
 def build_go_live_reminder_notification(market_data):
@@ -1086,7 +1321,7 @@ def build_rich_scheduled_market(market):
     promo_text = build_market_promo_text(market) or "No promo details attached yet."
     go_live_text = go_live_at.strftime('%b %d, %Y at %I:%M %p UTC') if go_live_at else "Soon"
 
-    return (
+    fallback = (
         f"<h2>Premium Early Market Alert</h2>"
         f"{build_rich_media_block(cover_url, title)}"
         f"<p><b>{escape_text(title)}</b></p>"
@@ -1098,6 +1333,7 @@ def build_rich_scheduled_market(market):
         f"<blockquote>{escape_text(promo_text)}</blockquote>"
         f"<p>Premium users are seeing this before the public live alert.</p>"
     )
+    return render_template_rich("scheduled_market_rich", build_market_template_context(market), fallback)
 
 
 def build_rich_new_market(market, ai_message, heading="New Market Live", cover_url=None):
@@ -1123,7 +1359,8 @@ def build_rich_new_market(market, ai_message, heading="New Market Live", cover_u
         html_parts.append(f"<p>{ai_message}</p>")
     else:
         html_parts.append("<p>Share your opinion before the market moves.</p>")
-    return "".join(html_parts)
+    fallback = "".join(html_parts)
+    return render_template_rich("new_market_rich", build_market_template_context(market, ai_message), fallback)
 
 
 def build_rich_reminder(title, minutes_left, ai_message=None, urgent=False):
@@ -1141,7 +1378,15 @@ def build_rich_reminder(title, minutes_left, ai_message=None, urgent=False):
         html_parts.append(f"<blockquote>{ai_message}</blockquote>")
     else:
         html_parts.append("<p>Share your opinion before the market closes.</p>")
-    return "".join(html_parts)
+    fallback = "".join(html_parts)
+    key = "reminder_10m_rich" if urgent else "reminder_1h_rich"
+    context = {
+        "title": escape_text(title),
+        "time_left": escape_text(time_text),
+        "ai_text": ai_message or "",
+        "status": "Final call" if urgent else "Closing soon",
+    }
+    return render_template_rich(key, context, fallback)
 
 
 def build_rich_go_live_reminder(market_data):
@@ -1149,7 +1394,7 @@ def build_rich_go_live_reminder(market_data):
     go_live_at = market_data.get("go_live_at")
     parsed = go_live_at if isinstance(go_live_at, datetime) else parse_api_datetime(go_live_at)
     go_live_text = parsed.strftime('%I:%M %p UTC') if parsed else "very soon"
-    return (
+    fallback = (
         "<h2>Premium Go-Live Reminder</h2>"
         f"<p><b>{escape_text(title)}</b></p>"
         "<table>"
@@ -1158,10 +1403,15 @@ def build_rich_go_live_reminder(market_data):
         "</table>"
         "<p>This market is almost live.</p>"
     )
+    return render_template_rich(
+        "go_live_reminder_rich",
+        {"title": escape_text(title), "go_live_time": escape_text(go_live_text)},
+        fallback,
+    )
 
 
 def build_rich_market_closed(title):
-    return (
+    fallback = (
         "<h2>Market Closed</h2>"
         f"<p><b>{escape_text(title)}</b></p>"
         "<table>"
@@ -1170,6 +1420,7 @@ def build_rich_market_closed(title):
         "</table>"
         "<p>Reward distribution may now be in progress.</p>"
     )
+    return render_template_rich("market_closed_rich", {"title": escape_text(title)}, fallback)
 
 
 def build_rich_image_followup(title, cover_url):
@@ -1218,11 +1469,22 @@ def build_rich_digest():
     if not live_items:
         live_items = "<li>No live markets tracked right now.</li>"
 
-    return (
+    fallback = (
         f"<h2>Daily B4 Market Digest</h2>"
         f"<table><tr><th>Category</th><th>Total</th></tr>{stat_rows}</table>"
         f"<h3>Scheduled</h3><ul>{scheduled_items}</ul>"
         f"<h3>Live Now</h3><ul>{live_items}</ul>"
+    )
+    return render_template_rich(
+        "daily_summary_rich",
+        {
+            "scheduled_count": len(scheduled),
+            "live_count": len(active),
+            "ending_soon_count": len(get_ending_soon_markets()),
+            "scheduled_items": scheduled_items,
+            "live_items": live_items,
+        },
+        fallback,
     )
 
 
@@ -1280,7 +1542,7 @@ def schedule_image_followup(market_id, title, theme):
                 broadcast_to_all(
                     message,
                     market_id,
-                    create_market_keyboard(market_id, build_market_link(market_id)),
+                    create_market_keyboard(market_id, build_market_link(market_id), scope="image_followup"),
                     theme=theme,
                     notification_key=f"image_followup_{market_id}",
                     photo_url=cover_url,
@@ -1319,6 +1581,97 @@ def build_main_menu_keyboard(user_id=None, chat_type=None):
     if chat_type == "private" and user_id and is_admin(user_id):
         keyboard.add(types.KeyboardButton("Admin"))
     return keyboard
+
+
+def build_admin_keyboard():
+    keyboard = types.InlineKeyboardMarkup(row_width=2)
+    keyboard.add(
+        types.InlineKeyboardButton("Pause", callback_data="admin_pause"),
+        types.InlineKeyboardButton("Resume", callback_data="admin_resume"),
+        types.InlineKeyboardButton("Test", callback_data="admin_test"),
+        types.InlineKeyboardButton("Clean", callback_data="admin_clean"),
+        types.InlineKeyboardButton("Stats", callback_data="admin_stats"),
+        types.InlineKeyboardButton("Tone", callback_data="admin_tone"),
+        types.InlineKeyboardButton("Studio", callback_data="studio_menu"),
+    )
+    return keyboard
+
+
+def build_studio_keyboard():
+    keyboard = types.InlineKeyboardMarkup(row_width=2)
+    keyboard.add(
+        types.InlineKeyboardButton("Templates", callback_data="studio_templates"),
+        types.InlineKeyboardButton("Buttons", callback_data="studio_buttons"),
+        types.InlineKeyboardButton("Preview", callback_data="studio_preview"),
+        types.InlineKeyboardButton("Commands", callback_data="studio_commands"),
+        types.InlineKeyboardButton("Admin", callback_data="admin_menu"),
+    )
+    return keyboard
+
+
+def get_studio_text():
+    return (
+        "<b>Admin Message Studio</b>\n\n"
+        "Edit bot wording, rich text layouts, inline buttons, social links, and broadcast helpers without touching code.\n\n"
+        "<b>Useful placeholders</b>\n"
+        "<code>{title}</code>, <code>{theme}</code>, <code>{close_time}</code>, <code>{go_live_time}</code>, "
+        "<code>{market_link}</code>, <code>{promo_text}</code>, <code>{ai_text}</code>, <code>{cover_image}</code>\n\n"
+        "Use /studio_commands to see editing commands."
+    )
+
+
+def get_studio_commands_text():
+    return (
+        "<b>Studio Commands</b>\n\n"
+        "<b>Templates</b>\n"
+        "<code>/settemplate key | message</code>\n"
+        "<code>/setrich key | rich message</code>\n"
+        "<code>/deltemplate key</code>\n"
+        "<code>/templates</code>\n\n"
+        "<b>Inline Buttons</b>\n"
+        "<code>/addbutton scope | label | url</code>\n"
+        "<code>/delbutton id</code>\n"
+        "<code>/buttons</code>\n\n"
+        "<b>Broadcast</b>\n"
+        "<code>/studiobroadcast all | message</code>\n"
+        "<code>/studiobroadcast premium | message</code>\n\n"
+        "<b>Scopes</b>\n"
+        "<code>all</code>, <code>new_market</code>, <code>scheduled_market</code>, "
+        "<code>reminder_1h</code>, <code>reminder_10m</code>, <code>go_live_reminder</code>, "
+        "<code>image_followup</code>, <code>broadcast</code>\n\n"
+        "<b>Examples</b>\n"
+        "<code>/addbutton all | Follow X | https://x.com/yourname</code>\n"
+        "<code>/addbutton new_market | Community | https://t.me/yourgroup</code>\n"
+        "<code>/addbutton broadcast | Follow X | https://x.com/yourname</code>\n"
+        "<code>/settemplate new_market_text | NEW MARKET: {title}\\n\\n{ai_text}</code>"
+    )
+
+
+def get_templates_text():
+    templates = list_templates()
+    if not templates:
+        return "No custom templates saved yet.\n\nUse /settemplate or /setrich to add one."
+    lines = ["<b>Saved Templates</b>"]
+    for template in templates:
+        lines.append(
+            f"\n<code>{escape_text(template.get('template_key'))}</code>\n"
+            f"Text: {'yes' if template.get('body') else 'no'} | Rich: {'yes' if template.get('rich_body') else 'no'}"
+        )
+    return "\n".join(lines)
+
+
+def get_buttons_text():
+    buttons = get_custom_buttons()
+    if not buttons:
+        return "No custom buttons saved yet.\n\nUse /addbutton scope | label | url"
+    lines = ["<b>Custom Buttons</b>"]
+    for button in buttons:
+        lines.append(
+            f"\nID <code>{button.get('id')}</code> | <b>{escape_text(button.get('scope'))}</b>\n"
+            f"{escape_text(button.get('label'))}\n"
+            f"<code>{escape_text(button.get('url'))}</code>"
+        )
+    return "\n".join(lines)
 
 
 def build_tone_keyboard():
@@ -1492,7 +1845,8 @@ def announce_live_market(market, existing=None):
     end_time_unix = market.get("end_time")
     end_time = datetime.fromtimestamp(int(end_time_unix), tz=timezone.utc).replace(tzinfo=None)
     ai_message = generate_smart_notification(title, raw_theme, "new")
-    keyboard = create_market_keyboard(market_id, build_market_link(market_id))
+    context = build_market_template_context(market, ai_message)
+    keyboard = create_market_keyboard(market_id, build_market_link(market_id), scope="new_market", context=context)
     notification = build_new_market_notification(market, ai_message)
     cover_image_url = wait_for_market_cover_image(market_id, market)
 
@@ -1550,7 +1904,8 @@ def announce_scheduled_market_to_premium(market):
     if not saved:
         return
 
-    keyboard = create_market_keyboard(market_id, build_market_link(market_id))
+    context = build_market_template_context(market)
+    keyboard = create_market_keyboard(market_id, build_market_link(market_id), scope="scheduled_market", context=context)
     notification = build_scheduled_market_notification(market)
     cover_image_url = wait_for_market_cover_image(market_id, market)
     broadcast_to_all(
@@ -1665,7 +2020,7 @@ def check_scheduled_notifications():
                             broadcast_to_all(
                                 build_go_live_reminder_notification(market_data),
                                 market_id,
-                                create_market_keyboard(market_id, market_link),
+                                create_market_keyboard(market_id, market_link, scope="go_live_reminder"),
                                 theme=raw_theme,
                                 notification_key=f"go_live_2m_{market_id}",
                                 premium_only=True,
@@ -1705,7 +2060,7 @@ def check_scheduled_notifications():
                                 f"This is your last chance to stake!"
                             )
                         
-                        keyboard = create_market_keyboard(market_id, market_link)
+                        keyboard = create_market_keyboard(market_id, market_link, scope="reminder_1h")
                         broadcast_to_all(
                             notification,
                             market_id,
@@ -1737,7 +2092,7 @@ def check_scheduled_notifications():
                                 f"Act Now Or Lose This Opportunity!"
                             )
                         
-                        keyboard = create_market_keyboard(market_id, market_link)
+                        keyboard = create_market_keyboard(market_id, market_link, scope="reminder_10m")
                         broadcast_to_all(
                             notification,
                             market_id,
@@ -1870,7 +2225,7 @@ def handle_dashboard_callback(call):
             refresh_market(call)
             return
 
-        if data.startswith("admin_") or data.startswith("tone_"):
+        if data.startswith("admin_") or data.startswith("tone_") or data.startswith("studio_"):
             if not is_admin(user_id):
                 answer("admin only", show_alert=True)
                 return
@@ -1885,6 +2240,21 @@ def handle_dashboard_callback(call):
                 reply_markup=build_admin_keyboard(),
                 parse_mode="HTML"
             )
+        elif data == "studio_menu":
+            delete_callback_message(call)
+            send_temp_message(call.message.chat.id, get_studio_text(), reply_markup=build_studio_keyboard(), parse_mode="HTML")
+        elif data == "studio_templates":
+            delete_callback_message(call)
+            send_temp_message(call.message.chat.id, get_templates_text(), reply_markup=build_studio_keyboard(), parse_mode="HTML")
+        elif data == "studio_buttons":
+            delete_callback_message(call)
+            send_temp_message(call.message.chat.id, get_buttons_text(), reply_markup=build_studio_keyboard(), parse_mode="HTML")
+        elif data == "studio_commands":
+            delete_callback_message(call)
+            send_temp_message(call.message.chat.id, get_studio_commands_text(), reply_markup=build_studio_keyboard(), parse_mode="HTML")
+        elif data == "studio_preview":
+            delete_callback_message(call)
+            send_studio_preview(call.message.chat.id)
         elif data == "admin_pause":
             set_pause_state(True)
             delete_callback_message(call)
@@ -2068,6 +2438,202 @@ def admin_dashboard(message):
         reply_temp(message, get_stats_text(), reply_markup=build_admin_keyboard(), parse_mode="HTML")
     except Exception as e:
         logger.error(f"error in admin dashboard: {e}")
+
+
+def send_studio_preview(chat_id):
+    markets = [market for market in fetch_b4_markets() if is_valid_market(market) and is_market_active(market)]
+    if not markets:
+        send_temp_message(chat_id, "No active API market available for preview.", parse_mode="HTML")
+        return
+    market = markets[0]
+    market_id = str(market.get("market_id", "")).strip()
+    raw_theme = normalize_theme(market.get("theme", "other"))
+    ai_message = generate_smart_notification(str(market.get("title", "")).strip(), raw_theme, "new")
+    context = build_market_template_context(market, ai_message)
+    keyboard = create_market_keyboard(market_id, build_market_link(market_id), scope="new_market", context=context)
+    send_notification_to_chat(
+        chat_id,
+        build_new_market_notification(market, ai_message),
+        keyboard=keyboard,
+        photo_url=get_market_cover_image(market),
+        rich_html=build_rich_new_market(market, ai_message, heading="Studio Preview"),
+    )
+
+
+@bot.message_handler(commands=['studio'])
+def studio_command(message):
+    try:
+        if not is_admin(message.from_user.id):
+            reply_temp(message, "Permission denied.")
+            return
+        reply_temp(message, get_studio_text(), reply_markup=build_studio_keyboard(), parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"error in studio: {e}")
+
+
+@bot.message_handler(commands=['studio_commands'])
+def studio_commands_command(message):
+    try:
+        if not is_admin(message.from_user.id):
+            reply_temp(message, "Permission denied.")
+            return
+        reply_temp(message, get_studio_commands_text(), reply_markup=build_studio_keyboard(), parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"error in studio_commands: {e}")
+
+
+@bot.message_handler(commands=['templates'])
+def templates_command(message):
+    try:
+        if not is_admin(message.from_user.id):
+            reply_temp(message, "Permission denied.")
+            return
+        reply_temp(message, get_templates_text(), reply_markup=build_studio_keyboard(), parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"error in templates: {e}")
+
+
+@bot.message_handler(commands=['settemplate'])
+def settemplate_command(message):
+    try:
+        if not is_admin(message.from_user.id):
+            reply_temp(message, "Permission denied.")
+            return
+        payload = message.text.split(maxsplit=1)
+        if len(payload) < 2 or "|" not in payload[1]:
+            reply_temp(message, "Format: /settemplate key | message")
+            return
+        key, body = [part.strip() for part in payload[1].split("|", 1)]
+        body = body.replace("\\n", "\n")
+        existing = get_template(key)
+        rich_body = existing.get("rich_body") if existing else None
+        if save_template(key, body, rich_body):
+            reply_temp(message, f"Saved text template <code>{escape_text(key)}</code>.", parse_mode="HTML")
+        else:
+            reply_temp(message, "Could not save template.")
+    except Exception as e:
+        logger.error(f"error in settemplate: {e}")
+
+
+@bot.message_handler(commands=['setrich'])
+def setrich_command(message):
+    try:
+        if not is_admin(message.from_user.id):
+            reply_temp(message, "Permission denied.")
+            return
+        payload = message.text.split(maxsplit=1)
+        if len(payload) < 2 or "|" not in payload[1]:
+            reply_temp(message, "Format: /setrich key | rich message")
+            return
+        key, rich_body = [part.strip() for part in payload[1].split("|", 1)]
+        existing = get_template(key)
+        body = existing.get("body") if existing else rich_body
+        rich_body = rich_body.replace("\\n", "\n")
+        if save_template(key, body, rich_body):
+            reply_temp(message, f"Saved rich template <code>{escape_text(key)}</code>.", parse_mode="HTML")
+        else:
+            reply_temp(message, "Could not save rich template.")
+    except Exception as e:
+        logger.error(f"error in setrich: {e}")
+
+
+@bot.message_handler(commands=['deltemplate'])
+def deltemplate_command(message):
+    try:
+        if not is_admin(message.from_user.id):
+            reply_temp(message, "Permission denied.")
+            return
+        args = message.text.split(maxsplit=1)
+        if len(args) < 2:
+            reply_temp(message, "Format: /deltemplate key")
+            return
+        deleted = delete_template(args[1].strip())
+        reply_temp(message, "Template deleted." if deleted else "Template not found.")
+    except Exception as e:
+        logger.error(f"error in deltemplate: {e}")
+
+
+@bot.message_handler(commands=['buttons'])
+def buttons_command(message):
+    try:
+        if not is_admin(message.from_user.id):
+            reply_temp(message, "Permission denied.")
+            return
+        reply_temp(message, get_buttons_text(), reply_markup=build_studio_keyboard(), parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"error in buttons: {e}")
+
+
+@bot.message_handler(commands=['addbutton'])
+def addbutton_command(message):
+    try:
+        if not is_admin(message.from_user.id):
+            reply_temp(message, "Permission denied.")
+            return
+        payload = message.text.split(maxsplit=1)
+        if len(payload) < 2:
+            reply_temp(message, "Format: /addbutton scope | label | url")
+            return
+        parts = [part.strip() for part in payload[1].split("|")]
+        if len(parts) < 3:
+            reply_temp(message, "Format: /addbutton scope | label | url")
+            return
+        button_id = add_custom_button(parts[0], parts[1], parts[2])
+        if button_id:
+            reply_temp(message, f"Button saved with ID <code>{button_id}</code>.", parse_mode="HTML")
+        else:
+            reply_temp(message, "Could not save button. Check the scope and URL.")
+    except Exception as e:
+        logger.error(f"error in addbutton: {e}")
+
+
+@bot.message_handler(commands=['delbutton'])
+def delbutton_command(message):
+    try:
+        if not is_admin(message.from_user.id):
+            reply_temp(message, "Permission denied.")
+            return
+        args = message.text.split(maxsplit=1)
+        if len(args) < 2:
+            reply_temp(message, "Format: /delbutton id")
+            return
+        deleted = delete_custom_button(int(args[1].strip()))
+        reply_temp(message, "Button deleted." if deleted else "Button not found.")
+    except Exception as e:
+        logger.error(f"error in delbutton: {e}")
+
+
+@bot.message_handler(commands=['studiobroadcast'])
+def studiobroadcast_command(message):
+    try:
+        if not is_admin(message.from_user.id):
+            reply_temp(message, "Permission denied.")
+            return
+        payload = message.text.split(maxsplit=1)
+        if len(payload) < 2 or "|" not in payload[1]:
+            reply_temp(message, "Format: /studiobroadcast all | message")
+            return
+
+        audience, body = [part.strip() for part in payload[1].split("|", 1)]
+        audience = audience.lower()
+        if audience not in {"all", "premium"}:
+            reply_temp(message, "Audience must be all or premium.")
+            return
+
+        rich_html = simple_rich_markup(body.replace("\\n", "\n"))
+        text = escape_text(body.replace("\\n", "\n"))
+        keyboard = create_custom_keyboard("broadcast", {"audience": audience})
+        broadcast_to_all(
+            text,
+            keyboard=keyboard,
+            notification_key=f"studio_broadcast_{int(time.time())}",
+            premium_only=audience == "premium",
+            rich_html=rich_html,
+        )
+        reply_temp(message, f"Studio broadcast sent to <b>{escape_text(audience)}</b> subscribers.", parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"error in studiobroadcast: {e}")
+        reply_temp(message, f"Error: {e}")
 
 
 @bot.message_handler(commands=['tone'])
@@ -2594,6 +3160,16 @@ try:
         telebot.types.BotCommand("premium_remove", "Remove premium user or chat"),
         telebot.types.BotCommand("premium_users", "List premium users or chats"),
         telebot.types.BotCommand("premium_digest", "Preview premium digest"),
+        telebot.types.BotCommand("studio", "Open admin message studio"),
+        telebot.types.BotCommand("studio_commands", "Show message studio commands"),
+        telebot.types.BotCommand("templates", "List custom templates"),
+        telebot.types.BotCommand("buttons", "List custom inline buttons"),
+        telebot.types.BotCommand("settemplate", "Edit plain message template"),
+        telebot.types.BotCommand("setrich", "Edit rich message template"),
+        telebot.types.BotCommand("deltemplate", "Delete custom template"),
+        telebot.types.BotCommand("addbutton", "Add custom inline button"),
+        telebot.types.BotCommand("delbutton", "Delete custom inline button"),
+        telebot.types.BotCommand("studiobroadcast", "Send rich broadcast with studio buttons"),
         telebot.types.BotCommand("reset", "Reset all data"),
         telebot.types.BotCommand("cleanmessages", "Delete tracked messages only"),
         telebot.types.BotCommand("refreshlinks", "Refresh market button links"),
