@@ -1392,7 +1392,7 @@ def build_new_market_notification(market, ai_message):
 
     message = (
         f"🆕 <b>NEW MARKET LIVE</b>\n\n"
-        f"📌 <b>{escape_text(title)}</b>\n\n"
+        f"<b>📌 {escape_text(title)}</b>\n\n"
         f"⏰ Closes: {escape_text(end_time_str)}"
     )
 
@@ -1416,7 +1416,7 @@ def build_scheduled_market_notification(market):
 
     message = (
         f"⭐ <b>PREMIUM EARLY MARKET ALERT</b>\n\n"
-        f"📌 <b>{escape_text(title)}</b>\n\n"
+        f"<b>📌 {escape_text(title)}</b>\n\n"
         f"🚀 Goes Live: <b>{escape_text(go_live_text)}</b>"
     )
     if promo_text:
@@ -1437,7 +1437,7 @@ def build_go_live_reminder_notification(market_data):
 
     return (
         f"⏱️ <b>PREMIUM 2-MINUTE LIVE REMINDER</b>\n\n"
-        f"📌 <b>{escape_text(title)}</b>\n\n"
+        f"<b>📌 {escape_text(title)}</b>\n\n"
         f"This market goes live at <b>{escape_text(go_live_text)}</b>."
     )
 
@@ -1463,7 +1463,7 @@ def build_rich_scheduled_market(market):
     fallback = (
         f"<h2>Premium Early Market Alert</h2>"
         f"{build_rich_media_block(cover_url, title)}"
-        f"<p><b>{escape_text(title)}</b></p>"
+        f"<h3>{escape_text(title)}</h3>"
         f"<table>"
         f"<tr><th>Goes Live</th><td>{escape_text(go_live_text)}</td></tr>"
         f"<tr><th>Closes</th><td>{escape_text(end_time.strftime('%b %d, %Y at %I:%M %p UTC'))}</td></tr>"
@@ -1484,7 +1484,7 @@ def build_rich_new_market(market, ai_message, heading="New Market Live", cover_u
     html_parts = [
         f"<h2>{escape_text(heading)}</h2>",
         build_rich_media_block(cover_url, title),
-        f"<p><b>{escape_text(title)}</b></p>",
+        f"<h3>{escape_text(title)}</h3>",
         "<table>",
         f"<tr><th>Closes</th><td>{escape_text(end_time.strftime('%b %d, %Y at %I:%M %p UTC'))}</td></tr>",
         "</table>",
@@ -1504,7 +1504,7 @@ def build_rich_reminder(title, minutes_left, ai_message=None, urgent=False):
     time_text = "10 minutes" if urgent else f"{int(minutes_left)} minutes"
     html_parts = [
         f"<h2>{heading}</h2>",
-        f"<p><b>{escape_text(title)}</b></p>",
+        f"<h3>{escape_text(title)}</h3>",
         "<table>",
         f"<tr><th>Time Left</th><td>{escape_text(time_text)}</td></tr>",
         f"<tr><th>Status</th><td>{'Final call' if urgent else 'Closing soon'}</td></tr>",
@@ -1532,7 +1532,7 @@ def build_rich_go_live_reminder(market_data):
     go_live_text = parsed.strftime('%I:%M %p UTC') if parsed else "very soon"
     fallback = (
         "<h2>Premium Go-Live Reminder</h2>"
-        f"<p><b>{escape_text(title)}</b></p>"
+        f"<h3>{escape_text(title)}</h3>"
         "<table>"
         f"<tr><th>Goes Live</th><td>{escape_text(go_live_text)}</td></tr>"
         "<tr><th>Access</th><td>Premium early reminder</td></tr>"
@@ -1549,7 +1549,7 @@ def build_rich_go_live_reminder(market_data):
 def build_rich_market_closed(title):
     fallback = (
         "<h2>Market Closed</h2>"
-        f"<p><b>{escape_text(title)}</b></p>"
+        f"<h3>{escape_text(title)}</h3>"
         "<table>"
         "<tr><th>Status</th><td>Closed</td></tr>"
         "<tr><th>Messages</th><td>Scheduled for cleanup</td></tr>"
@@ -1563,7 +1563,7 @@ def build_rich_image_followup(title, cover_url):
     return (
         "<h2>Market Cover Ready</h2>"
         f"{build_rich_media_block(cover_url, title)}"
-        f"<p><b>{escape_text(title)}</b></p>"
+        f"<h3>{escape_text(title)}</h3>"
     )
 
 
@@ -1673,7 +1673,7 @@ def schedule_image_followup(market_id, title, theme):
                     break
                 message = (
                     f"🖼️ <b>Market Cover Ready</b>\n\n"
-                    f"📌 <b>{escape_text(title)}</b>"
+                    f"<b>?? {escape_text(title)}</b>"
                 )
                 broadcast_to_all(
                     message,
@@ -2278,14 +2278,14 @@ def check_scheduled_notifications():
                         if ai_message:
                             notification = (
                                 f"🔃 <b>MARKET CLOSING SOON</b>\n\n"
-                                f"📌 <b>{escape_text(title)}</b>\n\n"
+                                f"<b>?? {escape_text(title)}</b>\n\n"
                                 f"⏳ Time Remaining: <b>{mins_left} Minutes</b>\n\n"
                                 f"{ai_message}"
                             )
                         else:
                             notification = (
                                 f"🔃 <b>MARKET CLOSING SOON</b>\n\n"
-                                f"📌 <b>{escape_text(title)}</b>\n\n"
+                                f"<b>?? {escape_text(title)}</b>\n\n"
                                 f"⏳ Time Remaining: <b>{mins_left} Minutes</b>\n\n"
                                 f"This is your last chance to stake!"
                             )
@@ -2311,13 +2311,13 @@ def check_scheduled_notifications():
                         if ai_message:
                             notification = (
                                 f"🚨 <b>URGENT: MARKET CLOSING IN 10 MINUTES</b>\n\n"
-                                f"📌 <b>{escape_text(title)}</b>\n\n"
+                                f"<b>?? {escape_text(title)}</b>\n\n"
                                 f"{ai_message}"
                             )
                         else:
                             notification = (
                                 f"🚨 <b>URGENT: MARKET CLOSING IN 10 MINUTES</b>\n\n"
-                                f"📌 <b>{escape_text(title)}</b>\n\n"
+                                f"<b>?? {escape_text(title)}</b>\n\n"
                                 f"⏳ Time Remaining: <b>10 Minutes</b>\n\n"
                                 f"Act Now Or Lose This Opportunity!"
                             )
@@ -2337,7 +2337,7 @@ def check_scheduled_notifications():
                 else:
                     notification = (
                         f"⛔ <b>MARKET CLOSED</b>\n\n"
-                        f"📌 <b>{escape_text(title)}</b>\n\n"
+                        f"<b>?? {escape_text(title)}</b>\n\n"
                         f"💰 Reward Distribution In Progress\n"
                         f"Check Your Wallet For Returns!\n\n"
                         f"🗑️ This message will be deleted in 10 minutes"
@@ -3670,5 +3670,3 @@ try:
 except Exception as e:
     logger.error(f"critical error in bot: {e}")
     time.sleep(10)
-
-
