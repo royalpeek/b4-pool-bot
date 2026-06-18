@@ -1145,6 +1145,18 @@ def create_custom_keyboard(scope="broadcast", context=None):
     return keyboard if has_buttons else None
 
 
+def create_single_button_keyboard(label, url):
+    label = str(label or "").strip()
+    url = str(url or "").strip()
+    if not label or not url:
+        return None
+    if not (url.startswith("http://") or url.startswith("https://") or url.startswith("tg://")):
+        return None
+    keyboard = types.InlineKeyboardMarkup()
+    keyboard.add(types.InlineKeyboardButton(label, url=url))
+    return keyboard
+
+
 def format_theme(theme):
     theme = normalize_theme(theme)
     theme_map = {
@@ -1635,6 +1647,8 @@ def get_studio_commands_text():
         "<b>Broadcast</b>\n"
         "<code>/studiobroadcast all | message</code>\n"
         "<code>/studiobroadcast premium | message</code>\n\n"
+        "<b>Easy Broadcast With One Button</b>\n"
+        "<code>/quickbroadcast Button Text | Button Link | Message</code>\n\n"
         "<b>Scopes</b>\n"
         "<code>all</code>, <code>new_market</code>, <code>scheduled_market</code>, "
         "<code>reminder_1h</code>, <code>reminder_10m</code>, <code>go_live_reminder</code>, "
@@ -1643,6 +1657,7 @@ def get_studio_commands_text():
         "<code>/addbutton all | Follow X | https://x.com/yourname</code>\n"
         "<code>/addbutton new_market | Community | https://t.me/yourgroup</code>\n"
         "<code>/addbutton broadcast | Follow X | https://x.com/yourname</code>\n"
+        "<code>/quickbroadcast Follow us on X | https://x.com/yourname | Big update today!</code>\n"
         "<code>/settemplate new_market_text | NEW MARKET: {title}\\n\\n{ai_text}</code>"
     )
 
@@ -2636,6 +2651,58 @@ def studiobroadcast_command(message):
         reply_temp(message, f"Error: {e}")
 
 
+def handle_quick_broadcast(message, premium_only=False):
+    if not is_admin(message.from_user.id):
+        reply_temp(message, "Permission denied.")
+        return
+
+    payload = message.text.split(maxsplit=1)
+    command_name = "quickpremium" if premium_only else "quickbroadcast"
+    if len(payload) < 2:
+        reply_temp(message, f"Format: /{command_name} Button Text | Button Link | Message")
+        return
+
+    parts = [part.strip() for part in payload[1].split("|", 2)]
+    if len(parts) < 3:
+        reply_temp(message, f"Format: /{command_name} Button Text | Button Link | Message")
+        return
+
+    button_text, button_url, body = parts
+    keyboard = create_single_button_keyboard(button_text, button_url)
+    if not keyboard:
+        reply_temp(message, "Button link must start with http://, https://, or tg://")
+        return
+
+    body = body.replace("\\n", "\n")
+    broadcast_to_all(
+        escape_text(body),
+        keyboard=keyboard,
+        notification_key=f"{command_name}_{int(time.time())}",
+        premium_only=premium_only,
+        rich_html=simple_rich_markup(body),
+    )
+    audience = "premium users" if premium_only else "all subscribers"
+    reply_temp(message, f"Broadcast sent to <b>{audience}</b>.", parse_mode="HTML")
+
+
+@bot.message_handler(commands=['quickbroadcast'])
+def quickbroadcast_command(message):
+    try:
+        handle_quick_broadcast(message, premium_only=False)
+    except Exception as e:
+        logger.error(f"error in quickbroadcast: {e}")
+        reply_temp(message, f"Error: {e}")
+
+
+@bot.message_handler(commands=['quickpremium'])
+def quickpremium_command(message):
+    try:
+        handle_quick_broadcast(message, premium_only=True)
+    except Exception as e:
+        logger.error(f"error in quickpremium: {e}")
+        reply_temp(message, f"Error: {e}")
+
+
 @bot.message_handler(commands=['tone'])
 def tone_command(message):
     try:
@@ -3170,6 +3237,8 @@ try:
         telebot.types.BotCommand("addbutton", "Add custom inline button"),
         telebot.types.BotCommand("delbutton", "Delete custom inline button"),
         telebot.types.BotCommand("studiobroadcast", "Send rich broadcast with studio buttons"),
+        telebot.types.BotCommand("quickbroadcast", "Broadcast with one custom button"),
+        telebot.types.BotCommand("quickpremium", "Premium broadcast with one custom button"),
         telebot.types.BotCommand("reset", "Reset all data"),
         telebot.types.BotCommand("cleanmessages", "Delete tracked messages only"),
         telebot.types.BotCommand("refreshlinks", "Refresh market button links"),
