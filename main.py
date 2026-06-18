@@ -9,7 +9,7 @@ import psycopg
 import html
 from threading import Thread
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import requests
 from openai import OpenAI
 
@@ -54,6 +54,22 @@ IMAGE_FOLLOWUP_WAIT_SECONDS = float(os.getenv("IMAGE_FOLLOWUP_WAIT_SECONDS", "45
 PREMIUM_GO_LIVE_REMINDER_SECONDS = int(os.getenv("PREMIUM_GO_LIVE_REMINDER_SECONDS", "120"))
 TEMP_RESPONSE_DELETE_SECONDS = int(os.getenv("TEMP_RESPONSE_DELETE_SECONDS", "180"))
 DAILY_SUMMARY_UTC_HOUR = int(os.getenv("DAILY_SUMMARY_UTC_HOUR", "9"))
+PREMIUM_PAYMENT_TEXT = os.getenv(
+    "PREMIUM_PAYMENT_TEXT",
+    "To activate premium, choose a plan, make payment, then send your payment proof here. Admin will activate your access after confirmation."
+)
+PREMIUM_PLAN_PRICES = {
+    "monthly": "$3",
+    "3months": "$8",
+    "6months": "$15",
+    "yearly": "$25",
+}
+PREMIUM_PLAN_DAYS = {
+    "monthly": 30,
+    "3months": 90,
+    "6months": 180,
+    "yearly": 365,
+}
 VALID_THEMES = ["all", "crypto", "politics", "entertainment", "sports", "travel", "current_events", "other"]
 VALID_TONES = ["casual", "urgent", "premium", "degen", "professional"]
 STUDIO_BUTTON_SCOPES = {
@@ -175,9 +191,13 @@ def init_db():
                     CREATE TABLE IF NOT EXISTS premium_chats (
                         chat_id TEXT PRIMARY KEY,
                         added_by TEXT,
+                        plan TEXT,
+                        expires_at TIMESTAMP,
                         created_at TIMESTAMP DEFAULT NOW()
                     )
                 """)
+                cur.execute("ALTER TABLE premium_chats ADD COLUMN IF NOT EXISTS plan TEXT")
+                cur.execute("ALTER TABLE premium_chats ADD COLUMN IF NOT EXISTS expires_at TIMESTAMP")
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS message_templates (
                         template_key TEXT PRIMARY KEY,
@@ -308,15 +328,52 @@ def chat_wants_theme(chat_id, theme):
     return "all" in themes or theme in themes
 
 
-def add_premium_chat(chat_id, added_by):
+def normalize_premium_plan(plan):
+    plan = str(plan or "monthly").strip().lower().replace("-", "").replace("_", "")
+    aliases = {
+        "month": "monthly",
+        "1month": "monthly",
+        "3month": "3months",
+        "3months": "3months",
+        "6month": "6months",
+        "6months": "6months",
+        "year": "yearly",
+        "1year": "yearly",
+        "yearly": "yearly",
+        "annual": "yearly",
+    }
+    return aliases.get(plan, "monthly")
+
+
+def premium_expiry_for_plan(plan):
+    plan = normalize_premium_plan(plan)
+    return now_utc() + timedelta(days=PREMIUM_PLAN_DAYS.get(plan, 30))
+
+
+def get_premium_wallet():
+    return get_bot_state("premium_usdc_sol_wallet", os.getenv("PREMIUM_USDC_SOL_WALLET", "")).strip()
+
+
+def set_premium_wallet(wallet):
+    wallet = str(wallet or "").strip()
+    set_bot_state("premium_usdc_sol_wallet", wallet)
+    return wallet
+
+
+def add_premium_chat(chat_id, added_by, plan="monthly", expires_at=None):
+    plan = normalize_premium_plan(plan)
+    expires_at = expires_at or premium_expiry_for_plan(plan)
     try:
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
-                    INSERT INTO premium_chats (chat_id, added_by)
-                    VALUES (%s, %s)
-                    ON CONFLICT (chat_id) DO UPDATE SET added_by = EXCLUDED.added_by
-                """, (str(chat_id), str(added_by)))
+                    INSERT INTO premium_chats (chat_id, added_by, plan, expires_at)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (chat_id)
+                    DO UPDATE SET added_by = EXCLUDED.added_by,
+                                  plan = EXCLUDED.plan,
+                                  expires_at = EXCLUDED.expires_at
+                """, (str(chat_id), str(added_by), plan, expires_at))
         return True
     except Exception as e:
         logger.error(f"error adding premium chat {chat_id}: {e}")
@@ -338,7 +395,11 @@ def get_premium_chat_ids():
     try:
         with get_db() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT chat_id FROM premium_chats ORDER BY created_at DESC")
+                cur.execute("""
+                    SELECT chat_id FROM premium_chats
+                    WHERE expires_at IS NULL OR expires_at > NOW()
+                    ORDER BY created_at DESC
+                """)
                 return [row[0] for row in cur.fetchall()]
     except Exception as e:
         logger.error(f"error fetching premium chats: {e}")
@@ -854,6 +915,19 @@ def reply_temp(message, text, reply_markup=None, parse_mode=None):
     return sent
 
 
+def send_persistent_message(chat_id, text, reply_markup=None, parse_mode=None):
+    return bot.send_message(
+        chat_id,
+        text,
+        reply_markup=reply_markup,
+        parse_mode=parse_mode,
+    )
+
+
+def reply_persistent(message, text, reply_markup=None, parse_mode=None):
+    return bot.reply_to(message, text, reply_markup=reply_markup, parse_mode=parse_mode)
+
+
 def keyboard_to_payload(keyboard):
     if not keyboard:
         return None
@@ -1251,8 +1325,6 @@ def build_market_template_context(market, ai_message=None):
 
 def build_new_market_notification(market, ai_message):
     title = str(market.get("title", "")).strip()
-    raw_theme = normalize_theme(market.get("theme", "other"))
-    theme = format_theme(raw_theme)
     end_time_unix = market.get("end_time")
     end_time = datetime.fromtimestamp(int(end_time_unix), tz=timezone.utc).replace(tzinfo=None)
     end_time_str = end_time.strftime('%b %d, %Y at %I:%M %p UTC')
@@ -1261,7 +1333,6 @@ def build_new_market_notification(market, ai_message):
     message = (
         f"🆕 <b>NEW MARKET LIVE</b>\n\n"
         f"📌 <b>{escape_text(title)}</b>\n\n"
-        f"🏷️ Theme: {escape_text(theme)}\n"
         f"⏰ Closes: {escape_text(end_time_str)}"
     )
 
@@ -1279,8 +1350,6 @@ def build_new_market_notification(market, ai_message):
 
 def build_scheduled_market_notification(market):
     title = str(market.get("title", "")).strip()
-    raw_theme = normalize_theme(market.get("theme", "other"))
-    theme = format_theme(raw_theme)
     go_live_at = get_market_go_live_at(market)
     go_live_text = go_live_at.strftime('%b %d, %Y at %I:%M %p UTC') if go_live_at else "soon"
     promo_text = build_market_promo_text(market)
@@ -1288,7 +1357,6 @@ def build_scheduled_market_notification(market):
     message = (
         f"⭐ <b>PREMIUM EARLY MARKET ALERT</b>\n\n"
         f"📌 <b>{escape_text(title)}</b>\n\n"
-        f"🏷️ Theme: {escape_text(theme)}\n"
         f"🚀 Goes Live: <b>{escape_text(go_live_text)}</b>"
     )
     if promo_text:
@@ -1325,7 +1393,6 @@ def build_rich_media_block(image_url, caption):
 
 def build_rich_scheduled_market(market):
     title = str(market.get("title", "")).strip()
-    raw_theme = normalize_theme(market.get("theme", "other"))
     go_live_at = get_market_go_live_at(market)
     end_time_unix = market.get("end_time")
     end_time = datetime.fromtimestamp(int(end_time_unix), tz=timezone.utc).replace(tzinfo=None)
@@ -1338,7 +1405,6 @@ def build_rich_scheduled_market(market):
         f"{build_rich_media_block(cover_url, title)}"
         f"<p><b>{escape_text(title)}</b></p>"
         f"<table>"
-        f"<tr><th>Theme</th><td>{escape_text(format_theme(raw_theme))}</td></tr>"
         f"<tr><th>Goes Live</th><td>{escape_text(go_live_text)}</td></tr>"
         f"<tr><th>Closes</th><td>{escape_text(end_time.strftime('%b %d, %Y at %I:%M %p UTC'))}</td></tr>"
         f"</table>"
@@ -1350,7 +1416,6 @@ def build_rich_scheduled_market(market):
 
 def build_rich_new_market(market, ai_message, heading="New Market Live", cover_url=None):
     title = str(market.get("title", "")).strip()
-    raw_theme = normalize_theme(market.get("theme", "other"))
     end_time_unix = market.get("end_time")
     end_time = datetime.fromtimestamp(int(end_time_unix), tz=timezone.utc).replace(tzinfo=None)
     cover_url = cover_url or get_market_cover_image(market)
@@ -1361,7 +1426,6 @@ def build_rich_new_market(market, ai_message, heading="New Market Live", cover_u
         build_rich_media_block(cover_url, title),
         f"<p><b>{escape_text(title)}</b></p>",
         "<table>",
-        f"<tr><th>Theme</th><td>{escape_text(format_theme(raw_theme))}</td></tr>",
         f"<tr><th>Closes</th><td>{escape_text(end_time.strftime('%b %d, %Y at %I:%M %p UTC'))}</td></tr>",
         "</table>",
     ]
@@ -1590,9 +1654,57 @@ def build_main_menu_keyboard(user_id=None, chat_type=None):
         types.KeyboardButton("Help"),
         types.KeyboardButton("My ID"),
     )
+    if chat_type == "private":
+        keyboard.add(types.KeyboardButton("Upgrade"))
     if chat_type == "private" and user_id and is_admin(user_id):
         keyboard.add(types.KeyboardButton("Admin"))
     return keyboard
+
+
+def build_upgrade_keyboard():
+    keyboard = types.InlineKeyboardMarkup(row_width=2)
+    keyboard.add(
+        types.InlineKeyboardButton(f"Monthly {PREMIUM_PLAN_PRICES['monthly']}", callback_data="upgrade_monthly"),
+        types.InlineKeyboardButton(f"3 Months {PREMIUM_PLAN_PRICES['3months']}", callback_data="upgrade_3months"),
+        types.InlineKeyboardButton(f"6 Months {PREMIUM_PLAN_PRICES['6months']}", callback_data="upgrade_6months"),
+        types.InlineKeyboardButton(f"1 Year {PREMIUM_PLAN_PRICES['yearly']}", callback_data="upgrade_yearly"),
+    )
+    keyboard.add(types.InlineKeyboardButton("Back to Menu", callback_data="upgrade_back"))
+    return keyboard
+
+
+def get_upgrade_text(selected_plan=None):
+    wallet = get_premium_wallet()
+    plan_lines = [
+        f"Monthly - {PREMIUM_PLAN_PRICES['monthly']}",
+        f"3 Months - {PREMIUM_PLAN_PRICES['3months']}",
+        f"6 Months - {PREMIUM_PLAN_PRICES['6months']}",
+        f"1 Year - {PREMIUM_PLAN_PRICES['yearly']}",
+    ]
+    text = (
+        "<b>B4 Premium Access</b>\n\n"
+        "Premium is for users who want the earliest market signals before the crowd sees them.\n\n"
+        "<b>What you get</b>\n"
+        "1. Early scheduled-market alerts before public live alerts\n"
+        "2. Exact go-live time for scheduled markets\n"
+        "3. 2-minute go-live reminders before scheduled markets open\n"
+        "4. Faster first-hand notice when premium-only opportunities appear\n"
+        "5. Early view of first-staker and sponsor promo opportunities when available\n"
+        "6. Premium market digest for upcoming and live opportunities\n"
+        "7. Priority access to new premium alert features as they are added\n\n"
+        "<b>Plans</b>\n"
+        + "\n".join(plan_lines)
+        + "\n\n<b>Payment</b>\nUSDC on Solana network\n"
+    )
+    if wallet:
+        text += f"<code>{escape_text(wallet)}</code>\n\n"
+    else:
+        text += "<i>Payment address is being updated by admin.</i>\n\n"
+    if selected_plan:
+        plan = normalize_premium_plan(selected_plan)
+        text += f"Selected plan: <b>{escape_text(plan)}</b> ({PREMIUM_PLAN_PRICES.get(plan, '$3')})\n\n"
+    text += escape_text(PREMIUM_PAYMENT_TEXT)
+    return text
 
 
 def build_admin_keyboard():
@@ -1605,6 +1717,7 @@ def build_admin_keyboard():
         types.InlineKeyboardButton("Stats", callback_data="admin_stats"),
         types.InlineKeyboardButton("Tone", callback_data="admin_tone"),
         types.InlineKeyboardButton("Studio", callback_data="studio_menu"),
+        types.InlineKeyboardButton("Premium", callback_data="admin_premium"),
     )
     return keyboard
 
@@ -2297,6 +2410,22 @@ def handle_dashboard_callback(call):
         elif data == "admin_stats":
             delete_callback_message(call)
             send_temp_message(call.message.chat.id, get_stats_text(), reply_markup=build_admin_keyboard(), parse_mode="HTML")
+        elif data == "admin_premium":
+            delete_callback_message(call)
+            wallet = get_premium_wallet() or "Not set"
+            send_temp_message(
+                call.message.chat.id,
+                "<b>Premium Admin</b>\n\n"
+                f"USDC Solana wallet:\n<code>{escape_text(wallet)}</code>\n\n"
+                "Set wallet:\n<code>/setpremiumwallet YOUR_SOL_USDC_ADDRESS</code>\n\n"
+                "Activate user:\n"
+                "<code>/premium_add USER_ID monthly</code>\n"
+                "<code>/premium_add USER_ID 3months</code>\n"
+                "<code>/premium_add USER_ID 6months</code>\n"
+                "<code>/premium_add USER_ID yearly</code>",
+                reply_markup=build_admin_keyboard(),
+                parse_mode="HTML"
+            )
         elif data == "admin_tone":
             delete_callback_message(call)
             send_temp_message(
@@ -2333,6 +2462,26 @@ def handle_dashboard_callback(call):
 
             set_chat_themes(chat_id, updated)
             bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=build_theme_keyboard(updated))
+        elif data.startswith("upgrade_"):
+            if call.message.chat.type != "private":
+                answer("open the bot privately to upgrade", show_alert=True)
+                return
+            if data == "upgrade_back":
+                bot.edit_message_text(
+                    "Menu is available below. Choose what you need next.",
+                    call.message.chat.id,
+                    call.message.message_id,
+                    parse_mode="HTML",
+                )
+                return
+            plan = data.replace("upgrade_", "")
+            bot.edit_message_text(
+                get_upgrade_text(plan),
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=build_upgrade_keyboard(),
+                parse_mode="HTML"
+            )
         else:
             send_temp_message(call.message.chat.id, f"Unknown button action: {escape_text(data)}", parse_mode="HTML")
 
@@ -2424,6 +2573,23 @@ def send_help(message):
         logger.error(f"error in help: {e}")
 
 
+@bot.message_handler(commands=['upgrade'])
+def upgrade_command(message):
+    try:
+        save_user(message)
+        if message.chat.type != "private":
+            reply_temp(message, "Please open the bot in private chat to view premium plans.")
+            return
+        reply_persistent(
+            message,
+            get_upgrade_text(),
+            reply_markup=build_upgrade_keyboard(),
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        logger.error(f"error in upgrade: {e}")
+
+
 @bot.message_handler(commands=['preferences'])
 def preferences(message):
     try:
@@ -2462,7 +2628,6 @@ def send_studio_preview(chat_id):
         return
     market = markets[0]
     market_id = str(market.get("market_id", "")).strip()
-    raw_theme = normalize_theme(market.get("theme", "other"))
     ai_message = generate_smart_notification(str(market.get("title", "")).strip(), raw_theme, "new")
     context = build_market_template_context(market, ai_message)
     keyboard = create_market_keyboard(market_id, build_market_link(market_id), scope="new_market", context=context)
@@ -2753,7 +2918,7 @@ def handle_menu_button(message):
         logger.error(f"error handling menu button: {e}")
 
 
-@bot.message_handler(func=lambda message: message.text in ["Status", "Ending Soon", "Preferences", "Recent", "Daily Summary", "Help", "My ID", "Admin"])
+@bot.message_handler(func=lambda message: message.text in ["Status", "Ending Soon", "Preferences", "Recent", "Daily Summary", "Help", "My ID", "Upgrade", "Admin"])
 def handle_clean_menu_button(message):
     try:
         if message.text == "Status":
@@ -2770,6 +2935,8 @@ def handle_clean_menu_button(message):
             send_help(message)
         elif message.text == "My ID":
             get_my_id(message)
+        elif message.text == "Upgrade":
+            upgrade_command(message)
         elif message.text == "Admin":
             admin_dashboard(message)
     except Exception as e:
@@ -2890,21 +3057,52 @@ def broadcast_command(message):
 def premium_add_command(message):
     try:
         if not is_admin(message.from_user.id):
-            reply_temp(message, "❌ Permission Denied. Admin Only Command")
+            reply_temp(message, "Permission denied. Admin only command.")
             return
 
         args = message.text.split(maxsplit=1)
         if len(args) < 2:
-            reply_temp(message, "Format: /premium_add telegram_chat_or_user_id")
+            reply_temp(message, "Format: /premium_add telegram_chat_or_user_id monthly")
             return
 
-        chat_id = args[1].strip()
-        if add_premium_chat(chat_id, message.from_user.id):
-            reply_temp(message, f"⭐ Premium enabled for <code>{escape_text(chat_id)}</code>", parse_mode="HTML")
+        parts = args[1].split()
+        chat_id = parts[0].strip()
+        plan = normalize_premium_plan(parts[1] if len(parts) > 1 else "monthly")
+        expires_at = premium_expiry_for_plan(plan)
+        if add_premium_chat(chat_id, message.from_user.id, plan=plan, expires_at=expires_at):
+            reply_temp(
+                message,
+                f"Premium enabled for <code>{escape_text(chat_id)}</code>\n"
+                f"Plan: <b>{escape_text(plan)}</b>\n"
+                f"Expires: <b>{escape_text(expires_at.strftime('%b %d, %Y'))}</b>",
+                parse_mode="HTML",
+            )
         else:
-            reply_temp(message, "❌ Could not add premium chat.")
+            reply_temp(message, "Could not add premium chat.")
     except Exception as e:
         logger.error(f"error in premium_add: {e}")
+
+
+@bot.message_handler(commands=['setpremiumwallet'])
+def setpremiumwallet_command(message):
+    try:
+        if not is_admin(message.from_user.id):
+            reply_temp(message, "Permission denied. Admin only command.")
+            return
+
+        args = message.text.split(maxsplit=1)
+        if len(args) < 2:
+            reply_temp(message, "Format: /setpremiumwallet YOUR_SOL_USDC_ADDRESS")
+            return
+
+        wallet = set_premium_wallet(args[1])
+        reply_temp(
+            message,
+            f"USDC Solana premium wallet updated:\n<code>{escape_text(wallet)}</code>",
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        logger.error(f"error in setpremiumwallet: {e}")
 
 
 @bot.message_handler(commands=['premium_remove'])
@@ -2934,16 +3132,40 @@ def premium_remove_command(message):
 def premium_users_command(message):
     try:
         if not is_admin(message.from_user.id):
-            reply_temp(message, "❌ Permission Denied. Admin Only Command")
+            reply_temp(message, "Permission denied. Admin only command.")
             return
 
-        premium_ids = get_premium_chat_ids()
-        if not premium_ids:
+        with get_db() as conn:
+            with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
+                cur.execute("""
+                    SELECT chat_id, plan, expires_at, created_at
+                    FROM premium_chats
+                    ORDER BY created_at DESC
+                    LIMIT 50
+                """)
+                rows = cur.fetchall()
+
+        if not rows:
             reply_temp(message, "No premium chats yet.")
             return
 
-        lines = ["⭐ <b>Premium Chats</b>"]
-        lines.extend(f"<code>{escape_text(chat_id)}</code>" for chat_id in premium_ids[:50])
+        lines = ["<b>Premium Users / Chats</b>"]
+        for row in rows:
+            expires_at = row.get("expires_at")
+            if expires_at:
+                expiry_text = expires_at.strftime('%b %d, %Y') if hasattr(expires_at, 'strftime') else str(expires_at)
+            else:
+                expiry_text = "No expiry"
+            status = "active"
+            if expires_at:
+                expiry_dt = expires_at if hasattr(expires_at, "strftime") else parse_api_datetime(str(expires_at))
+                if expiry_dt and expiry_dt <= now_utc():
+                    status = "expired"
+            lines.append(
+                f"\n<code>{escape_text(row.get('chat_id'))}</code>\n"
+                f"Plan: <b>{escape_text(row.get('plan') or 'legacy')}</b> | {escape_text(status)}\n"
+                f"Expires: {escape_text(expiry_text)}"
+            )
         reply_temp(message, "\n".join(lines), parse_mode="HTML")
     except Exception as e:
         logger.error(f"error in premium_users: {e}")
@@ -3211,11 +3433,15 @@ try:
         telebot.types.BotCommand("getmyid", "Get your telegram id"),
     ]
     
+    private_commands = public_commands + [
+        telebot.types.BotCommand("upgrade", "View premium plans"),
+    ]
+
     bot.set_my_commands(public_commands)
-    bot.set_my_commands(public_commands, scope=telebot.types.BotCommandScopeAllPrivateChats())
+    bot.set_my_commands(private_commands, scope=telebot.types.BotCommandScopeAllPrivateChats())
     bot.set_my_commands(public_commands, scope=telebot.types.BotCommandScopeAllGroupChats())
     
-    admin_commands = public_commands + [
+    admin_commands = private_commands + [
         telebot.types.BotCommand("admin", "Open admin dashboard"),
         telebot.types.BotCommand("pause", "Pause all notifications"),
         telebot.types.BotCommand("resume", "Resume notifications"),
@@ -3224,6 +3450,7 @@ try:
         telebot.types.BotCommand("preview", "Preview latest market alert"),
         telebot.types.BotCommand("health", "Show bot health"),
         telebot.types.BotCommand("premium_add", "Add premium user or chat"),
+        telebot.types.BotCommand("setpremiumwallet", "Set USDC Solana payment address"),
         telebot.types.BotCommand("premium_remove", "Remove premium user or chat"),
         telebot.types.BotCommand("premium_users", "List premium users or chats"),
         telebot.types.BotCommand("premium_digest", "Preview premium digest"),
