@@ -29,7 +29,7 @@ if not os.getenv("DATABASE_URL"):
 bot = telebot.TeleBot(bot_token)
 
 B4_API_URL = os.getenv("B4_API_URL", "https://www.b4app.xyz/api/markets")
-MARKET_LINK_BASE = os.getenv("MARKET_LINK_BASE", "https://b4app.xyz/m").rstrip("/")
+MARKET_LINK_BASE = os.getenv("MARKET_LINK_BASE", "https://www.b4app.xyz/m").rstrip("/")
 ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
 DATABASE_URL = os.getenv("DATABASE_URL")
 
@@ -49,6 +49,8 @@ BROADCAST_WORKERS = max(1, int(os.getenv("BROADCAST_WORKERS", "4")))
 MARKET_POLL_SECONDS = float(os.getenv("MARKET_POLL_SECONDS", "5"))
 COVER_IMAGE_WAIT_SECONDS = float(os.getenv("COVER_IMAGE_WAIT_SECONDS", "8"))
 COVER_IMAGE_RETRY_SECONDS = float(os.getenv("COVER_IMAGE_RETRY_SECONDS", "1"))
+IMAGE_FOLLOWUP_WAIT_SECONDS = float(os.getenv("IMAGE_FOLLOWUP_WAIT_SECONDS", "45"))
+PREMIUM_GO_LIVE_REMINDER_SECONDS = int(os.getenv("PREMIUM_GO_LIVE_REMINDER_SECONDS", "120"))
 TEMP_RESPONSE_DELETE_SECONDS = int(os.getenv("TEMP_RESPONSE_DELETE_SECONDS", "180"))
 DAILY_SUMMARY_UTC_HOUR = int(os.getenv("DAILY_SUMMARY_UTC_HOUR", "9"))
 VALID_THEMES = ["all", "crypto", "politics", "entertainment", "sports", "travel", "current_events", "other"]
@@ -68,6 +70,23 @@ def now_utc():
 
 def build_market_link(market_id):
     return f"{MARKET_LINK_BASE}/{market_id}"
+
+
+def parse_api_datetime(value):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone(timezone.utc).replace(tzinfo=None)
+    except Exception:
+        return None
+
+
+def get_market_go_live_at(market):
+    go_live_at = parse_api_datetime(market.get("go_live_at"))
+    if go_live_at:
+        return go_live_at
+    created_at = parse_api_datetime(market.get("created_at"))
+    return created_at
 
 
 def get_db():
@@ -113,9 +132,19 @@ def init_db():
                         notified_5m BOOLEAN DEFAULT FALSE,
                         notified_ended BOOLEAN DEFAULT FALSE,
                         delete_scheduled BOOLEAN DEFAULT FALSE,
+                        notified_scheduled BOOLEAN DEFAULT FALSE,
+                        notified_go_live_2m BOOLEAN DEFAULT FALSE,
+                        image_followup_sent BOOLEAN DEFAULT FALSE,
+                        is_scheduled BOOLEAN DEFAULT FALSE,
+                        go_live_at TEXT,
                         detected_at TEXT
                     )
                 """)
+                cur.execute("ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS notified_scheduled BOOLEAN DEFAULT FALSE")
+                cur.execute("ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS notified_go_live_2m BOOLEAN DEFAULT FALSE")
+                cur.execute("ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS image_followup_sent BOOLEAN DEFAULT FALSE")
+                cur.execute("ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS is_scheduled BOOLEAN DEFAULT FALSE")
+                cur.execute("ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS go_live_at TEXT")
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS market_messages (
                         id SERIAL PRIMARY KEY,
@@ -129,6 +158,13 @@ def init_db():
                     CREATE TABLE IF NOT EXISTS bot_state (
                         key TEXT PRIMARY KEY,
                         value TEXT
+                    )
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS premium_chats (
+                        chat_id TEXT PRIMARY KEY,
+                        added_by TEXT,
+                        created_at TIMESTAMP DEFAULT NOW()
                     )
                 """)
                 cur.execute("""
@@ -240,6 +276,47 @@ def get_chat_themes(chat_id):
 def chat_wants_theme(chat_id, theme):
     themes = get_chat_themes(chat_id)
     return "all" in themes or theme in themes
+
+
+def add_premium_chat(chat_id, added_by):
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO premium_chats (chat_id, added_by)
+                    VALUES (%s, %s)
+                    ON CONFLICT (chat_id) DO UPDATE SET added_by = EXCLUDED.added_by
+                """, (str(chat_id), str(added_by)))
+        return True
+    except Exception as e:
+        logger.error(f"error adding premium chat {chat_id}: {e}")
+        return False
+
+
+def remove_premium_chat(chat_id):
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM premium_chats WHERE chat_id = %s", (str(chat_id),))
+                return cur.rowcount > 0
+    except Exception as e:
+        logger.error(f"error removing premium chat {chat_id}: {e}")
+        return False
+
+
+def get_premium_chat_ids():
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT chat_id FROM premium_chats ORDER BY created_at DESC")
+                return [row[0] for row in cur.fetchall()]
+    except Exception as e:
+        logger.error(f"error fetching premium chats: {e}")
+        return []
+
+
+def is_premium_chat(chat_id):
+    return str(chat_id) in set(get_premium_chat_ids())
 
 
 def clean_ai_message(message):
@@ -381,17 +458,26 @@ def get_announced_market(market_id):
         return None
 
 
-def save_announced_market(market_id, title, theme, end_time):
+def save_announced_market(market_id, title, theme, end_time, notified_new=True, is_scheduled=False, go_live_at=None):
     try:
         market_link = build_market_link(market_id)
+        go_live_value = go_live_at.isoformat() if isinstance(go_live_at, datetime) else go_live_at
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
-                    INSERT INTO announced_markets (market_id, title, theme, end_time, market_link, notified_new, notified_1h, notified_5m, notified_ended, delete_scheduled, detected_at)
-                    VALUES (%s, %s, %s, %s, %s, TRUE, FALSE, FALSE, FALSE, FALSE, %s)
+                    INSERT INTO announced_markets (
+                        market_id, title, theme, end_time, market_link, notified_new,
+                        notified_1h, notified_5m, notified_ended, delete_scheduled,
+                        notified_scheduled, notified_go_live_2m, image_followup_sent,
+                        is_scheduled, go_live_at, detected_at
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, %s, %s, %s)
                     ON CONFLICT (market_id) DO NOTHING
                     RETURNING market_id
-                """, (str(market_id), title, theme, end_time, market_link, now_utc().isoformat()))
+                """, (
+                    str(market_id), title, theme, end_time, market_link, notified_new,
+                    is_scheduled, go_live_value, now_utc().isoformat()
+                ))
                 return cur.fetchone() is not None
     except Exception as e:
         logger.error(f"error saving market {market_id}: {e}")
@@ -399,7 +485,11 @@ def save_announced_market(market_id, title, theme, end_time):
 
 
 def update_market_flag(market_id, flag):
-    allowed_flags = {"notified_new", "notified_1h", "notified_5m", "notified_ended", "delete_scheduled"}
+    allowed_flags = {
+        "notified_new", "notified_1h", "notified_5m", "notified_ended",
+        "delete_scheduled", "notified_scheduled", "notified_go_live_2m",
+        "image_followup_sent"
+    }
     if flag not in allowed_flags:
         logger.error(f"invalid market flag requested: {flag}")
         return
@@ -430,6 +520,35 @@ def get_all_announced_markets():
     except Exception as e:
         logger.error(f"error fetching all markets: {e}")
         return []
+
+
+def get_recent_announced_markets(limit=8):
+    try:
+        with get_db() as conn:
+            with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
+                cur.execute("""
+                    SELECT * FROM announced_markets
+                    ORDER BY detected_at DESC NULLS LAST
+                    LIMIT %s
+                """, (limit,))
+                return cur.fetchall()
+    except Exception as e:
+        logger.error(f"error fetching recent markets: {e}")
+        return []
+
+
+def update_market_live_state(market_id, is_scheduled=False, go_live_at=None):
+    try:
+        go_live_value = go_live_at.isoformat() if isinstance(go_live_at, datetime) else go_live_at
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE announced_markets
+                    SET is_scheduled = %s, go_live_at = COALESCE(%s, go_live_at)
+                    WHERE market_id = %s
+                """, (is_scheduled, go_live_value, str(market_id)))
+    except Exception as e:
+        logger.error(f"error updating live state for {market_id}: {e}")
 
 
 def save_message_id(market_id, chat_id, message_id):
@@ -573,15 +692,18 @@ def send_notification_to_chat(chat_id, message_text, market_id=None, keyboard=No
     return True
 
 
-def broadcast_to_all(message_text, market_id=None, keyboard=None, theme=None, notification_key=None, photo_url=None):
+def broadcast_to_all(message_text, market_id=None, keyboard=None, theme=None, notification_key=None, photo_url=None, premium_only=False):
     try:
         if notification_key and not can_send_notification(notification_key):
             return
 
+        premium_ids = set(get_premium_chat_ids()) if premium_only else None
         chats = [
             chat_id for chat_id in get_all_chats()
             if not theme or chat_wants_theme(chat_id, theme)
         ]
+        if premium_ids is not None:
+            chats = [chat_id for chat_id in chats if str(chat_id) in premium_ids]
         sent = 0
 
         if BROADCAST_WORKERS <= 1 or len(chats) <= 1:
@@ -605,6 +727,8 @@ def broadcast_to_all(message_text, market_id=None, keyboard=None, theme=None, no
                     except Exception as e:
                         logger.error(f"error sending to {chat_id}: {e}")
 
+        if sent:
+            set_bot_state("last_notification_sent", now_utc().isoformat())
         logger.info(f"broadcast sent to {sent} chats")
     except Exception as e:
         logger.error(f"error in broadcast_to_all: {e}")
@@ -698,9 +822,11 @@ def fetch_b4_markets():
 
         if isinstance(data, dict) and "markets" in data:
             logger.info(f"fetched {len(data['markets'])} markets from api")
+            set_bot_state("last_api_check", now_utc().isoformat())
             return data["markets"]
         elif isinstance(data, list):
             logger.info(f"fetched {len(data)} markets from api")
+            set_bot_state("last_api_check", now_utc().isoformat())
             return data
         else:
             logger.error(f"unexpected api response: {data}")
@@ -851,6 +977,76 @@ def build_new_market_notification(market, ai_message):
     return message
 
 
+def build_scheduled_market_notification(market):
+    title = str(market.get("title", "")).strip()
+    raw_theme = normalize_theme(market.get("theme", "other"))
+    theme = format_theme(raw_theme)
+    go_live_at = get_market_go_live_at(market)
+    go_live_text = go_live_at.strftime('%b %d, %Y at %I:%M %p UTC') if go_live_at else "soon"
+    promo_text = build_market_promo_text(market)
+
+    message = (
+        f"⭐ <b>PREMIUM EARLY MARKET ALERT</b>\n\n"
+        f"📌 <b>{escape_text(title)}</b>\n\n"
+        f"🏷️ Theme: {escape_text(theme)}\n"
+        f"🚀 Goes Live: <b>{escape_text(go_live_text)}</b>"
+    )
+    if promo_text:
+        message += f"\n{promo_text}"
+
+    message += "\n\nPremium users are seeing this before the public live alert."
+    return message
+
+
+def build_go_live_reminder_notification(market_data):
+    title = market_data.get("title", "").strip()
+    go_live_at = market_data.get("go_live_at")
+    if isinstance(go_live_at, datetime):
+        go_live_text = go_live_at.strftime('%I:%M %p UTC')
+    else:
+        parsed = parse_api_datetime(go_live_at)
+        go_live_text = parsed.strftime('%I:%M %p UTC') if parsed else "very soon"
+
+    return (
+        f"⏱️ <b>PREMIUM 2-MINUTE LIVE REMINDER</b>\n\n"
+        f"📌 <b>{escape_text(title)}</b>\n\n"
+        f"This market goes live at <b>{escape_text(go_live_text)}</b>."
+    )
+
+
+def schedule_image_followup(market_id, title, theme):
+    if IMAGE_FOLLOWUP_WAIT_SECONDS <= 0:
+        return
+
+    def send_when_ready():
+        deadline = time.time() + IMAGE_FOLLOWUP_WAIT_SECONDS
+        while time.time() < deadline:
+            time.sleep(COVER_IMAGE_RETRY_SECONDS)
+            for latest_market in fetch_b4_markets():
+                if str(latest_market.get("market_id", "")).strip() != str(market_id):
+                    continue
+                cover_url = get_market_cover_image(latest_market)
+                if not cover_url:
+                    break
+                message = (
+                    f"🖼️ <b>Market Cover Ready</b>\n\n"
+                    f"📌 <b>{escape_text(title)}</b>"
+                )
+                broadcast_to_all(
+                    message,
+                    market_id,
+                    create_market_keyboard(market_id, build_market_link(market_id)),
+                    theme=theme,
+                    notification_key=f"image_followup_{market_id}",
+                    photo_url=cover_url,
+                )
+                update_market_flag(market_id, "image_followup_sent")
+                logger.info(f"image follow-up sent for market {market_id}")
+                return
+
+    Thread(target=send_when_ready, daemon=True).start()
+
+
 def normalize_theme(theme):
     theme_text = str(theme or "other").lower()
     for valid_theme in VALID_THEMES:
@@ -911,6 +1107,7 @@ def get_stats_text():
     total_users = len(get_all_users())
     total_markets = len(all_markets)
     total_chats = len(get_all_chats())
+    premium_chats = len(get_premium_chat_ids())
     active = sum(1 for m in all_markets if not m.get("notified_ended"))
     paused = "Paused" if get_pause_state() else "Running"
     tone = get_ai_tone().title()
@@ -924,6 +1121,36 @@ def get_stats_text():
         f"🎛 AI Tone: <b>{tone}</b>\n"
         f"✅ Status: <b>{paused}</b>"
     )
+
+
+def get_health_text():
+    return (
+        f"🩺 <b>Notify Bot Health</b>\n\n"
+        f"Status: <b>{'Paused' if get_pause_state() else 'Running'}</b>\n"
+        f"Last API Check: <code>{escape_text(get_bot_state('last_api_check', 'never'))}</code>\n"
+        f"Last Market: <code>{escape_text(get_bot_state('last_market_detected', 'none'))}</code>\n"
+        f"Last Notification: <code>{escape_text(get_bot_state('last_notification_sent', 'none'))}</code>\n"
+        f"AI: <b>{'Active' if ai_client else 'Not configured'}</b>\n"
+        f"Poll Interval: <b>{MARKET_POLL_SECONDS}s</b>\n"
+        f"Image Wait: <b>{COVER_IMAGE_WAIT_SECONDS}s</b>\n"
+        f"Market Link Base: <code>{escape_text(MARKET_LINK_BASE)}</code>"
+    )
+
+
+def build_recent_markets_text():
+    markets = get_recent_announced_markets()
+    if not markets:
+        return "No markets announced yet."
+
+    lines = ["🕘 <b>Recent Announced Markets</b>"]
+    for market in markets:
+        status = "scheduled" if market.get("is_scheduled") and not market.get("notified_new") else "live"
+        lines.append(
+            f"\n<b>{escape_text(market.get('title', 'Untitled'))}</b>\n"
+            f"ID: <code>{escape_text(market.get('market_id'))}</code>\n"
+            f"Status: {escape_text(status)}"
+        )
+    return "\n".join(lines)
 
 
 def build_daily_summary_text():
@@ -955,6 +1182,43 @@ def build_daily_summary_text():
     return summary
 
 
+def build_premium_digest_text():
+    markets = get_all_announced_markets()
+    scheduled = [
+        market for market in markets
+        if market.get("is_scheduled") and not market.get("notified_new") and not market.get("notified_ended")
+    ]
+    active = [
+        market for market in markets
+        if market.get("notified_new") and not market.get("notified_ended")
+    ]
+
+    lines = [
+        "⭐ <b>Premium B4 Market Digest</b>",
+        "",
+        f"Scheduled early alerts: <b>{len(scheduled)}</b>",
+        f"Live markets tracked: <b>{len(active)}</b>",
+    ]
+
+    if scheduled:
+        lines.append("\n<b>Upcoming</b>")
+        for market in scheduled[:5]:
+            go_live_at = market.get("go_live_at")
+            if isinstance(go_live_at, datetime):
+                go_live_text = go_live_at.strftime('%b %d, %I:%M %p UTC')
+            else:
+                parsed = parse_api_datetime(go_live_at)
+                go_live_text = parsed.strftime('%b %d, %I:%M %p UTC') if parsed else "soon"
+            lines.append(f"• {escape_text(market.get('title'))} — {escape_text(go_live_text)}")
+
+    if active:
+        lines.append("\n<b>Live Now</b>")
+        for market in active[:5]:
+            lines.append(f"• {escape_text(market.get('title'))}")
+
+    return "\n".join(lines)
+
+
 def send_daily_summary_if_due():
     now = datetime.now(timezone.utc)
     if now.hour != DAILY_SUMMARY_UTC_HOUR:
@@ -968,8 +1232,99 @@ def send_daily_summary_if_due():
         build_daily_summary_text(),
         notification_key=f"daily_summary_{today_key}",
     )
+    broadcast_to_all(
+        build_premium_digest_text(),
+        notification_key=f"premium_digest_{today_key}",
+        premium_only=True,
+    )
     set_bot_state("last_daily_summary_date", today_key)
     logger.info(f"daily summary sent for {today_key}")
+
+
+def is_scheduled_market(market):
+    go_live_at = get_market_go_live_at(market)
+    return bool(go_live_at and go_live_at > now_utc())
+
+
+def announce_live_market(market, existing=None):
+    market_id = str(market.get("market_id", "")).strip()
+    title = str(market.get("title", "")).strip()
+    raw_theme = normalize_theme(market.get("theme", "other"))
+    end_time_unix = market.get("end_time")
+    end_time = datetime.fromtimestamp(int(end_time_unix), tz=timezone.utc).replace(tzinfo=None)
+    ai_message = generate_smart_notification(title, raw_theme, "new")
+    keyboard = create_market_keyboard(market_id, build_market_link(market_id))
+    notification = build_new_market_notification(market, ai_message)
+    cover_image_url = wait_for_market_cover_image(market_id, market)
+
+    if existing:
+        update_market_flag(market_id, "notified_new")
+        update_market_live_state(market_id, is_scheduled=False, go_live_at=get_market_go_live_at(market))
+        should_broadcast = True
+    else:
+        should_broadcast = save_announced_market(
+            market_id,
+            title,
+            raw_theme,
+            end_time.isoformat(),
+            notified_new=True,
+            is_scheduled=False,
+            go_live_at=get_market_go_live_at(market),
+        )
+
+    if not should_broadcast:
+        logger.info(f"market {market_id} was already reserved for announcement")
+        return
+
+    broadcast_to_all(
+        notification,
+        market_id,
+        keyboard,
+        theme=raw_theme,
+        notification_key=f"new_{market_id}",
+        photo_url=cover_image_url,
+    )
+    set_bot_state("last_market_detected", f"{market_id} | {title}")
+    if not cover_image_url:
+        schedule_image_followup(market_id, title, raw_theme)
+    logger.info(f"new market announced: {title}")
+
+
+def announce_scheduled_market_to_premium(market):
+    market_id = str(market.get("market_id", "")).strip()
+    title = str(market.get("title", "")).strip()
+    raw_theme = normalize_theme(market.get("theme", "other"))
+    end_time_unix = market.get("end_time")
+    end_time = datetime.fromtimestamp(int(end_time_unix), tz=timezone.utc).replace(tzinfo=None)
+    go_live_at = get_market_go_live_at(market)
+
+    saved = save_announced_market(
+        market_id,
+        title,
+        raw_theme,
+        end_time.isoformat(),
+        notified_new=False,
+        is_scheduled=True,
+        go_live_at=go_live_at,
+    )
+    if not saved:
+        return
+
+    keyboard = create_market_keyboard(market_id, build_market_link(market_id))
+    notification = build_scheduled_market_notification(market)
+    cover_image_url = wait_for_market_cover_image(market_id, market)
+    broadcast_to_all(
+        notification,
+        market_id,
+        keyboard,
+        theme=raw_theme,
+        notification_key=f"scheduled_{market_id}",
+        photo_url=cover_image_url,
+        premium_only=True,
+    )
+    update_market_flag(market_id, "notified_scheduled")
+    set_bot_state("last_market_detected", f"{market_id} | {title} (scheduled)")
+    logger.info(f"premium scheduled market announced: {title}")
 
 
 def monitor_b4_markets():
@@ -1021,50 +1376,12 @@ def monitor_b4_markets():
 
                     existing = get_announced_market(market_id)
                     if not existing:
-                        title = str(market.get("title", "")).strip()
-                        raw_theme = normalize_theme(market.get("theme", "other"))
-                        theme = format_theme(raw_theme)
-                        end_time_unix = market.get("end_time")
-                        end_time = datetime.fromtimestamp(int(end_time_unix), tz=timezone.utc).replace(tzinfo=None)
-                        end_time_str = end_time.strftime('%b %d, %Y at %I:%M %p UTC')
-
-                        # try to generate ai notification
-                        ai_message = generate_smart_notification(title, raw_theme, "new")
-                        market_link = build_market_link(market_id)
-                        
-                        if ai_message:
-                            notification = (
-                                f"🆕 <b>NEW MARKET LIVE</b>\n\n"
-                                f"📌 <b>{escape_text(title)}</b>\n\n"
-                                f"🏷️ Theme: {escape_text(theme)}\n"
-                                f"⏰ Closes: {escape_text(end_time_str)}\n\n"
-                                f"{ai_message}"
-                            )
+                        if is_scheduled_market(market):
+                            announce_scheduled_market_to_premium(market)
                         else:
-                            notification = (
-                                f"🆕 <b>NEW MARKET LIVE</b>\n\n"
-                                f"📌 <b>{escape_text(title)}</b>\n\n"
-                                f"🏷️ Theme: {escape_text(theme)}\n"
-                                f"⏰ Closes: {escape_text(end_time_str)}\n\n"
-                                f"Place your stake now!"
-                            )
-
-                        keyboard = create_market_keyboard(market_id, market_link)
-                        notification = build_new_market_notification(market, ai_message)
-                        cover_image_url = wait_for_market_cover_image(market_id, market)
-
-                        if save_announced_market(market_id, title, raw_theme, end_time.isoformat()):
-                            broadcast_to_all(
-                                notification,
-                                market_id,
-                                keyboard,
-                                theme=raw_theme,
-                                notification_key=f"new_{market_id}",
-                                photo_url=cover_image_url,
-                            )
-                            logger.info(f"new market announced: {title}")
-                        else:
-                            logger.info(f"market {market_id} was already reserved for announcement")
+                            announce_live_market(market)
+                    elif existing.get("is_scheduled") and not existing.get("notified_new") and not is_scheduled_market(market):
+                        announce_live_market(market, existing=existing)
 
                 except Exception as e:
                     logger.error(f"error processing market: {e}")
@@ -1096,6 +1413,24 @@ def check_scheduled_notifications():
 
                 if not end_time_str or not title:
                     continue
+
+                go_live_value = market_data.get("go_live_at")
+                if market_data.get("is_scheduled") and not market_data.get("notified_go_live_2m") and go_live_value:
+                    go_live_at = go_live_value if isinstance(go_live_value, datetime) else parse_api_datetime(go_live_value)
+                    if go_live_at:
+                        seconds_to_live = (go_live_at - now).total_seconds()
+                        if 0 < seconds_to_live <= PREMIUM_GO_LIVE_REMINDER_SECONDS:
+                            market_link = market_data.get("market_link", build_market_link(market_id))
+                            broadcast_to_all(
+                                build_go_live_reminder_notification(market_data),
+                                market_id,
+                                create_market_keyboard(market_id, market_link),
+                                theme=raw_theme,
+                                notification_key=f"go_live_2m_{market_id}",
+                                premium_only=True,
+                            )
+                            update_market_flag(market_id, "notified_go_live_2m")
+                            logger.info(f"premium go-live reminder sent for: {title}")
 
                 end_time = datetime.fromisoformat(end_time_str)
                 time_until = (end_time - now).total_seconds()
@@ -1646,6 +1981,137 @@ def broadcast_command(message):
         logger.error(f"error in broadcast: {e}")
 
 
+@bot.message_handler(commands=['premium_add'])
+def premium_add_command(message):
+    try:
+        if not is_admin(message.from_user.id):
+            reply_temp(message, "❌ Permission Denied. Admin Only Command")
+            return
+
+        args = message.text.split(maxsplit=1)
+        if len(args) < 2:
+            reply_temp(message, "Format: /premium_add telegram_chat_or_user_id")
+            return
+
+        chat_id = args[1].strip()
+        if add_premium_chat(chat_id, message.from_user.id):
+            reply_temp(message, f"⭐ Premium enabled for <code>{escape_text(chat_id)}</code>", parse_mode="HTML")
+        else:
+            reply_temp(message, "❌ Could not add premium chat.")
+    except Exception as e:
+        logger.error(f"error in premium_add: {e}")
+
+
+@bot.message_handler(commands=['premium_remove'])
+def premium_remove_command(message):
+    try:
+        if not is_admin(message.from_user.id):
+            reply_temp(message, "❌ Permission Denied. Admin Only Command")
+            return
+
+        args = message.text.split(maxsplit=1)
+        if len(args) < 2:
+            reply_temp(message, "Format: /premium_remove telegram_chat_or_user_id")
+            return
+
+        chat_id = args[1].strip()
+        removed = remove_premium_chat(chat_id)
+        reply_temp(
+            message,
+            f"⭐ Premium removed for <code>{escape_text(chat_id)}</code>" if removed else "That chat was not premium.",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.error(f"error in premium_remove: {e}")
+
+
+@bot.message_handler(commands=['premium_users'])
+def premium_users_command(message):
+    try:
+        if not is_admin(message.from_user.id):
+            reply_temp(message, "❌ Permission Denied. Admin Only Command")
+            return
+
+        premium_ids = get_premium_chat_ids()
+        if not premium_ids:
+            reply_temp(message, "No premium chats yet.")
+            return
+
+        lines = ["⭐ <b>Premium Chats</b>"]
+        lines.extend(f"<code>{escape_text(chat_id)}</code>" for chat_id in premium_ids[:50])
+        reply_temp(message, "\n".join(lines), parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"error in premium_users: {e}")
+
+
+@bot.message_handler(commands=['premium_digest'])
+def premium_digest_command(message):
+    try:
+        if not is_admin(message.from_user.id):
+            reply_temp(message, "❌ Permission Denied. Admin Only Command")
+            return
+        reply_temp(message, build_premium_digest_text(), parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"error in premium_digest: {e}")
+
+
+@bot.message_handler(commands=['health'])
+def health_command(message):
+    try:
+        if not is_admin(message.from_user.id):
+            reply_temp(message, "❌ Permission Denied. Admin Only Command")
+            return
+        reply_temp(message, get_health_text(), parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"error in health: {e}")
+
+
+@bot.message_handler(commands=['recent'])
+def recent_command(message):
+    try:
+        if not is_admin(message.from_user.id):
+            reply_temp(message, "❌ Permission Denied. Admin Only Command")
+            return
+        reply_temp(message, build_recent_markets_text(), parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"error in recent: {e}")
+
+
+@bot.message_handler(commands=['preview'])
+def preview_command(message):
+    try:
+        if not is_admin(message.from_user.id):
+            reply_temp(message, "❌ Permission Denied. Admin Only Command")
+            return
+
+        markets = [market for market in fetch_b4_markets() if is_valid_market(market) and is_market_active(market)]
+        if not markets:
+            reply_temp(message, "No active API markets available to preview.")
+            return
+
+        market = markets[0]
+        market_id = str(market.get("market_id", "")).strip()
+        raw_theme = normalize_theme(market.get("theme", "other"))
+        if is_scheduled_market(market):
+            preview_text = build_scheduled_market_notification(market)
+        else:
+            ai_message = generate_smart_notification(str(market.get("title", "")).strip(), raw_theme, "new")
+            preview_text = build_new_market_notification(market, ai_message)
+
+        cover_image_url = get_market_cover_image(market)
+        send_notification_to_chat(
+            message.chat.id,
+            f"👀 <b>Preview Only</b>\n\n{preview_text}",
+            market_id=None,
+            keyboard=create_market_keyboard(market_id, build_market_link(market_id)),
+            photo_url=cover_image_url,
+        )
+        try_delete_user_message(message)
+    except Exception as e:
+        logger.error(f"error in preview: {e}")
+        reply_temp(message, f"❌ Error: {e}")
+
+
 @bot.message_handler(commands=['reset'])
 def reset_notifications(message):
     try:
@@ -1843,6 +2309,13 @@ try:
         telebot.types.BotCommand("test", "Send test notification"),
         telebot.types.BotCommand("tone", "Change AI message tone"),
         telebot.types.BotCommand("summary", "Preview daily summary"),
+        telebot.types.BotCommand("preview", "Preview latest market alert"),
+        telebot.types.BotCommand("health", "Show bot health"),
+        telebot.types.BotCommand("recent", "Show recent announced markets"),
+        telebot.types.BotCommand("premium_add", "Add premium user or chat"),
+        telebot.types.BotCommand("premium_remove", "Remove premium user or chat"),
+        telebot.types.BotCommand("premium_users", "List premium users or chats"),
+        telebot.types.BotCommand("premium_digest", "Preview premium digest"),
         telebot.types.BotCommand("reset", "Reset all data"),
         telebot.types.BotCommand("cleanmessages", "Delete tracked messages only"),
         telebot.types.BotCommand("refreshlinks", "Refresh market button links"),
