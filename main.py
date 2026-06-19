@@ -48,6 +48,7 @@ NOTIFICATION_COOLDOWN_SECONDS = int(os.getenv("NOTIFICATION_COOLDOWN_SECONDS", "
 SEND_DELAY_SECONDS = float(os.getenv("SEND_DELAY_SECONDS", "0.1"))
 BROADCAST_WORKERS = max(1, int(os.getenv("BROADCAST_WORKERS", "4")))
 MARKET_POLL_SECONDS = float(os.getenv("MARKET_POLL_SECONDS", "5"))
+PUBLIC_ALERT_DELAY_SECONDS = float(os.getenv("PUBLIC_ALERT_DELAY_SECONDS", "45"))
 COVER_IMAGE_WAIT_SECONDS = float(os.getenv("COVER_IMAGE_WAIT_SECONDS", "8"))
 COVER_IMAGE_RETRY_SECONDS = float(os.getenv("COVER_IMAGE_RETRY_SECONDS", "1"))
 IMAGE_FOLLOWUP_WAIT_SECONDS = float(os.getenv("IMAGE_FOLLOWUP_WAIT_SECONDS", "45"))
@@ -69,6 +70,12 @@ PREMIUM_PLAN_DAYS = {
     "3months": 90,
     "6months": 180,
     "yearly": 365,
+}
+PREMIUM_ALERT_MODES = {
+    "all": "All priority alerts",
+    "promo": "Boosted and promo markets only",
+    "first_staker": "First-staker promos only",
+    "sponsor": "Sponsor boosts only",
 }
 CUSTOM_EMOJI_IDS = {
     "live": "5416081784641168838",
@@ -113,6 +120,16 @@ def parse_api_datetime(value):
         return datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone(timezone.utc).replace(tzinfo=None)
     except Exception:
         return None
+
+
+def format_market_time(dt, include_date=True):
+    if not dt:
+        return ""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    wat_time = dt.astimezone(timezone(timedelta(hours=1)))
+    pattern = '%b %d, %Y at %I:%M %p' if include_date else '%I:%M %p'
+    return f"{wat_time.strftime(pattern)} WAT"
 
 
 def get_market_go_live_at(market):
@@ -423,6 +440,19 @@ def get_premium_chat_ids():
 
 def is_premium_chat(chat_id):
     return str(chat_id) in set(get_premium_chat_ids())
+
+
+def get_premium_alert_mode(chat_id):
+    mode = get_bot_state(f"premium_alert_mode_{chat_id}", "all")
+    return mode if mode in PREMIUM_ALERT_MODES else "all"
+
+
+def set_premium_alert_mode(chat_id, mode):
+    mode = str(mode or "all").strip().lower()
+    if mode not in PREMIUM_ALERT_MODES:
+        mode = "all"
+    set_bot_state(f"premium_alert_mode_{chat_id}", mode)
+    return mode
 
 
 class SafeFormatDict(dict):
@@ -1080,18 +1110,34 @@ def send_notification_to_chat(chat_id, message_text, market_id=None, keyboard=No
     return True
 
 
-def broadcast_to_all(message_text, market_id=None, keyboard=None, theme=None, notification_key=None, photo_url=None, premium_only=False, rich_html=None):
+def broadcast_to_all(
+    message_text,
+    market_id=None,
+    keyboard=None,
+    theme=None,
+    notification_key=None,
+    photo_url=None,
+    premium_only=False,
+    rich_html=None,
+    exclude_premium=False,
+    premium_filter=None,
+):
     try:
         if notification_key and not can_send_notification(notification_key):
             return
 
-        premium_ids = set(get_premium_chat_ids()) if premium_only else None
+        premium_ids = set(get_premium_chat_ids()) if (premium_only or exclude_premium or premium_filter) else None
         chats = [
             chat_id for chat_id in get_all_chats()
             if not theme or chat_wants_theme(chat_id, theme)
         ]
         if premium_ids is not None:
-            chats = [chat_id for chat_id in chats if str(chat_id) in premium_ids]
+            if premium_only:
+                chats = [chat_id for chat_id in chats if str(chat_id) in premium_ids]
+            if exclude_premium:
+                chats = [chat_id for chat_id in chats if str(chat_id) not in premium_ids]
+            if premium_filter:
+                chats = [chat_id for chat_id in chats if premium_filter(chat_id)]
         sent = 0
 
         if BROADCAST_WORKERS <= 1 or len(chats) <= 1:
@@ -1373,6 +1419,44 @@ def build_market_promo_text(market):
     return "\n".join(lines)
 
 
+def market_has_first_staker_promo(market):
+    return bool(market.get("first_staker_promo_available"))
+
+
+def market_sponsor_count(market):
+    try:
+        return int(market.get("sponsor_match_count") or 0)
+    except Exception:
+        return 0
+
+
+def market_has_promo(market):
+    return market_has_first_staker_promo(market) or market_sponsor_count(market) > 0
+
+
+def premium_chat_wants_market(chat_id, market):
+    mode = get_premium_alert_mode(chat_id)
+    if mode == "all":
+        return True
+    if mode == "promo":
+        return market_has_promo(market)
+    if mode == "first_staker":
+        return market_has_first_staker_promo(market)
+    if mode == "sponsor":
+        return market_sponsor_count(market) > 0
+    return True
+
+
+def get_premium_market_heading(market):
+    if market_has_first_staker_promo(market) and market_sponsor_count(market) > 0:
+        return "Premium Promo Signal"
+    if market_has_first_staker_promo(market):
+        return "First-Staker Signal"
+    if market_sponsor_count(market) > 0:
+        return "Sponsor Boost Signal"
+    return "Premium Priority Alert"
+
+
 def build_market_template_context(market, ai_message=None):
     market_id = str(market.get("market_id", "")).strip()
     raw_theme = normalize_theme(market.get("theme", "other"))
@@ -1385,8 +1469,8 @@ def build_market_template_context(market, ai_message=None):
         "title": escape_text(market.get("title", "")),
         "theme": escape_text(format_theme(raw_theme)),
         "raw_theme": escape_text(raw_theme),
-        "close_time": escape_text(end_time.strftime('%b %d, %Y at %I:%M %p UTC') if end_time else ""),
-        "go_live_time": escape_text(go_live_at.strftime('%b %d, %Y at %I:%M %p UTC') if go_live_at else ""),
+        "close_time": escape_text(format_market_time(end_time) if end_time else ""),
+        "go_live_time": escape_text(format_market_time(go_live_at) if go_live_at else ""),
         "promo_text": escape_text(build_market_promo_text(market)),
         "ai_text": ai_message or "",
         "cover_image": escape_text(get_market_cover_image(market) or ""),
@@ -1401,7 +1485,7 @@ def build_new_market_notification(market, ai_message):
     title = str(market.get("title", "")).strip()
     end_time_unix = market.get("end_time")
     end_time = datetime.fromtimestamp(int(end_time_unix), tz=timezone.utc).replace(tzinfo=None)
-    end_time_str = end_time.strftime('%b %d, %Y at %I:%M %p UTC')
+    end_time_str = format_market_time(end_time)
     promo_text = build_market_promo_text(market)
 
     message = (
@@ -1422,10 +1506,20 @@ def build_new_market_notification(market, ai_message):
     return render_template_text("new_market_text", build_market_template_context(market, ai_message), message)
 
 
+def build_premium_priority_notification(market, ai_message):
+    heading = get_premium_market_heading(market)
+    base = build_new_market_notification(market, ai_message)
+    return (
+        f"{custom_emoji('premium', '🛡')} <b>{escape_text(heading.upper())}</b>\n"
+        "Premium first-hand notice.\n\n"
+        f"{base}"
+    )
+
+
 def build_scheduled_market_notification(market):
     title = str(market.get("title", "")).strip()
     go_live_at = get_market_go_live_at(market)
-    go_live_text = go_live_at.strftime('%b %d, %Y at %I:%M %p UTC') if go_live_at else "soon"
+    go_live_text = format_market_time(go_live_at) if go_live_at else "soon"
     promo_text = build_market_promo_text(market)
 
     message = (
@@ -1444,10 +1538,10 @@ def build_go_live_reminder_notification(market_data):
     title = market_data.get("title", "").strip()
     go_live_at = market_data.get("go_live_at")
     if isinstance(go_live_at, datetime):
-        go_live_text = go_live_at.strftime('%I:%M %p UTC')
+        go_live_text = format_market_time(go_live_at, include_date=False)
     else:
         parsed = parse_api_datetime(go_live_at)
-        go_live_text = parsed.strftime('%I:%M %p UTC') if parsed else "very soon"
+        go_live_text = format_market_time(parsed, include_date=False) if parsed else "very soon"
 
     return (
         f"{custom_emoji('premium', '🛡')} <b>PREMIUM 2-MINUTE LIVE REMINDER</b>\n\n"
@@ -1472,7 +1566,7 @@ def build_rich_scheduled_market(market):
     end_time = datetime.fromtimestamp(int(end_time_unix), tz=timezone.utc).replace(tzinfo=None)
     cover_url = get_market_cover_image(market)
     promo_text = build_market_promo_text(market) or "No promo details attached yet."
-    go_live_text = go_live_at.strftime('%b %d, %Y at %I:%M %p UTC') if go_live_at else "Soon"
+    go_live_text = format_market_time(go_live_at) if go_live_at else "Soon"
 
     fallback = (
         f"<h3>{custom_emoji('premium', '🛡')} Premium Early Access</h3>"
@@ -1480,7 +1574,7 @@ def build_rich_scheduled_market(market):
         f"<h2>{escape_text(title)}</h2>"
         f"<table>"
         f"<tr><th>Goes Live</th><td>{escape_text(go_live_text)}</td></tr>"
-        f"<tr><th>Closes</th><td>{escape_text(end_time.strftime('%b %d, %Y at %I:%M %p UTC'))}</td></tr>"
+        f"<tr><th>Closes</th><td>{escape_text(format_market_time(end_time))}</td></tr>"
         f"</table>"
         f"<blockquote>{escape_text(promo_text)}</blockquote>"
         f"<p>Premium users are seeing this before the public live alert.</p>"
@@ -1500,7 +1594,7 @@ def build_rich_new_market(market, ai_message, heading="New Market Live", cover_u
         build_rich_media_block(cover_url, title),
         f"<h2>{escape_text(title)}</h2>",
         "<table>",
-        f"<tr><th>Closes</th><td>{escape_text(end_time.strftime('%b %d, %Y at %I:%M %p UTC'))}</td></tr>",
+        f"<tr><th>Closes</th><td>{escape_text(format_market_time(end_time))}</td></tr>",
         "</table>",
     ]
     if promo_text:
@@ -1545,7 +1639,7 @@ def build_rich_go_live_reminder(market_data):
     title = market_data.get("title", "").strip()
     go_live_at = market_data.get("go_live_at")
     parsed = go_live_at if isinstance(go_live_at, datetime) else parse_api_datetime(go_live_at)
-    go_live_text = parsed.strftime('%I:%M %p UTC') if parsed else "very soon"
+    go_live_text = format_market_time(parsed, include_date=False) if parsed else "very soon"
     fallback = (
         f"<h3>{custom_emoji('premium', '🛡')} Premium Go-Live Reminder</h3>"
         f"<h2>{escape_text(title)}</h2>"
@@ -1585,32 +1679,34 @@ def build_rich_image_followup(title, cover_url):
 
 def build_rich_digest():
     markets = get_all_announced_markets()
-    scheduled = [
-        market for market in markets
-        if market.get("is_scheduled") and not market.get("notified_new") and not market.get("notified_ended")
-    ][:8]
     active = [
         market for market in markets
         if market.get("notified_new") and not market.get("notified_ended")
     ][:8]
+    try:
+        boosted = [
+            market for market in fetch_b4_markets()
+            if is_valid_market(market) and is_market_active(market) and market_has_promo(market)
+        ][:8]
+    except Exception as e:
+        logger.warning(f"could not fetch boosted markets for digest: {e}")
+        boosted = []
 
     stat_rows = (
-        f"<tr><td>Scheduled</td><td>{len(scheduled)}</td></tr>"
+        f"<tr><td>Boosted</td><td>{len(boosted)}</td></tr>"
         f"<tr><td>Live</td><td>{len(active)}</td></tr>"
         f"<tr><td>Ending Soon</td><td>{len(get_ending_soon_markets())}</td></tr>"
     )
 
-    scheduled_items = ""
-    for market in scheduled[:5]:
-        go_live_at = market.get("go_live_at")
-        parsed = go_live_at if isinstance(go_live_at, datetime) else parse_api_datetime(go_live_at)
-        go_live_text = parsed.strftime('%b %d, %I:%M %p UTC') if parsed else "Soon"
-        scheduled_items += (
+    boosted_items = ""
+    for market in boosted[:5]:
+        promo_text = build_market_promo_text(market) or "Promo active"
+        boosted_items += (
             f"<li><b>{escape_text(market.get('title'))}</b><br/>"
-            f"Goes live: {escape_text(go_live_text)}</li>"
+            f"{escape_text(promo_text)}</li>"
         )
-    if not scheduled_items:
-        scheduled_items = "<li>No scheduled markets tracked right now.</li>"
+    if not boosted_items:
+        boosted_items = "<li>No boosted markets visible right now.</li>"
 
     live_items = ""
     for market in active[:5]:
@@ -1624,16 +1720,18 @@ def build_rich_digest():
     fallback = (
         f"<h2>Daily B4 Market Digest</h2>"
         f"<table><tr><th>Category</th><th>Total</th></tr>{stat_rows}</table>"
-        f"<h3>Scheduled</h3><ul>{scheduled_items}</ul>"
+        f"<h3>Boosted / Promo</h3><ul>{boosted_items}</ul>"
         f"<h3>Live Now</h3><ul>{live_items}</ul>"
     )
     return render_template_rich(
         "daily_summary_rich",
         {
-            "scheduled_count": len(scheduled),
+            "scheduled_count": 0,
+            "boosted_count": len(boosted),
             "live_count": len(active),
             "ending_soon_count": len(get_ending_soon_markets()),
-            "scheduled_items": scheduled_items,
+            "scheduled_items": boosted_items,
+            "boosted_items": boosted_items,
             "live_items": live_items,
         },
         fallback,
@@ -1732,6 +1830,8 @@ def build_main_menu_keyboard(user_id=None, chat_type=None):
     )
     if chat_type == "private":
         keyboard.add(types.KeyboardButton("Upgrade"))
+        if user_id and is_premium_chat(user_id):
+            keyboard.add(types.KeyboardButton("Premium Filters"))
     if chat_type == "private" and user_id and is_admin(user_id):
         keyboard.add(types.KeyboardButton("Admin"))
     return keyboard
@@ -1749,6 +1849,26 @@ def build_upgrade_keyboard():
     return keyboard
 
 
+def build_premium_filters_keyboard(chat_id):
+    current = get_premium_alert_mode(chat_id)
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    for mode, label in PREMIUM_ALERT_MODES.items():
+        prefix = "✓ " if mode == current else ""
+        keyboard.add(types.InlineKeyboardButton(f"{prefix}{label}", callback_data=f"premium_mode_{mode}"))
+    keyboard.add(types.InlineKeyboardButton("Back to Menu", callback_data="upgrade_back"))
+    return keyboard
+
+
+def get_premium_filters_text(chat_id):
+    current = get_premium_alert_mode(chat_id)
+    return (
+        f"{custom_emoji('premium', '🛡')} <b>Premium Alert Filters</b>\n\n"
+        "Choose which priority alerts this private chat should receive.\n\n"
+        f"Current mode: <b>{escape_text(PREMIUM_ALERT_MODES.get(current, PREMIUM_ALERT_MODES['all']))}</b>\n\n"
+        "This only controls premium priority alerts. Public alerts still follow the normal bot rules."
+    )
+
+
 def get_upgrade_text(selected_plan=None, user_id=None):
     wallet = get_premium_wallet()
     plan_lines = [
@@ -1759,15 +1879,14 @@ def get_upgrade_text(selected_plan=None, user_id=None):
     ]
     text = (
         "<b>B4 Premium Access</b>\n\n"
-        "Premium is for users who want the earliest market signals before the crowd sees them.\n\n"
+        "Premium is for users who want faster, cleaner market signals before the crowd reacts.\n\n"
         "<b>What you get</b>\n"
-        "1. Early scheduled-market alerts before public live alerts\n"
-        "2. Exact go-live time for scheduled markets\n"
-        "3. 2-minute go-live reminders before scheduled markets open\n"
-        "4. Faster first-hand notice when premium-only opportunities appear\n"
-        "5. Early view of first-staker and sponsor promo opportunities when available\n"
-        "6. Premium market digest for upcoming and live opportunities\n"
-        "7. Priority access to new premium alert features as they are added\n\n"
+        "1. Priority new-market alerts before the public alert goes out\n"
+        "2. First-hand notice for first-staker promos when available\n"
+        "3. Sponsor boost alerts when a boosted market appears\n"
+        "4. Premium filters: all alerts, promo-only, first-staker-only, or sponsor-only\n"
+        "5. Premium digest focused on boosted and live opportunities\n"
+        "6. Priority access to new premium alert features as they are added\n\n"
         "<b>Plans</b>\n"
         + "\n".join(plan_lines)
         + "\n\n<b>Payment</b>\nUSDC on Solana network\n"
@@ -1799,15 +1918,14 @@ def get_upgrade_rich(selected_plan=None, user_id=None):
     )
     return (
         "<h2>B4 Premium Access</h2>"
-        "<p>Get earlier market signals before public alerts go out.</p>"
+        "<p>Get faster, cleaner market signals before public alerts go out.</p>"
         "<h3>Benefits</h3>"
         "<ul>"
-        "<li>Early scheduled-market alerts before public live alerts</li>"
-        "<li>Exact go-live time for scheduled markets</li>"
-        "<li>2-minute go-live reminders before scheduled markets open</li>"
-        "<li>Faster first-hand notice when premium opportunities appear</li>"
-        "<li>Early first-staker and sponsor promo notices when available</li>"
-        "<li>Premium market digest for upcoming and live opportunities</li>"
+        "<li>Priority new-market alerts before the public alert goes out</li>"
+        "<li>First-hand first-staker promo notices when available</li>"
+        "<li>Sponsor boost alerts when a boosted market appears</li>"
+        "<li>Premium filters for all alerts, promo-only, first-staker-only, or sponsor-only</li>"
+        "<li>Premium digest focused on boosted and live opportunities</li>"
         "<li>Priority access to new premium alert features</li>"
         "</ul>"
         "<h3>Plans</h3>"
@@ -2021,40 +2139,38 @@ def build_daily_summary_text():
 
 def build_premium_digest_text():
     markets = get_all_announced_markets()
-    scheduled = [
-        market for market in markets
-        if market.get("is_scheduled") and not market.get("notified_new") and not market.get("notified_ended")
-    ]
     active = [
         market for market in markets
         if market.get("notified_new") and not market.get("notified_ended")
     ]
+    try:
+        boosted = [
+            market for market in fetch_b4_markets()
+            if is_valid_market(market) and is_market_active(market) and market_has_promo(market)
+        ]
+    except Exception as e:
+        logger.warning(f"could not fetch boosted markets for premium digest: {e}")
+        boosted = []
 
     lines = [
-        "⭐ <b>Premium B4 Market Digest</b>",
+        f"{custom_emoji('premium', '*')} <b>Premium B4 Market Digest</b>",
         "",
-        f"Scheduled early alerts: <b>{len(scheduled)}</b>",
+        f"Boosted opportunities visible: <b>{len(boosted)}</b>",
         f"Live markets tracked: <b>{len(active)}</b>",
     ]
 
-    if scheduled:
-        lines.append("\n<b>Upcoming</b>")
-        for market in scheduled[:5]:
-            go_live_at = market.get("go_live_at")
-            if isinstance(go_live_at, datetime):
-                go_live_text = go_live_at.strftime('%b %d, %I:%M %p UTC')
-            else:
-                parsed = parse_api_datetime(go_live_at)
-                go_live_text = parsed.strftime('%b %d, %I:%M %p UTC') if parsed else "soon"
-            lines.append(f"• {escape_text(market.get('title'))} — {escape_text(go_live_text)}")
+    if boosted:
+        lines.append("\n<b>Boosted / Promo Now</b>")
+        for market in boosted[:5]:
+            promo_text = build_market_promo_text(market) or "Promo active"
+            lines.append(f"- <b>{escape_text(market.get('title'))}</b>\n{escape_text(promo_text)}")
 
     if active:
         lines.append("\n<b>Live Now</b>")
         for market in active[:5]:
-            lines.append(f"• {escape_text(market.get('title'))}")
+            lines.append(f"- {escape_text(market.get('title'))}")
 
     return "\n".join(lines)
-
 
 def send_daily_summary_if_due():
     now = datetime.now(timezone.utc)
@@ -2115,15 +2231,40 @@ def announce_live_market(market, existing=None):
         logger.info(f"market {market_id} was already reserved for announcement")
         return
 
+    premium_notification = build_premium_priority_notification(market, ai_message)
+    premium_rich = build_rich_new_market(
+        market,
+        ai_message,
+        heading=get_premium_market_heading(market),
+        cover_url=cover_image_url,
+    )
     broadcast_to_all(
-        notification,
+        premium_notification,
         market_id,
         keyboard,
         theme=raw_theme,
-        notification_key=f"new_{market_id}",
+        notification_key=f"premium_new_{market_id}",
         photo_url=cover_image_url,
-        rich_html=build_rich_new_market(market, ai_message, cover_url=cover_image_url),
+        rich_html=premium_rich,
+        premium_only=True,
+        premium_filter=lambda chat_id: premium_chat_wants_market(chat_id, market),
     )
+
+    def send_public_alert():
+        if PUBLIC_ALERT_DELAY_SECONDS > 0:
+            time.sleep(PUBLIC_ALERT_DELAY_SECONDS)
+        broadcast_to_all(
+            notification,
+            market_id,
+            keyboard,
+            theme=raw_theme,
+            notification_key=f"public_new_{market_id}",
+            photo_url=cover_image_url,
+            rich_html=build_rich_new_market(market, ai_message, cover_url=cover_image_url),
+            exclude_premium=True,
+        )
+
+    Thread(target=send_public_alert, daemon=True).start()
     set_bot_state("last_market_detected", f"{market_id} | {title}")
     if not cover_image_url:
         schedule_image_followup(market_id, title, raw_theme)
@@ -2603,6 +2744,22 @@ def handle_dashboard_callback(call):
                 rich_html=get_upgrade_rich(plan, call.from_user.id),
                 fallback_text=get_upgrade_text(plan, call.from_user.id),
             )
+        elif data.startswith("premium_mode_"):
+            if call.message.chat.type != "private":
+                answer("open the bot privately to manage premium filters", show_alert=True)
+                return
+            if not is_premium_chat(call.from_user.id):
+                answer("premium users only", show_alert=True)
+                return
+            mode = data.replace("premium_mode_", "")
+            set_premium_alert_mode(call.from_user.id, mode)
+            delete_callback_message(call)
+            send_persistent_rich(
+                chat_id=call.message.chat.id,
+                rich_html=get_premium_filters_text(call.from_user.id),
+                fallback_text=get_premium_filters_text(call.from_user.id),
+                reply_markup=build_premium_filters_keyboard(call.from_user.id),
+            )
         else:
             send_temp_message(call.message.chat.id, f"Unknown button action: {escape_text(data)}", parse_mode="HTML")
 
@@ -3021,6 +3178,26 @@ def summary_command(message):
         logger.error(f"error in summary command: {e}")
 
 
+@bot.message_handler(commands=['premiumfilters'])
+def premiumfilters_command(message):
+    try:
+        save_user(message)
+        if message.chat.type != "private":
+            reply_temp(message, "Please open the bot in private chat to manage premium filters.")
+            return
+        if not is_premium_chat(message.from_user.id):
+            reply_temp(message, "Premium filters are available after premium activation. Use /upgrade to view plans.")
+            return
+        send_persistent_rich(
+            chat_id=message.chat.id,
+            rich_html=get_premium_filters_text(message.from_user.id),
+            fallback_text=get_premium_filters_text(message.from_user.id),
+            reply_markup=build_premium_filters_keyboard(message.from_user.id),
+        )
+    except Exception as e:
+        logger.error(f"error in premiumfilters command: {e}")
+
+
 @bot.message_handler(func=lambda message: message.text in ["📊 Status", "⏰ Ending Soon", "🏷 Preferences", "ℹ️ Help", "🆔 My ID", "🛠 Admin"])
 def handle_menu_button(message):
     try:
@@ -3040,7 +3217,7 @@ def handle_menu_button(message):
         logger.error(f"error handling menu button: {e}")
 
 
-@bot.message_handler(func=lambda message: message.text in ["Status", "Ending Soon", "Preferences", "Recent", "Daily Summary", "Help", "My ID", "Upgrade", "Admin"])
+@bot.message_handler(func=lambda message: message.text in ["Status", "Ending Soon", "Preferences", "Recent", "Daily Summary", "Help", "My ID", "Upgrade", "Premium Filters", "Admin"])
 def handle_clean_menu_button(message):
     try:
         if message.text == "Status":
@@ -3059,6 +3236,8 @@ def handle_clean_menu_button(message):
             get_my_id(message)
         elif message.text == "Upgrade":
             upgrade_command(message)
+        elif message.text == "Premium Filters":
+            premiumfilters_command(message)
         elif message.text == "Admin":
             admin_dashboard(message)
     except Exception as e:
@@ -3590,6 +3769,7 @@ try:
     
     private_commands = public_commands + [
         telebot.types.BotCommand("upgrade", "View premium plans"),
+        telebot.types.BotCommand("premiumfilters", "Manage premium alert filters"),
     ]
 
     bot.set_my_commands(public_commands)
