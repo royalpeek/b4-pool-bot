@@ -47,7 +47,7 @@ ai_model = os.getenv("AI_MODEL", "llama-3.1-8b-instant")
 NOTIFICATION_COOLDOWN_SECONDS = int(os.getenv("NOTIFICATION_COOLDOWN_SECONDS", "2"))
 SEND_DELAY_SECONDS = float(os.getenv("SEND_DELAY_SECONDS", "0.1"))
 BROADCAST_WORKERS = max(1, int(os.getenv("BROADCAST_WORKERS", "4")))
-MARKET_POLL_SECONDS = float(os.getenv("MARKET_POLL_SECONDS", "5"))
+MARKET_POLL_SECONDS = float(os.getenv("MARKET_POLL_SECONDS", "1"))
 PUBLIC_ALERT_DELAY_SECONDS = float(os.getenv("PUBLIC_ALERT_DELAY_SECONDS", "45"))
 COVER_IMAGE_WAIT_SECONDS = float(os.getenv("COVER_IMAGE_WAIT_SECONDS", "8"))
 COVER_IMAGE_RETRY_SECONDS = float(os.getenv("COVER_IMAGE_RETRY_SECONDS", "1"))
@@ -2210,7 +2210,7 @@ def announce_live_market(market, existing=None):
     context = build_market_template_context(market, ai_message)
     keyboard = create_market_keyboard(market_id, build_market_link(market_id), scope="new_market", context=context)
     notification = build_new_market_notification(market, ai_message)
-    cover_image_url = wait_for_market_cover_image(market_id, market)
+    instant_cover_image_url = get_market_cover_image(market)
 
     if existing:
         update_market_flag(market_id, "notified_new")
@@ -2236,7 +2236,7 @@ def announce_live_market(market, existing=None):
         market,
         ai_message,
         heading=get_premium_market_heading(market),
-        cover_url=cover_image_url,
+        cover_url=instant_cover_image_url,
     )
     broadcast_to_all(
         premium_notification,
@@ -2244,13 +2244,14 @@ def announce_live_market(market, existing=None):
         keyboard,
         theme=raw_theme,
         notification_key=f"premium_new_{market_id}",
-        photo_url=cover_image_url,
+        photo_url=instant_cover_image_url,
         rich_html=premium_rich,
         premium_only=True,
         premium_filter=lambda chat_id: premium_chat_wants_market(chat_id, market),
     )
 
     def send_public_alert():
+        cover_image_url = wait_for_market_cover_image(market_id, market)
         if PUBLIC_ALERT_DELAY_SECONDS > 0:
             time.sleep(PUBLIC_ALERT_DELAY_SECONDS)
         broadcast_to_all(
@@ -2266,7 +2267,7 @@ def announce_live_market(market, existing=None):
 
     Thread(target=send_public_alert, daemon=True).start()
     set_bot_state("last_market_detected", f"{market_id} | {title}")
-    if not cover_image_url:
+    if not instant_cover_image_url:
         schedule_image_followup(market_id, title, raw_theme)
     logger.info(f"new market announced: {title}")
 
