@@ -43,7 +43,8 @@ ai_base_url = (
     or os.getenv("FREEMODEL_BASE_URL")
     or ("https://api.groq.com/openai/v1" if os.getenv("GROQ_API_KEY") else None)
 )
-ai_model = os.getenv("AI_MODEL", "llama-3.1-8b-instant")
+DEFAULT_AI_MODEL = "openai/gpt-oss-20b"
+ai_model = os.getenv("AI_MODEL", DEFAULT_AI_MODEL)
 NOTIFICATION_COOLDOWN_SECONDS = int(os.getenv("NOTIFICATION_COOLDOWN_SECONDS", "2"))
 SEND_DELAY_SECONDS = float(os.getenv("SEND_DELAY_SECONDS", "0.1"))
 BROADCAST_WORKERS = max(1, int(os.getenv("BROADCAST_WORKERS", "4")))
@@ -84,6 +85,14 @@ CUSTOM_EMOJI_IDS = {
     "ten_minutes": "5317000131822760128",
     "ended": "5206204230582425091",
 }
+CUSTOM_EMOJI_FALLBACKS = {
+    "live": "LIVE",
+    "premium": "PREMIUM",
+    "one_hour": "1H",
+    "ten_minutes": "10M",
+    "ended": "END",
+}
+VALID_CUSTOM_EMOJI_KEYS = set(CUSTOM_EMOJI_IDS.keys())
 VALID_THEMES = ["all", "crypto", "politics", "entertainment", "sports", "travel", "current_events", "other"]
 VALID_TONES = ["casual", "urgent", "premium", "degen", "professional"]
 STUDIO_BUTTON_SCOPES = {
@@ -313,6 +322,46 @@ def set_ai_tone(tone):
 
 def get_ai_tone():
     return get_bot_state("ai_tone", "casual")
+
+
+def set_ai_model(model):
+    model = str(model or "").strip()
+    if not model or len(model) > 120 or any(char.isspace() for char in model):
+        return False
+    set_bot_state("ai_model", model)
+    return True
+
+
+def get_ai_model():
+    return get_bot_state("ai_model", ai_model) or ai_model
+
+
+def set_custom_emoji(key, emoji_id, fallback=None):
+    key = str(key or "").strip().lower()
+    emoji_id = str(emoji_id or "").strip()
+    if key not in VALID_CUSTOM_EMOJI_KEYS:
+        return False
+    if emoji_id.lower() in {"none", "off", "disable", "disabled"}:
+        set_bot_state(f"custom_emoji_{key}", "")
+    elif not emoji_id.isdigit():
+        return False
+    else:
+        set_bot_state(f"custom_emoji_{key}", emoji_id)
+    if fallback is not None and str(fallback).strip():
+        set_bot_state(f"custom_emoji_fallback_{key}", str(fallback).strip()[:24])
+    return True
+
+
+def get_custom_emoji_id(key):
+    saved = get_bot_state(f"custom_emoji_{key}", None)
+    if saved is None:
+        return CUSTOM_EMOJI_IDS.get(key, "")
+    return saved
+
+
+def get_custom_emoji_fallback(key, default=None):
+    fallback = default or CUSTOM_EMOJI_FALLBACKS.get(key, key.upper())
+    return get_bot_state(f"custom_emoji_fallback_{key}", fallback) or fallback
 
 
 def set_chat_themes(chat_id, themes):
@@ -623,7 +672,8 @@ def escape_text(value):
 
 
 def custom_emoji(key, fallback):
-    emoji_id = CUSTOM_EMOJI_IDS.get(key)
+    fallback = get_custom_emoji_fallback(key, fallback)
+    emoji_id = get_custom_emoji_id(key)
     if not emoji_id:
         return escape_text(fallback)
     return f'<tg-emoji emoji-id="{emoji_id}">{escape_text(fallback)}</tg-emoji>'
@@ -647,30 +697,42 @@ def generate_smart_notification(title, theme, notification_type="new"):
     try:
         tone = get_ai_tone()
         tone_instruction = {
-            "casual": "sound casual, warm, and direct.",
-            "urgent": "sound urgent without sounding spammy.",
-            "premium": "sound polished, confident, and concise.",
-            "degen": "sound crypto-native, playful, and sharp, but avoid offensive language.",
+            "casual": "sound friendly, warm, and conversational.",
+            "urgent": "sound urgent and useful without sounding spammy.",
+            "premium": "sound polished, confident, and exclusive.",
+            "degen": "sound crypto-native, playful, and sharp, but keep it clean.",
             "professional": "sound clear, professional, and calm.",
-        }.get(tone, "sound casual, warm, and direct.")
+        }.get(tone, "sound friendly, warm, and conversational.")
+
+        base_rules = (
+            "Write one natural sentence under 190 characters. "
+            "Do not mention votes, volume, pools, odds, money, or fake facts. "
+            "Do not add hashtags. Do not use quotation marks. "
+            "Invite people to share their opinion."
+        )
 
         if notification_type == "new":
-            prompt = f"""you are a b4 opinion market bot. generate a short 1-sentence call to action for a new opinion market.
+            prompt = f"""You are the friendly AI writer for a community B4 opinion market notification bot.
 opinion: "{title}"
-{tone_instruction} no fluff. just get people to share their opinion. lowercase."""
+Tone: {tone_instruction}
+{base_rules}"""
         elif notification_type == "1h":
-            prompt = f"""generate a short 1-sentence reminder for an opinion market closing in 1 hour.
+            prompt = f"""You are the friendly AI writer for a community B4 opinion market notification bot.
+Write a 1 hour remaining reminder.
 opinion: "{title}"
-{tone_instruction} no fluff. just tell them to hurry up and share. lowercase."""
+Tone: {tone_instruction}
+{base_rules}"""
         elif notification_type == "10m":
-            prompt = f"""generate a short 1-sentence URGENT reminder for an opinion market closing in 10 minutes.
+            prompt = f"""You are the friendly AI writer for a community B4 opinion market notification bot.
+Write a final 10 minute reminder.
 opinion: "{title}"
-{tone_instruction} this is the last call. no fluff. lowercase."""
+Tone: {tone_instruction}
+{base_rules}"""
         else:
             return None
 
         response = ai_client.chat.completions.create(
-            model=ai_model,
+            model=get_ai_model(),
             messages=[{"role": "user", "content": prompt}],
             max_tokens=50
         )
@@ -1954,6 +2016,8 @@ def build_admin_keyboard():
         types.InlineKeyboardButton("Tone", callback_data="admin_tone"),
         types.InlineKeyboardButton("Studio", callback_data="studio_menu"),
         types.InlineKeyboardButton("Premium", callback_data="admin_premium"),
+        types.InlineKeyboardButton("AI", callback_data="admin_ai"),
+        types.InlineKeyboardButton("Emojis", callback_data="admin_emojis"),
     )
     return keyboard
 
@@ -2009,6 +2073,50 @@ def get_studio_commands_text():
         "<code>/quickbroadcast Follow us on X | https://x.com/yourname | Big update today!</code>\n"
         "<code>/settemplate new_market_text | NEW MARKET: {title}\\n\\n{ai_text}</code>"
     )
+
+
+def get_ai_settings_text():
+    status = "active" if ai_client else "not configured"
+    return (
+        "<b>AI Settings</b>\n\n"
+        f"Status: <b>{escape_text(status)}</b>\n"
+        f"Current model: <code>{escape_text(get_ai_model())}</code>\n"
+        f"Tone: <b>{escape_text(get_ai_tone().title())}</b>\n\n"
+        "Free Groq model now recommended:\n"
+        "<code>openai/gpt-oss-20b</code>\n\n"
+        "Change model:\n"
+        "<code>/aimodel openai/gpt-oss-20b</code>\n\n"
+        "Change tone:\n"
+        "<code>/tone</code>\n\n"
+        "Keep API keys in Railway only."
+    )
+
+
+def get_emoji_settings_text():
+    lines = [
+        "<b>Custom Emoji Settings</b>",
+        "",
+        "Change any notification emoji without editing code.",
+        "",
+    ]
+    for key in sorted(VALID_CUSTOM_EMOJI_KEYS):
+        emoji_id = get_custom_emoji_id(key) or "disabled"
+        fallback = get_custom_emoji_fallback(key)
+        lines.append(f"<code>{escape_text(key)}</code>: <code>{escape_text(emoji_id)}</code> | fallback: <code>{escape_text(fallback)}</code>")
+    lines.extend([
+        "",
+        "Set emoji:",
+        "<code>/setemoji live 5416081784641168838</code>",
+        "",
+        "Set emoji with fallback text:",
+        "<code>/setemoji premium 5251203410396458957 PREMIUM</code>",
+        "",
+        "Disable custom emoji:",
+        "<code>/setemoji live none LIVE</code>",
+        "",
+        "Keys: <code>live</code>, <code>premium</code>, <code>one_hour</code>, <code>ten_minutes</code>, <code>ended</code>",
+    ])
+    return "\n".join(lines)
 
 
 def get_templates_text():
@@ -2694,6 +2802,22 @@ def handle_dashboard_callback(call):
                 reply_markup=build_tone_keyboard(),
                 parse_mode="HTML"
             )
+        elif data == "admin_ai":
+            delete_callback_message(call)
+            send_temp_message(
+                call.message.chat.id,
+                get_ai_settings_text(),
+                reply_markup=build_admin_keyboard(),
+                parse_mode="HTML"
+            )
+        elif data == "admin_emojis":
+            delete_callback_message(call)
+            send_temp_message(
+                call.message.chat.id,
+                get_emoji_settings_text(),
+                reply_markup=build_admin_keyboard(),
+                parse_mode="HTML"
+            )
         elif data.startswith("tone_"):
             tone = data.replace("tone_", "")
             set_ai_tone(tone)
@@ -2940,6 +3064,95 @@ def studio_commands_command(message):
         reply_temp(message, get_studio_commands_text(), reply_markup=build_studio_keyboard(), parse_mode="HTML")
     except Exception as e:
         logger.error(f"error in studio_commands: {e}")
+
+
+@bot.message_handler(commands=['ai', 'aistatus'])
+def ai_status_command(message):
+    try:
+        if not is_admin(message.from_user.id):
+            reply_temp(message, "Permission denied.")
+            return
+        reply_temp(message, get_ai_settings_text(), reply_markup=build_admin_keyboard(), parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"error in ai status command: {e}")
+
+
+@bot.message_handler(commands=['aimodel'])
+def ai_model_command(message):
+    try:
+        if not is_admin(message.from_user.id):
+            reply_temp(message, "Permission denied.")
+            return
+        parts = str(message.text or "").split(maxsplit=1)
+        if len(parts) == 1:
+            reply_temp(message, get_ai_settings_text(), reply_markup=build_admin_keyboard(), parse_mode="HTML")
+            return
+        model = parts[1].strip()
+        if not set_ai_model(model):
+            reply_temp(
+                message,
+                "Invalid model name.\n\nExample:\n<code>/aimodel openai/gpt-oss-20b</code>",
+                parse_mode="HTML"
+            )
+            return
+        reply_temp(
+            message,
+            f"<b>AI model updated</b>\n\nCurrent model: <code>{escape_text(get_ai_model())}</code>",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.error(f"error in aimodel command: {e}")
+
+
+@bot.message_handler(commands=['emojis'])
+def emojis_command(message):
+    try:
+        if not is_admin(message.from_user.id):
+            reply_temp(message, "Permission denied.")
+            return
+        reply_temp(message, get_emoji_settings_text(), reply_markup=build_admin_keyboard(), parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"error in emojis command: {e}")
+
+
+@bot.message_handler(commands=['setemoji'])
+def setemoji_command(message):
+    try:
+        if not is_admin(message.from_user.id):
+            reply_temp(message, "Permission denied.")
+            return
+        parts = str(message.text or "").split(maxsplit=3)
+        if len(parts) < 3:
+            reply_temp(
+                message,
+                "Use:\n<code>/setemoji key custom_emoji_id fallback</code>\n\n"
+                "Example:\n<code>/setemoji live 5416081784641168838 LIVE</code>\n\n"
+                "Disable:\n<code>/setemoji live none LIVE</code>\n\n"
+                "Keys: <code>live</code>, <code>premium</code>, <code>one_hour</code>, <code>ten_minutes</code>, <code>ended</code>",
+                parse_mode="HTML"
+            )
+            return
+        key = parts[1].strip().lower()
+        emoji_id = parts[2].strip()
+        fallback = parts[3].strip() if len(parts) > 3 else None
+        if not set_custom_emoji(key, emoji_id, fallback):
+            reply_temp(
+                message,
+                "Invalid emoji setting.\n\n"
+                "The key must be one of: <code>live</code>, <code>premium</code>, <code>one_hour</code>, <code>ten_minutes</code>, <code>ended</code>.\n"
+                "The emoji ID must be numbers only, or <code>none</code>.",
+                parse_mode="HTML"
+            )
+            return
+        reply_temp(
+            message,
+            f"<b>Emoji updated</b>\n\n<code>{escape_text(key)}</code>: {custom_emoji(key, get_custom_emoji_fallback(key))}\n"
+            f"ID: <code>{escape_text(get_custom_emoji_id(key) or 'disabled')}</code>\n"
+            f"Fallback: <code>{escape_text(get_custom_emoji_fallback(key))}</code>",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.error(f"error in setemoji command: {e}")
 
 
 @bot.message_handler(commands=['templates'])
@@ -3783,6 +3996,10 @@ try:
         telebot.types.BotCommand("resume", "Resume notifications"),
         telebot.types.BotCommand("test", "Send test notification"),
         telebot.types.BotCommand("tone", "Change AI message tone"),
+        telebot.types.BotCommand("ai", "Show AI settings"),
+        telebot.types.BotCommand("aimodel", "Change AI model"),
+        telebot.types.BotCommand("emojis", "Show custom emoji settings"),
+        telebot.types.BotCommand("setemoji", "Change custom emoji"),
         telebot.types.BotCommand("preview", "Preview latest market alert"),
         telebot.types.BotCommand("health", "Show bot health"),
         telebot.types.BotCommand("premium_add", "Add premium user or chat"),
