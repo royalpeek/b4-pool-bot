@@ -56,6 +56,11 @@ IMAGE_FOLLOWUP_WAIT_SECONDS = float(os.getenv("IMAGE_FOLLOWUP_WAIT_SECONDS", "45
 PREMIUM_GO_LIVE_REMINDER_SECONDS = int(os.getenv("PREMIUM_GO_LIVE_REMINDER_SECONDS", "120"))
 TEMP_RESPONSE_DELETE_SECONDS = int(os.getenv("TEMP_RESPONSE_DELETE_SECONDS", "180"))
 DAILY_SUMMARY_UTC_HOUR = int(os.getenv("DAILY_SUMMARY_UTC_HOUR", "9"))
+PRIORITY_CHAT_IDS = [
+    chat_id.strip()
+    for chat_id in os.getenv("PRIORITY_CHAT_IDS", "").split(",")
+    if chat_id.strip()
+]
 PREMIUM_PAYMENT_TEXT = os.getenv(
     "PREMIUM_PAYMENT_TEXT",
     "To activate premium, choose a plan, make payment, then send your payment proof here. Admin will activate your access after confirmation."
@@ -799,6 +804,30 @@ def get_all_chats():
         return []
 
 
+def get_priority_chat_ids():
+    priority_ids = {str(chat_id) for chat_id in PRIORITY_CHAT_IDS if str(chat_id).strip()}
+    if ADMIN_ID:
+        priority_ids.add(str(ADMIN_ID))
+    return priority_ids
+
+
+def prioritize_chats(chats):
+    priority_ids = get_priority_chat_ids()
+    seen = set()
+    priority = []
+    normal = []
+    for chat_id in chats:
+        chat_id_str = str(chat_id)
+        if chat_id_str in seen:
+            continue
+        seen.add(chat_id_str)
+        if chat_id_str in priority_ids:
+            priority.append(chat_id)
+        else:
+            normal.append(chat_id)
+    return priority + normal
+
+
 def get_all_users():
     try:
         with get_db() as conn:
@@ -1188,7 +1217,10 @@ def broadcast_to_all(
         if notification_key and not can_send_notification(notification_key):
             return
 
+        priority_ids = get_priority_chat_ids()
         premium_ids = set(get_premium_chat_ids()) if (premium_only or exclude_premium or premium_filter) else None
+        if premium_ids is not None:
+            premium_ids.update(priority_ids)
         chats = [
             chat_id for chat_id in get_all_chats()
             if not theme or chat_wants_theme(chat_id, theme)
@@ -1199,11 +1231,21 @@ def broadcast_to_all(
             if exclude_premium:
                 chats = [chat_id for chat_id in chats if str(chat_id) not in premium_ids]
             if premium_filter:
-                chats = [chat_id for chat_id in chats if premium_filter(chat_id)]
+                chats = [chat_id for chat_id in chats if str(chat_id) in priority_ids or premium_filter(chat_id)]
+        chats = prioritize_chats(chats)
         sent = 0
+        priority_chats = [chat_id for chat_id in chats if str(chat_id) in priority_ids]
+        regular_chats = [chat_id for chat_id in chats if str(chat_id) not in priority_ids]
 
-        if BROADCAST_WORKERS <= 1 or len(chats) <= 1:
-            for chat_id in chats:
+        for chat_id in priority_chats:
+            try:
+                if send_notification_to_chat(chat_id, message_text, market_id, keyboard, photo_url, rich_html):
+                    sent += 1
+            except Exception as e:
+                logger.error(f"error sending priority notification to {chat_id}: {e}")
+
+        if BROADCAST_WORKERS <= 1 or len(regular_chats) <= 1:
+            for chat_id in regular_chats:
                 try:
                     if send_notification_to_chat(chat_id, message_text, market_id, keyboard, photo_url, rich_html):
                         sent += 1
@@ -1213,7 +1255,7 @@ def broadcast_to_all(
             with ThreadPoolExecutor(max_workers=BROADCAST_WORKERS) as executor:
                 futures = {
                     executor.submit(send_notification_to_chat, chat_id, message_text, market_id, keyboard, photo_url, rich_html): chat_id
-                    for chat_id in chats
+                    for chat_id in regular_chats
                 }
                 for future in as_completed(futures):
                     chat_id = futures[future]
