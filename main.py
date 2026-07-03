@@ -753,6 +753,33 @@ Tone: {tone_instruction}
         return None
 
 
+def build_fast_market_cta(title, notification_type="new"):
+    """Local market-aware fallback text for fast alerts without an AI network call."""
+    clean_title = str(title or "this market").strip().rstrip("?!.")
+    variants = {
+        "new": [
+            "New market is live. What is your read on: {title}?",
+            "Fresh poll just opened. Back your opinion on: {title}.",
+            "Early eyes on this one: {title}. What side are you taking?",
+            "A new debate is open now. Make your call on: {title}.",
+            "This market just went live. Pick your side on: {title}.",
+        ],
+        "1h": [
+            "One hour left. If you have a strong view on {title}, now is the time.",
+            "This market is closing soon. Final chance to act on: {title}.",
+            "One hour remaining for {title}. Make your opinion count.",
+        ],
+        "10m": [
+            "Final 10 minutes. Last call for: {title}.",
+            "This market is almost closed. Decide quickly on: {title}.",
+            "Last stretch for {title}. Take your side before it closes.",
+        ],
+    }
+    options = variants.get(notification_type, variants["new"])
+    index = sum(ord(char) for char in clean_title) % len(options)
+    return escape_text(options[index].format(title=clean_title))
+
+
 def save_user(message):
     try:
         user_id = str(message.from_user.id)
@@ -807,17 +834,26 @@ def get_all_chats():
         return []
 
 
-def get_priority_chat_ids():
-    priority_ids = {str(chat_id) for chat_id in PRIORITY_CHAT_IDS if str(chat_id).strip()}
+def get_ordered_priority_chat_ids():
+    ordered = []
     if ADMIN_ID:
-        priority_ids.add(str(ADMIN_ID))
-    return priority_ids
+        ordered.append(str(ADMIN_ID))
+    for chat_id in PRIORITY_CHAT_IDS:
+        chat_id = str(chat_id).strip()
+        if chat_id and chat_id not in ordered:
+            ordered.append(chat_id)
+    return ordered
+
+
+def get_priority_chat_ids():
+    return set(get_ordered_priority_chat_ids())
 
 
 def prioritize_chats(chats):
     priority_ids = get_priority_chat_ids()
+    ordered_priority_ids = get_ordered_priority_chat_ids()
     seen = set()
-    priority = []
+    priority_map = {}
     normal = []
     for chat_id in chats:
         chat_id_str = str(chat_id)
@@ -825,9 +861,10 @@ def prioritize_chats(chats):
             continue
         seen.add(chat_id_str)
         if chat_id_str in priority_ids:
-            priority.append(chat_id)
+            priority_map[chat_id_str] = chat_id
         else:
             normal.append(chat_id)
+    priority = [priority_map[chat_id] for chat_id in ordered_priority_ids if chat_id in priority_map]
     return priority + normal
 
 
@@ -1597,6 +1634,7 @@ def build_new_market_notification(market, ai_message):
     end_time = datetime.fromtimestamp(int(end_time_unix), tz=timezone.utc).replace(tzinfo=None)
     end_time_str = format_market_time(end_time)
     promo_text = build_market_promo_text(market)
+    body_text = ai_message or build_fast_market_cta(title, "new")
 
     message = (
         f"{custom_emoji('live', '🟢')} <b>LIVE MARKET</b>\n\n"
@@ -1608,12 +1646,9 @@ def build_new_market_notification(market, ai_message):
         message += f"\n{promo_text}"
 
     message += "\n\n"
-    if ai_message:
-        message += ai_message
-    else:
-        message += "Share your opinion before the market moves."
+    message += body_text
 
-    return render_template_text("new_market_text", build_market_template_context(market, ai_message), message)
+    return render_template_text("new_market_text", build_market_template_context(market, body_text), message)
 
 
 def build_premium_priority_notification(market, ai_message):
@@ -1698,6 +1733,7 @@ def build_rich_new_market(market, ai_message, heading="New Market Live", cover_u
     end_time = datetime.fromtimestamp(int(end_time_unix), tz=timezone.utc).replace(tzinfo=None)
     cover_url = cover_url or get_market_cover_image(market)
     promo_text = build_market_promo_text(market)
+    body_text = ai_message or build_fast_market_cta(title, "new")
 
     html_parts = [
         f"<h3>{custom_emoji('live', '🟢')} {escape_text(heading)}</h3>",
@@ -1709,12 +1745,9 @@ def build_rich_new_market(market, ai_message, heading="New Market Live", cover_u
     ]
     if promo_text:
         html_parts.append(f"<blockquote>{escape_text(promo_text)}</blockquote>")
-    if ai_message:
-        html_parts.append(f"<p>{ai_message}</p>")
-    else:
-        html_parts.append("<p>Share your opinion before the market moves.</p>")
+    html_parts.append(f"<p>{body_text}</p>")
     fallback = "".join(html_parts)
-    return render_template_rich("new_market_rich", build_market_template_context(market, ai_message), fallback)
+    return render_template_rich("new_market_rich", build_market_template_context(market, body_text), fallback)
 
 
 def build_rich_reminder(title, minutes_left, ai_message=None, urgent=False):
