@@ -1665,9 +1665,11 @@ def is_market_active(market):
 
 INTELLIGENCE_SNAPSHOT_INTERVAL = 300
 SCORE_RUN_INTERVAL = 300
+RECALC_INTERVAL = 300
 USDC_DECIMALS = 6
 USDC_DIVISOR = 10 ** USDC_DECIMALS  # B4 API returns pools in base units (lamports). Divide by 1,000,000 for USDC.
 _last_score_run = 0
+_last_recalc_run = 0
 _intelligence_snapshot_cache = {}
 
 # ── Phase 2: Editorial & Discovery Layer ──────────────────────────────────────
@@ -2130,23 +2132,115 @@ def snapshot_market(market_id, market):
                     likes, comments, round(total_volume, 6), total_participants,
                     round(controversy, 4), round(avg_stake, 6),
                 ))
-                if total_volume > 0:
-                    cur.execute("""
-                        UPDATE creators SET
-                            total_volume = creators.total_volume + %s,
-                            best_volume = GREATEST(creators.best_volume, %s)
-                        WHERE wallet_address = (
-                            SELECT creator_wallet FROM markets WHERE market_id = %s
-                        )
-                    """, (round(total_volume, 6), round(total_volume, 6), market_id))
-                    cur.execute("""
-                        INSERT INTO creator_categories (wallet_address, theme, total_volume)
-                        SELECT creator_wallet, theme, %s FROM markets WHERE market_id = %s
-                        ON CONFLICT (wallet_address, theme) DO UPDATE SET
-                            total_volume = creator_categories.total_volume + EXCLUDED.total_volume
-                    """, (round(total_volume, 6), market_id))
     except Exception as e:
         logger.error(f"error snapshotting market {market_id}: {e}")
+
+
+def recalculate_creator_totals():
+    """
+    Recalculate creator lifetime stats from latest market state.
+    total_volume = sum of latest total_volume per unique market
+    best_volume  = max of latest total_volume across markets
+    total_markets = count of distinct market_ids
+    """
+    global _last_recalc_run
+    now = time.time()
+    if now - _last_recalc_run < RECALC_INTERVAL:
+        return
+    _last_recalc_run = now
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                # Get each creator's markets with their latest snapshot volume
+                cur.execute("""
+                    SELECT
+                        m.creator_wallet,
+                        m.market_id,
+                        COALESCE(
+                            (SELECT ms.total_volume FROM market_snapshots ms
+                             WHERE ms.market_id = m.market_id
+                             ORDER BY ms.snapshot_at DESC LIMIT 1),
+                            0
+                        ) as latest_volume
+                    FROM markets m
+                    WHERE m.creator_wallet IS NOT NULL
+                      AND m.creator_wallet != ''
+                """)
+                rows = cur.fetchall()
+
+                # Aggregate per creator
+                creators = {}
+                for wallet, market_id, volume in rows:
+                    if wallet not in creators:
+                        creators[wallet] = {"markets": set(), "volumes": []}
+                    creators[wallet]["markets"].add(market_id)
+                    creators[wallet]["volumes"].append(float(volume or 0))
+
+                # Update each creator
+                for wallet, data in creators.items():
+                    total_vol = round(sum(data["volumes"]), 6)
+                    best_vol = round(max(data["volumes"]), 6) if data["volumes"] else 0
+                    market_count = len(data["markets"])
+                    cur.execute("""
+                        UPDATE creators SET
+                            total_volume = %s,
+                            best_volume = %s,
+                            total_markets = %s
+                        WHERE wallet_address = %s
+                    """, (total_vol, best_vol, market_count, wallet))
+
+                logger.info(f"recalculated totals for {len(creators)} creators")
+    except Exception as e:
+        logger.error(f"error recalculating creator totals: {e}")
+
+
+def recalculate_creator_categories():
+    """
+    Recalculate creator category totals from latest market state.
+    total_volume per (wallet, theme) = sum of latest volumes for that theme.
+    """
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT
+                        m.creator_wallet,
+                        m.theme,
+                        m.market_id,
+                        COALESCE(
+                            (SELECT ms.total_volume FROM market_snapshots ms
+                             WHERE ms.market_id = m.market_id
+                             ORDER BY ms.snapshot_at DESC LIMIT 1),
+                            0
+                        ) as latest_volume
+                    FROM markets m
+                    WHERE m.creator_wallet IS NOT NULL
+                      AND m.creator_wallet != ''
+                """)
+                rows = cur.fetchall()
+
+                cats = {}
+                for wallet, theme, market_id, volume in rows:
+                    key = (wallet, theme)
+                    if key not in cats:
+                        cats[key] = {"markets": set(), "volumes": []}
+                    cats[key]["markets"].add(market_id)
+                    cats[key]["volumes"].append(float(volume or 0))
+
+                for (wallet, theme), data in cats.items():
+                    total_vol = round(sum(data["volumes"]), 6)
+                    market_count = len(data["markets"])
+                    cur.execute("""
+                        INSERT INTO creator_categories (wallet_address, theme, market_count, total_volume)
+                        VALUES (%s, %s, %s, %s)
+                        ON CONFLICT (wallet_address, theme) DO UPDATE SET
+                            market_count = EXCLUDED.market_count,
+                            total_volume = EXCLUDED.total_volume
+                    """, (wallet, theme, market_count, total_vol))
+
+                logger.info(f"recalculated categories for {len(cats)} wallet-theme pairs")
+    except Exception as e:
+        logger.error(f"error recalculating creator categories: {e}")
 
 
 def record_market_event(market_id, event_type, event_data=None):
@@ -3411,6 +3505,8 @@ def monitor_b4_markets():
                 active_ids = [str(m.get("market_id", "")).strip() for m in markets if str(m.get("market_id", "")).strip()]
                 if active_ids:
                     run_badge_engine(active_ids)
+                recalculate_creator_totals()
+                recalculate_creator_categories()
             except Exception as e:
                 logger.error(f"intelligence pipeline error: {e}")
             send_daily_summary_if_due()
@@ -5004,6 +5100,28 @@ def intelligence_status(message):
         reply_temp(message, f"❌ Error: {e}")
 
 
+@bot.message_handler(commands=['recalc'])
+def recalc_command(message):
+    try:
+        if not is_admin(message.from_user.id):
+            reply_temp(message, "❌ Permission Denied. Admin Only Command")
+            return
+        reply_temp(message, "Recalculating creator totals from latest market state...")
+        _force_recalc()
+        reply_temp(message, "✅ Creator totals recalculated.")
+    except Exception as e:
+        logger.error(f"error in recalc command: {e}")
+        reply_temp(message, f"❌ Error: {e}")
+
+
+def _force_recalc():
+    """Force recalculation bypassing rate limit."""
+    global _last_recalc_run
+    _last_recalc_run = 0
+    recalculate_creator_totals()
+    recalculate_creator_categories()
+
+
 @bot.message_handler(commands=['creators'])
 def show_creators(message):
     try:
@@ -5257,6 +5375,7 @@ try:
         telebot.types.BotCommand("users", "Show user count"),
         telebot.types.BotCommand("listusers", "List all users"),
         telebot.types.BotCommand("intel", "Intelligence engine status"),
+        telebot.types.BotCommand("recalc", "Recalculate creator totals"),
         telebot.types.BotCommand("creators", "Top creators by volume"),
         telebot.types.BotCommand("marketstats", "Market intelligence scores"),
     ]
