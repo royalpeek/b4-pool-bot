@@ -1659,6 +1659,8 @@ def is_market_active(market):
 
 INTELLIGENCE_SNAPSHOT_INTERVAL = 300
 SCORE_RUN_INTERVAL = 300
+USDC_DECIMALS = 6
+USDC_DIVISOR = 10 ** USDC_DECIMALS  # B4 API returns pools in base units (lamports). Divide by 1,000,000 for USDC.
 _last_score_run = 0
 _intelligence_snapshot_cache = {}
 
@@ -1800,8 +1802,10 @@ def snapshot_market(market_id, market):
     market_id = str(market_id or "").strip()
     if not market_id:
         return
-    yes_pool = int(market.get("yes_pool") or 0)
-    no_pool = int(market.get("no_pool") or 0)
+    yes_pool_raw = int(market.get("yes_pool") or 0)
+    no_pool_raw = int(market.get("no_pool") or 0)
+    yes_pool = yes_pool_raw / USDC_DIVISOR
+    no_pool = no_pool_raw / USDC_DIVISOR
     yes_votes = int(market.get("yes_votes") or 0)
     no_votes = int(market.get("no_votes") or 0)
     likes = int(market.get("likes_count") or 0)
@@ -1809,8 +1813,8 @@ def snapshot_market(market_id, market):
     total_volume = yes_pool + no_pool
     total_participants = yes_votes + no_votes
     controversy = 0.0
-    if total_volume > 0:
-        controversy = min(yes_pool, no_pool) / max(yes_pool, no_pool) if max(yes_pool, no_pool) > 0 else 0
+    if total_volume > 0 and max(yes_pool, no_pool) > 0:
+        controversy = min(yes_pool, no_pool) / max(yes_pool, no_pool)
     avg_stake = 0.0
     if total_participants > 0:
         avg_stake = total_volume / total_participants
@@ -1842,9 +1846,9 @@ def snapshot_market(market_id, market):
                         controversy_score, avg_stake_size
                     ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """, (
-                    market_id, yes_pool, no_pool, yes_votes, no_votes,
-                    likes, comments, total_volume, total_participants,
-                    round(controversy, 4), round(avg_stake, 2),
+                    market_id, round(yes_pool, 6), round(no_pool, 6), yes_votes, no_votes,
+                    likes, comments, round(total_volume, 6), total_participants,
+                    round(controversy, 4), round(avg_stake, 6),
                 ))
                 if total_volume > 0:
                     cur.execute("""
@@ -1854,13 +1858,13 @@ def snapshot_market(market_id, market):
                         WHERE wallet_address = (
                             SELECT creator_wallet FROM markets WHERE market_id = %s
                         )
-                    """, (total_volume, total_volume, market_id))
+                    """, (round(total_volume, 6), round(total_volume, 6), market_id))
                     cur.execute("""
                         INSERT INTO creator_categories (wallet_address, theme, total_volume)
                         SELECT creator_wallet, theme, %s FROM markets WHERE market_id = %s
                         ON CONFLICT (wallet_address, theme) DO UPDATE SET
                             total_volume = creator_categories.total_volume + EXCLUDED.total_volume
-                    """, (total_volume, market_id))
+                    """, (round(total_volume, 6), market_id))
     except Exception as e:
         logger.error(f"error snapshotting market {market_id}: {e}")
 
@@ -4656,7 +4660,7 @@ def show_creators(message):
             best = float(row[3] or 0)
             lines.append(
                 f"\n<code>{escape_text(wallet)}</code>\n"
-                f"Markets: <b>{markets}</b> | Volume: <b>{volume:,.0f}</b> | Best: <b>{best:,.0f}</b>"
+                f"Markets: <b>{markets}</b> | Volume: <b>${volume:,.2f}</b> | Best: <b>${best:,.2f}</b>"
             )
         reply_temp(message, "\n".join(lines), parse_mode="HTML")
     except Exception as e:
@@ -4700,7 +4704,7 @@ def market_statistics(message):
             score = float(row[7] or 0)
             lines.append(
                 f"\n<b>{escape_text(title)}</b>\n"
-                f"Theme: {escape_text(theme)} | Vol: {volume:,.0f} | "
+                f"Theme: {escape_text(theme)} | Vol: ${volume:,.2f} | "
                 f"Participants: {participants} | Controversy: {controversy:.2f}\n"
                 f"Score: <b>{score:.1f}</b>"
             )
