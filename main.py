@@ -122,6 +122,40 @@ else:
     logger.warning("ai not configured, using template notifications")
 
 
+class _CacheEntry:
+    __slots__ = ("value", "expires_at")
+
+    def __init__(self, value, ttl):
+        self.value = value
+        self.expires_at = time.monotonic() + ttl
+
+
+_cache: dict[str, _CacheEntry] = {}
+DEFAULT_CACHE_TTL = 5
+
+
+def cache_get(key, ttl=DEFAULT_CACHE_TTL):
+    entry = _cache.get(key)
+    if entry and time.monotonic() < entry.expires_at:
+        return entry.value
+    return None
+
+
+def cache_set(key, value, ttl=DEFAULT_CACHE_TTL):
+    _cache[key] = _CacheEntry(value, ttl)
+
+
+def cache_invalidate(*keys):
+    for key in keys:
+        _cache.pop(key, None)
+
+
+def cache_invalidate_prefix(prefix):
+    keys_to_remove = [k for k in _cache if k.startswith(prefix)]
+    for key in keys_to_remove:
+        _cache.pop(key, None)
+
+
 def now_utc():
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
@@ -280,6 +314,151 @@ def init_db():
         raise
 
 
+def init_intelligence_tables():
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS markets (
+                        market_id TEXT PRIMARY KEY,
+                        title TEXT,
+                        description TEXT,
+                        creator_wallet TEXT,
+                        market_pubkey TEXT,
+                        theme TEXT,
+                        end_time TIMESTAMPTZ,
+                        go_live_at TIMESTAMPTZ,
+                        created_at_api TIMESTAMPTZ,
+                        detected_at TIMESTAMPTZ DEFAULT NOW(),
+                        is_private BOOLEAN DEFAULT FALSE,
+                        cover_image_url TEXT,
+                        first_staker_promo BOOLEAN DEFAULT FALSE,
+                        first_staker_match NUMERIC,
+                        first_staker_min NUMERIC,
+                        sponsor_count INT DEFAULT 0,
+                        resolved BOOLEAN DEFAULT FALSE,
+                        outcome INT DEFAULT 0,
+                        hidden BOOLEAN DEFAULT FALSE,
+                        last_updated_at TIMESTAMPTZ,
+                        last_synced_at TIMESTAMPTZ DEFAULT NOW()
+                    )
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS market_snapshots (
+                        id SERIAL PRIMARY KEY,
+                        market_id TEXT REFERENCES markets(market_id),
+                        snapshot_at TIMESTAMPTZ DEFAULT NOW(),
+                        yes_pool NUMERIC DEFAULT 0,
+                        no_pool NUMERIC DEFAULT 0,
+                        yes_votes INT DEFAULT 0,
+                        no_votes INT DEFAULT 0,
+                        likes_count INT DEFAULT 0,
+                        comments_count INT DEFAULT 0,
+                        total_volume NUMERIC DEFAULT 0,
+                        total_participants INT DEFAULT 0,
+                        controversy_score NUMERIC DEFAULT 0,
+                        avg_stake_size NUMERIC DEFAULT 0
+                    )
+                """)
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_snapshots_market_time
+                    ON market_snapshots (market_id, snapshot_at DESC)
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS creators (
+                        wallet_address TEXT PRIMARY KEY,
+                        first_seen_at TIMESTAMPTZ DEFAULT NOW(),
+                        last_seen_at TIMESTAMPTZ DEFAULT NOW(),
+                        total_markets INT DEFAULT 0,
+                        total_volume NUMERIC DEFAULT 0,
+                        best_volume NUMERIC DEFAULT 0
+                    )
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS creator_categories (
+                        id SERIAL PRIMARY KEY,
+                        wallet_address TEXT REFERENCES creators(wallet_address),
+                        theme TEXT,
+                        market_count INT DEFAULT 0,
+                        total_volume NUMERIC DEFAULT 0,
+                        UNIQUE(wallet_address, theme)
+                    )
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS market_events (
+                        id SERIAL PRIMARY KEY,
+                        market_id TEXT REFERENCES markets(market_id),
+                        event_type TEXT NOT NULL,
+                        event_data JSONB DEFAULT '{}',
+                        recorded_at TIMESTAMPTZ DEFAULT NOW()
+                    )
+                """)
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_events_market_time
+                    ON market_events (market_id, recorded_at DESC)
+                """)
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_events_type
+                    ON market_events (event_type, recorded_at DESC)
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS market_fingerprints (
+                        market_id TEXT PRIMARY KEY REFERENCES markets(market_id),
+                        opening_word TEXT,
+                        word_count INT,
+                        has_question_mark BOOLEAN DEFAULT FALSE,
+                        is_yes_no BOOLEAN DEFAULT FALSE,
+                        topic_tags TEXT[] DEFAULT '{}',
+                        detected_keywords TEXT[] DEFAULT '{}',
+                        category TEXT,
+                        complexity_score NUMERIC DEFAULT 0,
+                        created_at TIMESTAMPTZ DEFAULT NOW()
+                    )
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS market_scores (
+                        market_id TEXT PRIMARY KEY REFERENCES markets(market_id),
+                        volume_percentile NUMERIC DEFAULT 0,
+                        controversy NUMERIC DEFAULT 0,
+                        momentum NUMERIC DEFAULT 0,
+                        engagement_ratio NUMERIC DEFAULT 0,
+                        freshness NUMERIC DEFAULT 0,
+                        composite_score NUMERIC DEFAULT 0,
+                        scored_at TIMESTAMPTZ DEFAULT NOW()
+                    )
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS market_dna (
+                        market_id TEXT PRIMARY KEY REFERENCES markets(market_id),
+                        question_type TEXT,
+                        sentiment_lean TEXT,
+                        appeal_score NUMERIC DEFAULT 0,
+                        divisiveness NUMERIC DEFAULT 0,
+                        broad_appeal BOOLEAN DEFAULT FALSE,
+                        created_at TIMESTAMPTZ DEFAULT NOW()
+                    )
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS ai_predictions (
+                        id SERIAL PRIMARY KEY,
+                        market_id TEXT REFERENCES markets(market_id),
+                        predicted_volume_range TEXT,
+                        predicted_controversy NUMERIC,
+                        predicted_engagement NUMERIC,
+                        confidence NUMERIC DEFAULT 0,
+                        model_version TEXT,
+                        created_at TIMESTAMPTZ DEFAULT NOW()
+                    )
+                """)
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_predictions_market
+                    ON ai_predictions (market_id, created_at DESC)
+                """)
+        logger.info("intelligence tables ready")
+    except Exception as e:
+        logger.error(f"error initialising intelligence tables: {e}")
+
+
 def is_admin(user_id):
     if ADMIN_ID is None or ADMIN_ID == 0:
         return False
@@ -387,21 +566,30 @@ def set_chat_themes(chat_id, themes):
                     SET themes = %s
                     WHERE chat_id = %s
                 """, (",".join(cleaned_themes), str(chat_id)))
+        cache_invalidate(f"themes:{chat_id}")
     except Exception as e:
         logger.error(f"error setting chat themes for {chat_id}: {e}")
 
 
 def get_chat_themes(chat_id):
+    cache_key = f"themes:{chat_id}"
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return cached
     try:
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT themes FROM subscribed_chats WHERE chat_id = %s", (str(chat_id),))
                 result = cur.fetchone()
                 if result and result[0]:
-                    return [theme for theme in result[0].split(",") if theme]
+                    themes = [theme for theme in result[0].split(",") if theme]
+                    cache_set(cache_key, themes)
+                    return themes
     except Exception as e:
         logger.error(f"error getting chat themes for {chat_id}: {e}")
-    return ["all"]
+    default = ["all"]
+    cache_set(cache_key, default)
+    return default
 
 
 def chat_wants_theme(chat_id, theme):
@@ -463,6 +651,7 @@ def add_premium_chat(chat_id, added_by, plan="monthly", expires_at=None):
                                   plan = EXCLUDED.plan,
                                   expires_at = EXCLUDED.expires_at
                 """, (str(chat_id), str(added_by), plan, expires_at))
+        cache_invalidate("premium:ids")
         return True
     except Exception as e:
         logger.error(f"error adding premium chat {chat_id}: {e}")
@@ -474,13 +663,19 @@ def remove_premium_chat(chat_id):
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute("DELETE FROM premium_chats WHERE chat_id = %s", (str(chat_id),))
-                return cur.rowcount > 0
+                removed = cur.rowcount > 0
+        if removed:
+            cache_invalidate("premium:ids")
+        return removed
     except Exception as e:
         logger.error(f"error removing premium chat {chat_id}: {e}")
         return False
 
 
 def get_premium_chat_ids():
+    cached = cache_get("premium:ids")
+    if cached is not None:
+        return cached
     try:
         with get_db() as conn:
             with conn.cursor() as cur:
@@ -489,7 +684,9 @@ def get_premium_chat_ids():
                     WHERE expires_at IS NULL OR expires_at > NOW()
                     ORDER BY created_at DESC
                 """)
-                return [row[0] for row in cur.fetchall()]
+                result = [row[0] for row in cur.fetchall()]
+                cache_set("premium:ids", result)
+                return result
     except Exception as e:
         logger.error(f"error fetching premium chats: {e}")
         return []
@@ -809,6 +1006,7 @@ def add_chat(chat_id, chat_name):
                     VALUES (%s, %s)
                     ON CONFLICT (chat_id) DO NOTHING
                 """, (str(chat_id), chat_name))
+        cache_invalidate("chats:all")
     except Exception as e:
         logger.error(f"error adding chat: {e}")
 
@@ -818,17 +1016,23 @@ def remove_chat(chat_id):
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute("DELETE FROM subscribed_chats WHERE chat_id = %s", (str(chat_id),))
+        cache_invalidate("chats:all", f"themes:{chat_id}")
     except Exception as e:
         logger.error(f"error removing chat: {e}")
 
 
 def get_all_chats():
+    cached = cache_get("chats:all")
+    if cached is not None:
+        return cached
     try:
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT chat_id FROM subscribed_chats")
                 rows = cur.fetchall()
-                return [row[0] for row in rows]
+                result = [row[0] for row in rows]
+                cache_set("chats:all", result)
+                return result
     except Exception as e:
         logger.error(f"error fetching chats: {e}")
         return []
@@ -1451,6 +1655,350 @@ def is_market_active(market):
     except Exception as e:
         logger.error(f"error checking market status: {e}")
         return False
+
+
+INTELLIGENCE_SNAPSHOT_INTERVAL = 300
+SCORE_RUN_INTERVAL = 300
+_last_score_run = 0
+_intelligence_snapshot_cache = {}
+
+
+def _parse_fingerprint(title):
+    title = str(title or "").strip()
+    words = title.split()
+    opening_word = words[0] if words else ""
+    word_count = len(words)
+    has_question = "?" in title
+    is_yes_no = any(
+        title.lower().startswith(p)
+        for p in ("is ", "are ", "was ", "were ", "do ", "does ", "did ", "can ", "could ", "should ", "would ", "will ", "has ", "have ")
+    )
+    return opening_word, word_count, has_question, is_yes_no
+
+
+def _detect_keywords(title):
+    title_lower = str(title or "").lower()
+    keywords = []
+    keyword_map = {
+        "crypto": ["bitcoin", "btc", "ethereum", "eth", "solana", "sol", "crypto", "token", "defi", "nft"],
+        "politics": ["election", "president", "vote", "government", "trump", "biden", "congress", "democrat", "republican"],
+        "sports": ["nba", "nfl", "mlb", "soccer", "football", "basketball", "tennis", "golf", "championship", "world cup"],
+        "entertainment": ["movie", "music", "album", "oscar", "grammy", "netflix", "celebrity", "actor", "singer"],
+        "economy": ["inflation", "recession", "stock", "market", "gdp", "interest rate", "unemployment", "trade", "tariff"],
+        "science": ["earth", "moon", "mars", "climate", "space", "dna", "virus", "vaccine", "quantum"],
+        "food": ["food", "restaurant", "cooking", "recipe", "pizza", "burger", "sushi", "coffee", "beer"],
+        "society": ["people", "society", "generation", "youth", "education", "school", "university", "job", "career"],
+    }
+    for tag, words in keyword_map.items():
+        if any(w in title_lower for w in words):
+            keywords.append(tag)
+    return keywords
+
+
+def _extract_topic_tags(theme, keywords):
+    tags = set()
+    if theme and theme != "other":
+        tags.add(theme)
+    tags.update(keywords)
+    return sorted(tags)
+
+
+def ingest_market(market):
+    market_id = str(market.get("market_id", "")).strip()
+    if not market_id:
+        return
+    title = str(market.get("title", "")).strip()
+    description = str(market.get("description", "") or "").strip()
+    creator = str(market.get("creator", "") or "").strip()
+    theme = str(market.get("theme", "other") or "other").strip()
+    end_time_unix = market.get("end_time")
+    end_time = None
+    if end_time_unix:
+        try:
+            end_time = datetime.fromtimestamp(int(end_time_unix), tz=timezone.utc)
+        except Exception:
+            pass
+    go_live_at = parse_api_datetime(market.get("go_live_at"))
+    created_at_api = parse_api_datetime(market.get("created_at"))
+    updated_at = parse_api_datetime(market.get("updated_at"))
+    opening_word, word_count, has_question, is_yes_no = _parse_fingerprint(title)
+    keywords = _detect_keywords(title)
+    topic_tags = _extract_topic_tags(theme, keywords)
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO markets (
+                        market_id, title, description, creator_wallet, market_pubkey, theme,
+                        end_time, go_live_at, created_at_api, is_private, cover_image_url,
+                        first_staker_promo, first_staker_match, first_staker_min, sponsor_count,
+                        resolved, outcome, hidden, last_updated_at, last_synced_at
+                    ) VALUES (
+                        %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s,
+                        %s, %s, %s, %s, NOW()
+                    )
+                    ON CONFLICT (market_id) DO UPDATE SET
+                        title = EXCLUDED.title,
+                        description = EXCLUDED.description,
+                        creator_wallet = EXCLUDED.creator_wallet,
+                        theme = EXCLUDED.theme,
+                        end_time = EXCLUDED.end_time,
+                        go_live_at = EXCLUDED.go_live_at,
+                        is_private = EXCLUDED.is_private,
+                        cover_image_url = EXCLUDED.cover_image_url,
+                        first_staker_promo = EXCLUDED.first_staker_promo,
+                        first_staker_match = EXCLUDED.first_staker_match,
+                        first_staker_min = EXCLUDED.first_staker_min,
+                        sponsor_count = EXCLUDED.sponsor_count,
+                        resolved = EXCLUDED.resolved,
+                        outcome = EXCLUDED.outcome,
+                        hidden = EXCLUDED.hidden,
+                        last_updated_at = EXCLUDED.last_updated_at,
+                        last_synced_at = NOW()
+                """, (
+                    market_id, title, description, creator or None, market.get("market_pubkey"), theme,
+                    end_time, go_live_at, created_at_api, market.get("is_private", False),
+                    market.get("cover_image_url"),
+                    market.get("first_staker_promo_available", False),
+                    market.get("first_staker_match_usdc"),
+                    market.get("first_staker_min_stake_usdc"),
+                    market.get("sponsor_match_count", 0),
+                    market.get("resolved", False), market.get("outcome", 0), market.get("hidden", False),
+                    updated_at,
+                ))
+                if creator:
+                    cur.execute("""
+                        INSERT INTO creators (wallet_address, last_seen_at, total_markets)
+                        VALUES (%s, NOW(), 1)
+                        ON CONFLICT (wallet_address) DO UPDATE SET
+                            last_seen_at = NOW(),
+                            total_markets = creators.total_markets + 1
+                    """, (creator,))
+                    cur.execute("""
+                        INSERT INTO creator_categories (wallet_address, theme, market_count)
+                        VALUES (%s, %s, 1)
+                        ON CONFLICT (wallet_address, theme) DO UPDATE SET
+                            market_count = creator_categories.market_count + 1
+                    """, (creator, theme))
+                cur.execute("""
+                    INSERT INTO market_fingerprints (
+                        market_id, opening_word, word_count, has_question_mark,
+                        is_yes_no, topic_tags, detected_keywords, category
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (market_id) DO NOTHING
+                """, (
+                    market_id, opening_word, word_count, has_question,
+                    is_yes_no, topic_tags, keywords, theme,
+                ))
+    except Exception as e:
+        logger.error(f"error ingesting market {market_id}: {e}")
+
+
+def snapshot_market(market_id, market):
+    market_id = str(market_id or "").strip()
+    if not market_id:
+        return
+    yes_pool = int(market.get("yes_pool") or 0)
+    no_pool = int(market.get("no_pool") or 0)
+    yes_votes = int(market.get("yes_votes") or 0)
+    no_votes = int(market.get("no_votes") or 0)
+    likes = int(market.get("likes_count") or 0)
+    comments = int(market.get("comments_count") or 0)
+    total_volume = yes_pool + no_pool
+    total_participants = yes_votes + no_votes
+    controversy = 0.0
+    if total_volume > 0:
+        controversy = min(yes_pool, no_pool) / max(yes_pool, no_pool) if max(yes_pool, no_pool) > 0 else 0
+    avg_stake = 0.0
+    if total_participants > 0:
+        avg_stake = total_volume / total_participants
+    cache_key = f"snapshot:{market_id}"
+    last = _intelligence_snapshot_cache.get(cache_key)
+    changed = not last or (
+        last.get("yes_pool") != yes_pool
+        or last.get("no_pool") != no_pool
+        or last.get("yes_votes") != yes_votes
+        or last.get("no_votes") != no_votes
+        or last.get("likes") != likes
+        or last.get("comments") != comments
+    )
+    time_elapsed = not last or (time.time() - last.get("time", 0)) >= INTELLIGENCE_SNAPSHOT_INTERVAL
+    if not changed and not time_elapsed:
+        return
+    _intelligence_snapshot_cache[cache_key] = {
+        "yes_pool": yes_pool, "no_pool": no_pool,
+        "yes_votes": yes_votes, "no_votes": no_votes,
+        "likes": likes, "comments": comments, "time": time.time(),
+    }
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO market_snapshots (
+                        market_id, yes_pool, no_pool, yes_votes, no_votes,
+                        likes_count, comments_count, total_volume, total_participants,
+                        controversy_score, avg_stake_size
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """, (
+                    market_id, yes_pool, no_pool, yes_votes, no_votes,
+                    likes, comments, total_volume, total_participants,
+                    round(controversy, 4), round(avg_stake, 2),
+                ))
+                if total_volume > 0:
+                    cur.execute("""
+                        UPDATE creators SET
+                            total_volume = creators.total_volume + %s,
+                            best_volume = GREATEST(creators.best_volume, %s)
+                        WHERE wallet_address = (
+                            SELECT creator_wallet FROM markets WHERE market_id = %s
+                        )
+                    """, (total_volume, total_volume, market_id))
+                    cur.execute("""
+                        INSERT INTO creator_categories (wallet_address, theme, total_volume)
+                        SELECT creator_wallet, theme, %s FROM markets WHERE market_id = %s
+                        ON CONFLICT (wallet_address, theme) DO UPDATE SET
+                            total_volume = creator_categories.total_volume + EXCLUDED.total_volume
+                    """, (total_volume, market_id))
+    except Exception as e:
+        logger.error(f"error snapshotting market {market_id}: {e}")
+
+
+def record_market_event(market_id, event_type, event_data=None):
+    market_id = str(market_id or "").strip()
+    if not market_id:
+        return
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO market_events (market_id, event_type, event_data)
+                    VALUES (%s, %s, %s)
+                """, (market_id, event_type, json.dumps(event_data or {})))
+    except Exception as e:
+        logger.error(f"error recording event for {market_id}: {e}")
+
+
+def _detect_market_event(market, announced):
+    market_id = str(market.get("market_id", "")).strip()
+    if not market_id:
+        return
+    is_new_market = not announced
+    is_now_live = announced and announced.get("is_scheduled") and not announced.get("notified_new") and not is_scheduled_market(market)
+    is_ending = False
+    try:
+        end_time_unix = market.get("end_time")
+        if end_time_unix:
+            end_time = datetime.fromtimestamp(int(end_time_unix), tz=timezone.utc).replace(tzinfo=None)
+            time_until = (end_time - now_utc()).total_seconds()
+            if 0 < time_until <= 3600 and not announced.get("notified_1h"):
+                is_ending = True
+    except Exception:
+        pass
+    if is_new_market:
+        record_market_event(market_id, "market_detected", {
+            "title": market.get("title"),
+            "creator": market.get("creator"),
+            "theme": market.get("theme"),
+        })
+    if is_now_live:
+        record_market_event(market_id, "market_live", {
+            "title": market.get("title"),
+        })
+    if is_ending:
+        record_market_event(market_id, "market_ending_1h", {
+            "title": market.get("title"),
+        })
+    if market.get("resolved"):
+        record_market_event(market_id, "market_resolved", {
+            "outcome": market.get("outcome"),
+        })
+    if market.get("hidden") and not (announced and announced.get("notified_ended")):
+        record_market_event(market_id, "market_hidden", {})
+
+
+def score_markets():
+    global _last_score_run
+    now = time.time()
+    if now - _last_score_run < SCORE_RUN_INTERVAL:
+        return
+    _last_score_run = now
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT market_id FROM markets WHERE resolved = FALSE AND hidden = FALSE")
+                market_ids = [row[0] for row in cur.fetchall()]
+        if not market_ids:
+            return
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT market_id, MAX(total_volume) as max_vol, MAX(total_participants) as max_part
+                    FROM market_snapshots
+                    GROUP BY market_id
+                """)
+                stats = {row[0]: {"max_vol": float(row[1] or 0), "max_part": float(row[2] or 0)} for row in cur.fetchall()}
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                for market_id in market_ids:
+                    cur.execute("""
+                        SELECT total_volume, total_participants, controversy_score
+                        FROM market_snapshots
+                        WHERE market_id = %s
+                        ORDER BY snapshot_at DESC
+                        LIMIT 1
+                    """, (market_id,))
+                    row = cur.fetchone()
+                    if not row:
+                        continue
+                    volume = float(row[0] or 0)
+                    participants = int(row[1] or 0)
+                    controversy = float(row[2] or 0)
+                    ms = stats.get(market_id, {})
+                    max_vol = ms.get("max_vol", 0)
+                    max_part = ms.get("max_part", 0)
+                    volume_pct = (volume / max_vol * 100) if max_vol > 0 else 0
+                    engagement = (participants / volume * 1000) if volume > 0 else 0
+                    cur.execute("""
+                        INSERT INTO market_scores (
+                            market_id, volume_percentile, controversy, engagement_ratio,
+                            composite_score, scored_at
+                        ) VALUES (%s, %s, %s, %s, %s, NOW())
+                        ON CONFLICT (market_id) DO UPDATE SET
+                            volume_percentile = EXCLUDED.volume_percentile,
+                            controversy = EXCLUDED.controversy,
+                            engagement_ratio = EXCLUDED.engagement_ratio,
+                            composite_score = EXCLUDED.composite_score,
+                            scored_at = NOW()
+                    """, (
+                        market_id,
+                        round(volume_pct, 2),
+                        round(controversy, 4),
+                        round(engagement, 4),
+                        round((volume_pct * 0.4 + controversy * 100 * 0.3 + engagement * 0.3), 2),
+                    ))
+        logger.info(f"scored {len(market_ids)} markets")
+    except Exception as e:
+        logger.error(f"error scoring markets: {e}")
+
+
+def run_intelligence_pipeline(markets):
+    for market in markets:
+        try:
+            market_id = str(market.get("market_id", "")).strip()
+            if not market_id:
+                continue
+            ingest_market(market)
+            snapshot_market(market_id, market)
+            existing = None
+            try:
+                existing = get_announced_market(market_id)
+            except Exception:
+                pass
+            _detect_market_event(market, existing)
+        except Exception as e:
+            logger.error(f"intelligence pipeline error for {market.get('market_id', '?')}: {e}")
 
 
 def create_market_keyboard(market_id, market_link, scope="new_market", context=None):
@@ -2552,6 +3100,11 @@ def monitor_b4_markets():
                     logger.error(f"error processing market: {e}")
 
             check_scheduled_notifications()
+            try:
+                run_intelligence_pipeline(markets)
+                score_markets()
+            except Exception as e:
+                logger.error(f"intelligence pipeline error: {e}")
             send_daily_summary_if_due()
             time.sleep(MARKET_POLL_SECONDS)
 
@@ -3105,6 +3658,7 @@ def send_studio_preview(chat_id):
         return
     market = markets[0]
     market_id = str(market.get("market_id", "")).strip()
+    raw_theme = normalize_theme(market.get("theme", "other"))
     ai_message = generate_smart_notification(str(market.get("title", "")).strip(), raw_theme, "new")
     context = build_market_template_context(market, ai_message)
     keyboard = create_market_keyboard(market_id, build_market_link(market_id), scope="new_market", context=context)
@@ -4038,8 +4592,127 @@ def reinvite_users(message):
         reply_temp(message, f"❌ Error: {e}")
 
 
+@bot.message_handler(commands=['intel'])
+def intelligence_status(message):
+    try:
+        if not is_admin(message.from_user.id):
+            reply_temp(message, "❌ Permission Denied. Admin Only Command")
+            return
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM markets")
+                total_markets = cur.fetchone()[0]
+                cur.execute("SELECT COUNT(*) FROM market_snapshots")
+                total_snapshots = cur.fetchone()[0]
+                cur.execute("SELECT COUNT(*) FROM creators")
+                total_creators = cur.fetchone()[0]
+                cur.execute("SELECT COUNT(*) FROM market_events")
+                total_events = cur.fetchone()[0]
+                cur.execute("SELECT COUNT(*) FROM market_scores")
+                total_scores = cur.fetchone()[0]
+                cur.execute("SELECT COUNT(*) FROM market_fingerprints")
+                total_fingerprints = cur.fetchone()[0]
+        text = (
+            "🧠 <b>Intelligence Engine Status</b>\n\n"
+            f"📊 Markets tracked: <b>{total_markets}</b>\n"
+            f"📸 Snapshots recorded: <b>{total_snapshots}</b>\n"
+            f"👤 Creators registered: <b>{total_creators}</b>\n"
+            f"📝 Events logged: <b>{total_events}</b>\n"
+            f"🎯 Markets scored: <b>{total_scores}</b>\n"
+            f"🧬 Fingerprints extracted: <b>{total_fingerprints}</b>\n\n"
+            f"⏱ Snapshot interval: <b>{INTELLIGENCE_SNAPSHOT_INTERVAL}s</b>\n"
+            f"⏱ Score interval: <b>{SCORE_RUN_INTERVAL}s</b>"
+        )
+        reply_temp(message, text, parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"error in intel command: {e}")
+        reply_temp(message, f"❌ Error: {e}")
+
+
+@bot.message_handler(commands=['creators'])
+def show_creators(message):
+    try:
+        if not is_admin(message.from_user.id):
+            reply_temp(message, "❌ Permission Denied. Admin Only Command")
+            return
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT c.wallet_address, c.total_markets, c.total_volume, c.best_volume,
+                           c.first_seen_at, c.last_seen_at
+                    FROM creators c
+                    ORDER BY c.total_volume DESC
+                    LIMIT 10
+                """)
+                rows = cur.fetchall()
+        if not rows:
+            reply_temp(message, "No creators tracked yet.")
+            return
+        lines = ["<b>Top Creators by Volume</b>"]
+        for row in rows:
+            wallet = str(row[0])[:12] + "..."
+            markets = row[1]
+            volume = float(row[2] or 0)
+            best = float(row[3] or 0)
+            lines.append(
+                f"\n<code>{escape_text(wallet)}</code>\n"
+                f"Markets: <b>{markets}</b> | Volume: <b>{volume:,.0f}</b> | Best: <b>{best:,.0f}</b>"
+            )
+        reply_temp(message, "\n".join(lines), parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"error in creators command: {e}")
+        reply_temp(message, f"❌ Error: {e}")
+
+
+@bot.message_handler(commands=['marketstats'])
+def market_statistics(message):
+    try:
+        if not is_admin(message.from_user.id):
+            reply_temp(message, "❌ Permission Denied. Admin Only Command")
+            return
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT m.market_id, m.title, m.theme,
+                           s.total_volume, s.total_participants, s.controversy_score,
+                           sc.volume_percentile, sc.composite_score
+                    FROM markets m
+                    LEFT JOIN market_snapshots s ON m.market_id = s.market_id
+                        AND s.snapshot_at = (
+                            SELECT MAX(snapshot_at) FROM market_snapshots WHERE market_id = m.market_id
+                        )
+                    LEFT JOIN market_scores sc ON m.market_id = sc.market_id
+                    WHERE m.resolved = FALSE AND m.hidden = FALSE
+                    ORDER BY sc.composite_score DESC NULLS LAST
+                    LIMIT 8
+                """)
+                rows = cur.fetchall()
+        if not rows:
+            reply_temp(message, "No active markets with scores yet.")
+            return
+        lines = ["<b>Market Intelligence</b>"]
+        for row in rows:
+            title = str(row[1] or "")[:40]
+            theme = row[2] or "?"
+            volume = float(row[3] or 0)
+            participants = int(row[4] or 0)
+            controversy = float(row[5] or 0)
+            score = float(row[7] or 0)
+            lines.append(
+                f"\n<b>{escape_text(title)}</b>\n"
+                f"Theme: {escape_text(theme)} | Vol: {volume:,.0f} | "
+                f"Participants: {participants} | Controversy: {controversy:.2f}\n"
+                f"Score: <b>{score:.1f}</b>"
+            )
+        reply_temp(message, "\n".join(lines), parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"error in marketstats command: {e}")
+        reply_temp(message, f"❌ Error: {e}")
+
+
 logger.info("Starting Bot...")
 init_db()
+init_intelligence_tables()
 
 try:
     public_commands = [
@@ -4099,6 +4772,9 @@ try:
         telebot.types.BotCommand("stats", "Show bot statistics"),
         telebot.types.BotCommand("users", "Show user count"),
         telebot.types.BotCommand("listusers", "List all users"),
+        telebot.types.BotCommand("intel", "Intelligence engine status"),
+        telebot.types.BotCommand("creators", "Top creators by volume"),
+        telebot.types.BotCommand("marketstats", "Market intelligence scores"),
     ]
     
     if ADMIN_ID and ADMIN_ID != 0:
