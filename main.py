@@ -1,4 +1,4 @@
-print("NEW DEPLOY VERSION - WITH CONFIGURABLE AI")
+print("NEW DEPLOY VERSION - PHASE 2 EDITORIAL LAYER")
 import telebot
 from telebot import types
 import json
@@ -247,6 +247,10 @@ def init_db():
                 cur.execute("ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS image_followup_sent BOOLEAN DEFAULT FALSE")
                 cur.execute("ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS is_scheduled BOOLEAN DEFAULT FALSE")
                 cur.execute("ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS go_live_at TEXT")
+                cur.execute("ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS notified_12h BOOLEAN DEFAULT FALSE")
+                cur.execute("ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS notified_6h BOOLEAN DEFAULT FALSE")
+                cur.execute("ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS notified_30m BOOLEAN DEFAULT FALSE")
+                cur.execute("ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS is_featured BOOLEAN DEFAULT FALSE")
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS market_messages (
                         id SERIAL PRIMARY KEY,
@@ -424,6 +428,7 @@ def init_intelligence_tables():
                         engagement_ratio NUMERIC DEFAULT 0,
                         freshness NUMERIC DEFAULT 0,
                         composite_score NUMERIC DEFAULT 0,
+                        badge TEXT,
                         scored_at TIMESTAMPTZ DEFAULT NOW()
                     )
                 """)
@@ -1136,7 +1141,7 @@ def get_announced_market(market_id):
         return None
 
 
-def save_announced_market(market_id, title, theme, end_time, notified_new=True, is_scheduled=False, go_live_at=None):
+def save_announced_market(market_id, title, theme, end_time, notified_new=True, is_scheduled=False, go_live_at=None, is_featured=False):
     try:
         market_link = build_market_link(market_id)
         go_live_value = go_live_at.isoformat() if isinstance(go_live_at, datetime) else go_live_at
@@ -1147,14 +1152,15 @@ def save_announced_market(market_id, title, theme, end_time, notified_new=True, 
                         market_id, title, theme, end_time, market_link, notified_new,
                         notified_1h, notified_5m, notified_ended, delete_scheduled,
                         notified_scheduled, notified_go_live_2m, image_followup_sent,
-                        is_scheduled, go_live_at, detected_at
+                        is_scheduled, go_live_at, detected_at,
+                        notified_12h, notified_6h, notified_30m, is_featured
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, %s, %s, %s)
+                    VALUES (%s, %s, %s, %s, %s, %s, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, %s, %s, %s, FALSE, FALSE, FALSE, %s)
                     ON CONFLICT (market_id) DO NOTHING
                     RETURNING market_id
                 """, (
                     str(market_id), title, theme, end_time, market_link, notified_new,
-                    is_scheduled, go_live_value, now_utc().isoformat()
+                    is_scheduled, go_live_value, now_utc().isoformat(), is_featured
                 ))
                 return cur.fetchone() is not None
     except Exception as e:
@@ -1166,7 +1172,7 @@ def update_market_flag(market_id, flag):
     allowed_flags = {
         "notified_new", "notified_1h", "notified_5m", "notified_ended",
         "delete_scheduled", "notified_scheduled", "notified_go_live_2m",
-        "image_followup_sent"
+        "image_followup_sent", "notified_12h", "notified_6h", "notified_30m"
     }
     if flag not in allowed_flags:
         logger.error(f"invalid market flag requested: {flag}")
@@ -1663,6 +1669,280 @@ USDC_DECIMALS = 6
 USDC_DIVISOR = 10 ** USDC_DECIMALS  # B4 API returns pools in base units (lamports). Divide by 1,000,000 for USDC.
 _last_score_run = 0
 _intelligence_snapshot_cache = {}
+
+# ── Phase 2: Editorial & Discovery Layer ──────────────────────────────────────
+# Featured creators (wallet addresses). Set via FEATURED_WALLETS env var (comma-separated).
+# Markets from these wallets get Editor's Pick treatment and smart reminder scheduling.
+_raw_featured = os.getenv("FEATURED_WALLETS", "")
+FEATURED_WALLETS: set[str] = {w.strip().lower() for w in _raw_featured.split(",") if w.strip()}
+
+# Smart Reminder Engine: volume targets (USDC). Only send featured reminders if volume is below target.
+FEATURED_REMINDER_TARGET_12H = float(os.getenv("FEATURED_REMINDER_TARGET_12H", "50"))
+FEATURED_REMINDER_TARGET_6H = float(os.getenv("FEATURED_REMINDER_TARGET_6H", "100"))
+FEATURED_REMINDER_TARGET_30M = float(os.getenv("FEATURED_REMINDER_TARGET_30M", "150"))
+
+# Hot Debate: momentum thresholds (percentage change between snapshots within interval window)
+HOT_DEBATE_VOLUME_SPIKE = float(os.getenv("HOT_DEBATE_VOLUME_SPIKE", "80"))   # % volume increase
+HOT_DEBATE_PARTICIPANT_SPIKE = float(os.getenv("HOT_DEBATE_PARTICIPANT_SPIKE", "60"))  # % participant increase
+HOT_DEBATE_COMMENT_SPIKE = float(os.getenv("HOT_DEBATE_COMMENT_SPIKE", "100"))  # % comment increase
+
+# Hidden Gem: strong characteristics but low attention
+HIDDEN_GEM_MIN_CONTROVERSY = float(os.getenv("HIDDEN_GEM_MIN_CONTROVERSY", "0.35"))
+HIDDEN_GEM_MIN_ENGAGEMENT = float(os.getenv("HIDDEN_GEM_MIN_ENGAGEMENT", "5.0"))
+HIDDEN_GEM_MAX_VOLUME_PERCENTILE = float(os.getenv("HIDDEN_GEM_MAX_VOLUME_PERCENTILE", "25"))
+
+# Rotating teasers — natural, non-repetitive text that adds editorial flavour
+TEASERS = [
+    "This one could split opinions.",
+    "Not an easy question.",
+    "Curious where the crowd lands.",
+    "Expect arguments on both sides.",
+    "One of today's toughest debates.",
+    "This one may surprise people.",
+    "Simple question. Difficult answer.",
+    "The crowd won't agree on this one.",
+    "Strong feelings expected on both sides.",
+    "A polarizing topic from the start.",
+    "No safe middle ground here.",
+    "Watch where the early money goes.",
+    "This could get heated.",
+    "Opinions will be divided on this one.",
+    "Not one to sit out.",
+    "The early signals are interesting.",
+    "This market will tell us something.",
+    "Both sides have a case here.",
+    "This one is already generating buzz.",
+    "A debate worth watching closely.",
+    "Smart money is moving on this one.",
+    "The odds could shift quickly.",
+    "Don't blink on this one.",
+    "This one has legs.",
+    "A real test of conviction.",
+]
+
+
+def is_featured_creator(market):
+    """Check if a market was created by a featured wallet."""
+    if not FEATURED_WALLETS:
+        return False
+    creator = str(market.get("creator", "") or "").strip().lower()
+    return creator in FEATURED_WALLETS
+
+
+def get_random_teaser(seed=None):
+    """Return a rotating teaser based on seed for consistency, or random."""
+    if seed is not None:
+        return TEASERS[seed % len(TEASERS)]
+    import random as _random
+    return _random.choice(TEASERS)
+
+
+def get_market_volume(market_id):
+    """Get latest total_volume from the most recent snapshot."""
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT total_volume, yes_pool, no_pool
+                    FROM market_snapshots
+                    WHERE market_id = %s
+                    ORDER BY snapshot_at DESC
+                    LIMIT 1
+                """, (market_id,))
+                row = cur.fetchone()
+                if row:
+                    return float(row[0] or 0), float(row[1] or 0), float(row[2] or 0)
+    except Exception as e:
+        logger.error(f"error getting volume for {market_id}: {e}")
+    return 0.0, 0.0, 0.0
+
+
+def get_market_snapshots_for_momentum(market_id, limit=3):
+    """Get recent snapshots for momentum calculation."""
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT total_volume, total_participants, comments_count, snapshot_at
+                    FROM market_snapshots
+                    WHERE market_id = %s
+                    ORDER BY snapshot_at DESC
+                    LIMIT %s
+                """, (market_id, limit))
+                return cur.fetchall()
+    except Exception as e:
+        logger.error(f"error getting snapshots for {market_id}: {e}")
+    return []
+
+
+def calculate_momentum(market_id):
+    """Calculate momentum score from recent snapshot deltas."""
+    snapshots = get_market_snapshots_for_momentum(market_id, 3)
+    if len(snapshots) < 2:
+        return 0.0, 0.0, 0.0
+
+    latest = snapshots[0]
+    previous = snapshots[1]
+    vol_now = float(latest[0] or 0)
+    vol_prev = float(previous[0] or 0)
+    part_now = int(latest[1] or 0)
+    part_prev = int(previous[1] or 0)
+    comment_now = int(latest[2] or 0)
+    comment_prev = int(previous[2] or 0)
+
+    vol_growth = ((vol_now - vol_prev) / vol_prev * 100) if vol_prev > 0 else 0
+    part_growth = ((part_now - part_prev) / part_prev * 100) if part_prev > 0 else 0
+    comment_growth = ((comment_now - comment_prev) / comment_prev * 100) if comment_prev > 0 else 0
+
+    return vol_growth, part_growth, comment_growth
+
+
+def detect_hot_debate(market_id):
+    """Detect if a market has sudden momentum spikes."""
+    vol_growth, part_growth, comment_growth = calculate_momentum(market_id)
+    is_hot = (
+        vol_growth >= HOT_DEBATE_VOLUME_SPIKE
+        or part_growth >= HOT_DEBATE_PARTICIPANT_SPIKE
+        or comment_growth >= HOT_DEBATE_COMMENT_SPIKE
+    )
+    return is_hot, vol_growth, part_growth, comment_growth
+
+
+def detect_hidden_gem(market_id):
+    """Detect markets with strong characteristics but low attention."""
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT ms.volume_percentile, ms.controversy, ms.engagement_ratio, ms.composite_score
+                    FROM market_scores ms
+                    WHERE ms.market_id = %s
+                """, (market_id,))
+                row = cur.fetchone()
+                if not row:
+                    return False
+                vol_pct = float(row[0] or 0)
+                controversy = float(row[1] or 0)
+                engagement = float(row[2] or 0)
+
+                return (
+                    controversy >= HIDDEN_GEM_MIN_CONTROVERSY
+                    and engagement >= HIDDEN_GEM_MIN_ENGAGEMENT
+                    and vol_pct <= HIDDEN_GEM_MAX_VOLUME_PERCENTILE
+                )
+    except Exception as e:
+        logger.error(f"error detecting hidden gem for {market_id}: {e}")
+    return False
+
+
+def assign_badge(market_id):
+    """
+    Assign a single badge to a market. Priority:
+    1. ⚡ Closing Soon (market ends within 30 minutes)
+    2. 🔥 Hot Debate (sudden momentum spike)
+    3. ⭐ Editor's Pick (featured creator)
+    4. 💎 Hidden Gem (strong metrics, low attention)
+    5. 📈 Market Watch (good scores, above average)
+    """
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT m.market_id, m.resolved, m.hidden, m.end_time,
+                           ms.total_volume, ms.composite_score, sc.composite_score
+                    FROM markets m
+                    LEFT JOIN market_snapshots ms ON m.market_id = ms.market_id
+                        AND ms.snapshot_at = (SELECT MAX(snapshot_at) FROM market_snapshots WHERE market_id = m.market_id)
+                    LEFT JOIN market_scores sc ON m.market_id = sc.market_id
+                    WHERE m.market_id = %s AND m.resolved = FALSE AND m.hidden = FALSE
+                """, (market_id,))
+                row = cur.fetchone()
+                if not row:
+                    return None
+
+                end_time_unix = row[3]
+                now = now_utc()
+                if end_time_unix:
+                    end_dt = datetime.fromtimestamp(int(end_time_unix), tz=timezone.utc).replace(tzinfo=None)
+                    minutes_left = (end_dt - now).total_seconds() / 60
+                else:
+                    minutes_left = 999
+
+                # Check closing soon
+                if minutes_left <= 30:
+                    return "⚡"
+
+                # Check hot debate
+                is_hot, _, _, _ = detect_hot_debate(market_id)
+                if is_hot:
+                    return "🔥"
+
+                # Check editor's pick
+                cur.execute("SELECT creator_wallet FROM markets WHERE market_id = %s", (market_id,))
+                creator_row = cur.fetchone()
+                if creator_row and creator_row[0] and creator_row[0].strip().lower() in FEATURED_WALLETS:
+                    return "⭐"
+
+                # Check hidden gem
+                if detect_hidden_gem(market_id):
+                    return "💎"
+
+                # Check market watch (above average composite score)
+                avg_score = 0
+                try:
+                    cur.execute("SELECT AVG(composite_score) FROM market_scores WHERE composite_score > 0")
+                    avg_row = cur.fetchone()
+                    avg_score = float(avg_row[0] or 0) if avg_row else 0
+                except Exception:
+                    pass
+                composite = float(row[6] or 0) if row[6] else 0
+                if composite > avg_score and composite > 0:
+                    return "📈"
+
+                return None
+    except Exception as e:
+        logger.error(f"error assigning badge for {market_id}: {e}")
+    return None
+
+
+def badge_label(badge):
+    """Return the full label for a badge emoji."""
+    labels = {
+        "⭐": "Editor's Pick",
+        "🔥": "Hot Debate",
+        "💎": "Hidden Gem",
+        "📈": "Market Watch",
+        "⚡": "Closing Soon",
+    }
+    return labels.get(badge, "")
+
+
+def format_badge_line(badge):
+    """Return a formatted badge line for notifications."""
+    if not badge:
+        return ""
+    label = badge_label(badge)
+    return f"{badge} <b>{label}</b>"
+
+
+def run_badge_engine(market_ids):
+    """Run badge assignment for all active markets and store results."""
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                for market_id in market_ids:
+                    badge = assign_badge(market_id)
+                    cur.execute("""
+                        INSERT INTO market_scores (market_id, scored_at)
+                        VALUES (%s, NOW())
+                        ON CONFLICT (market_id) DO NOTHING
+                    """, (market_id,))
+                    cur.execute("""
+                        UPDATE market_scores SET badge = %s WHERE market_id = %s
+                    """, (badge, market_id))
+        logger.info(f"badge engine processed {len(market_ids)} markets")
+    except Exception as e:
+        logger.error(f"error in badge engine: {e}")
 
 
 def _parse_fingerprint(title):
@@ -2187,12 +2467,23 @@ def build_new_market_notification(market, ai_message):
     end_time_str = format_market_time(end_time)
     promo_text = build_market_promo_text(market)
     body_text = ai_message or build_fast_market_cta(title, "new")
+    featured = is_featured_creator(market)
 
-    message = (
-        f"{custom_emoji('live', '🟢')} <b>LIVE MARKET</b>\n\n"
-        f"🔥 <b>{escape_text(title)}</b>\n\n"
-        f"⏰ Closes: {escape_text(end_time_str)}"
-    )
+    if featured:
+        teaser = get_random_teaser(sum(ord(c) for c in title))
+        message = (
+            f"⭐ <b>EDITOR'S PICK</b>\n\n"
+            f"{custom_emoji('live', '🟢')} <b>FIRST STAKER SIGNAL</b>\n\n"
+            f"🔥 <b>{escape_text(title)}</b>\n\n"
+            f"{teaser}\n\n"
+            f"⏰ Closes: {escape_text(end_time_str)}"
+        )
+    else:
+        message = (
+            f"{custom_emoji('live', '🟢')} <b>LIVE MARKET</b>\n\n"
+            f"🔥 <b>{escape_text(title)}</b>\n\n"
+            f"⏰ Closes: {escape_text(end_time_str)}"
+        )
 
     if promo_text:
         message += f"\n{promo_text}"
@@ -2286,6 +2577,10 @@ def build_rich_new_market(market, ai_message, heading="New Market Live", cover_u
     cover_url = cover_url or get_market_cover_image(market)
     promo_text = build_market_promo_text(market)
     body_text = ai_message or build_fast_market_cta(title, "new")
+    featured = is_featured_creator(market)
+    if featured:
+        teaser = get_random_teaser(sum(ord(c) for c in title))
+        heading = f"⭐ Editor's Pick — {heading}"
 
     html_parts = [
         f"<h3>{custom_emoji('live', '🟢')} {escape_text(heading)}</h3>",
@@ -2295,6 +2590,8 @@ def build_rich_new_market(market, ai_message, heading="New Market Live", cover_u
         f"<tr><th>Closes</th><td>{escape_text(format_market_time(end_time))}</td></tr>",
         "</table>",
     ]
+    if featured:
+        html_parts.append(f"<p><i>{escape_text(teaser)}</i></p>")
     if promo_text:
         html_parts.append(f"<blockquote>{escape_text(promo_text)}</blockquote>")
     html_parts.append(f"<p>{body_text}</p>")
@@ -2949,6 +3246,7 @@ def announce_live_market(market, existing=None):
     end_time = datetime.fromtimestamp(int(end_time_unix), tz=timezone.utc).replace(tzinfo=None)
     context = build_market_template_context(market, None)
     keyboard = create_market_keyboard(market_id, build_market_link(market_id), scope="new_market", context=context)
+    featured = is_featured_creator(market)
 
     if existing:
         update_market_flag(market_id, "notified_new")
@@ -2963,6 +3261,7 @@ def announce_live_market(market, existing=None):
             notified_new=True,
             is_scheduled=False,
             go_live_at=get_market_go_live_at(market),
+            is_featured=featured,
         )
 
     if not should_broadcast:
@@ -3012,6 +3311,7 @@ def announce_scheduled_market_to_premium(market):
     end_time_unix = market.get("end_time")
     end_time = datetime.fromtimestamp(int(end_time_unix), tz=timezone.utc).replace(tzinfo=None)
     go_live_at = get_market_go_live_at(market)
+    featured = is_featured_creator(market)
 
     saved = save_announced_market(
         market_id,
@@ -3021,6 +3321,7 @@ def announce_scheduled_market_to_premium(market):
         notified_new=False,
         is_scheduled=True,
         go_live_at=go_live_at,
+        is_featured=featured,
     )
     if not saved:
         return
@@ -3107,6 +3408,9 @@ def monitor_b4_markets():
             try:
                 run_intelligence_pipeline(markets)
                 score_markets()
+                active_ids = [str(m.get("market_id", "")).strip() for m in markets if str(m.get("market_id", "")).strip()]
+                if active_ids:
+                    run_badge_engine(active_ids)
             except Exception as e:
                 logger.error(f"intelligence pipeline error: {e}")
             send_daily_summary_if_due()
@@ -3163,6 +3467,73 @@ def check_scheduled_notifications():
                 if time_until > 0:
                     hours_until = time_until / 3600
                     minutes_until = time_until / 60
+
+                    # ── Smart Reminder Engine: Featured creator markets ──
+                    if market_data.get("is_featured") and FEATURED_WALLETS:
+                        current_volume = get_market_volume(market_id)[0]
+                        market_link = market_data.get("market_link", build_market_link(market_id))
+
+                        # 12-hour reminder
+                        if hours_until <= 12.0 and not market_data.get("notified_12h") and current_volume < FEATURED_REMINDER_TARGET_12H:
+                            teaser = get_random_teaser(sum(ord(c) for c in title) + 12)
+                            notification = (
+                                f"⭐ <b>EDITOR'S PICK</b>\n\n"
+                                f"{custom_emoji('one_hour', '!')} <b>12 HOURS LEFT</b>\n\n"
+                                f"<b>{escape_text(title)}</b>\n\n"
+                                f"Volume: <b>${current_volume:,.2f}</b> — still building.\n\n"
+                                f"{teaser}"
+                            )
+                            keyboard = create_market_keyboard(market_id, market_link, scope="reminder_1h")
+                            broadcast_to_all(
+                                notification,
+                                market_id,
+                                keyboard,
+                                theme=raw_theme,
+                                notification_key=f"12h_{market_id}",
+                                rich_html=build_rich_reminder(title, int(minutes_until), None, urgent=False),
+                            )
+                            update_market_flag(market_id, "notified_12h")
+                            logger.info(f"featured 12h reminder sent for: {title}")
+
+                        # 6-hour reminder
+                        elif hours_until <= 6.0 and not market_data.get("notified_6h") and current_volume < FEATURED_REMINDER_TARGET_6H:
+                            notification = (
+                                f"⭐ <b>EDITOR'S PICK</b>\n\n"
+                                f"{custom_emoji('one_hour', '!')} <b>6 HOURS LEFT</b>\n\n"
+                                f"<b>{escape_text(title)}</b>\n\n"
+                                f"Volume: <b>${current_volume:,.2f}</b> — still room to move."
+                            )
+                            keyboard = create_market_keyboard(market_id, market_link, scope="reminder_1h")
+                            broadcast_to_all(
+                                notification,
+                                market_id,
+                                keyboard,
+                                theme=raw_theme,
+                                notification_key=f"6h_{market_id}",
+                                rich_html=build_rich_reminder(title, int(minutes_until), None, urgent=False),
+                            )
+                            update_market_flag(market_id, "notified_6h")
+                            logger.info(f"featured 6h reminder sent for: {title}")
+
+                        # 30-minute reminder
+                        elif minutes_until <= 30.0 and not market_data.get("notified_30m") and current_volume < FEATURED_REMINDER_TARGET_30M:
+                            notification = (
+                                f"⭐ <b>EDITOR'S PICK</b>\n\n"
+                                f"{custom_emoji('ten_minutes', '4')} <b>FINAL 30 MINUTES</b>\n\n"
+                                f"<b>{escape_text(title)}</b>\n\n"
+                                f"Volume: <b>${current_volume:,.2f}</b> — last call for First Staker."
+                            )
+                            keyboard = create_market_keyboard(market_id, market_link, scope="reminder_10m")
+                            broadcast_to_all(
+                                notification,
+                                market_id,
+                                keyboard,
+                                theme=raw_theme,
+                                notification_key=f"30m_{market_id}",
+                                rich_html=build_rich_reminder(title, int(minutes_until), None, urgent=True),
+                            )
+                            update_market_flag(market_id, "notified_30m")
+                            logger.info(f"featured 30m reminder sent for: {title}")
 
                     if hours_until <= 1.0 and not market_data.get("notified_1h"):
                         mins_left = int(minutes_until)
@@ -4679,7 +5050,7 @@ def market_statistics(message):
                 cur.execute("""
                     SELECT m.market_id, m.title, m.theme,
                            s.total_volume, s.total_participants, s.controversy_score,
-                           sc.volume_percentile, sc.composite_score
+                           sc.volume_percentile, sc.composite_score, sc.badge
                     FROM markets m
                     LEFT JOIN market_snapshots s ON m.market_id = s.market_id
                         AND s.snapshot_at = (
@@ -4702,8 +5073,10 @@ def market_statistics(message):
             participants = int(row[4] or 0)
             controversy = float(row[5] or 0)
             score = float(row[7] or 0)
+            badge = row[8] or ""
+            badge_display = f" {badge}" if badge else ""
             lines.append(
-                f"\n<b>{escape_text(title)}</b>\n"
+                f"\n<b>{escape_text(title)}</b>{badge_display}\n"
                 f"Theme: {escape_text(theme)} | Vol: ${volume:,.2f} | "
                 f"Participants: {participants} | Controversy: {controversy:.2f}\n"
                 f"Score: <b>{score:.1f}</b>"
@@ -4711,6 +5084,111 @@ def market_statistics(message):
         reply_temp(message, "\n".join(lines), parse_mode="HTML")
     except Exception as e:
         logger.error(f"error in marketstats command: {e}")
+        reply_temp(message, f"❌ Error: {e}")
+
+
+@bot.message_handler(commands=['featured'])
+def show_featured(message):
+    try:
+        if not FEATURED_WALLETS:
+            reply_temp(message, "No featured creators configured yet.")
+            return
+        markets = fetch_b4_markets()
+        featured = [
+            m for m in markets
+            if is_valid_market(m) and is_market_active(m) and is_featured_creator(m)
+        ]
+        if not featured:
+            reply_temp(message, "No active featured markets right now.")
+            return
+        lines = ["<b>⭐ Featured Creator Markets</b>"]
+        for m in featured[:10]:
+            title = str(m.get("title", "")[:45]).strip()
+            market_id = str(m.get("market_id", "")).strip()
+            market_link = build_market_link(market_id)
+            yes_pool = int(m.get("yes_pool") or 0) / USDC_DIVISOR
+            no_pool = int(m.get("no_pool") or 0) / USDC_DIVISOR
+            volume = yes_pool + no_pool
+            yes_votes = int(m.get("yes_votes") or 0)
+            no_votes = int(m.get("no_votes") or 0)
+            participants = yes_votes + no_votes
+            end_time_unix = m.get("end_time")
+            end_time = datetime.fromtimestamp(int(end_time_unix), tz=timezone.utc).replace(tzinfo=None)
+            time_left = end_time - now_utc()
+            hours_left = max(0, time_left.total_seconds() / 3600)
+            promo = build_market_promo_text(m)
+            promo_line = f"\n{promo}" if promo else ""
+            lines.append(
+                f"\n⭐ <b>{escape_text(title)}</b>\n"
+                f"Vol: <b>${volume:,.2f}</b> | People: <b>{participants}</b> | "
+                f"Time: <b>{hours_left:.1f}h</b>{promo_line}\n"
+                f"<a href=\"{market_link}\">Vote Now</a>"
+            )
+        reply_temp(message, "\n".join(lines), parse_mode="HTML", disable_web_page_preview=True)
+    except Exception as e:
+        logger.error(f"error in featured command: {e}")
+        reply_temp(message, f"❌ Error: {e}")
+
+
+@bot.message_handler(commands=['trending'])
+def show_trending(message):
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT m.market_id, m.title, m.theme, m.end_time,
+                           s.total_volume, s.total_participants, s.controversy_score,
+                           sc.composite_score, sc.badge,
+                           (SELECT COUNT(*) FROM market_events me WHERE me.market_id = m.market_id
+                            AND me.recorded_at > NOW() - INTERVAL '6 hours') as recent_events
+                    FROM markets m
+                    LEFT JOIN market_snapshots s ON m.market_id = s.market_id
+                        AND s.snapshot_at = (
+                            SELECT MAX(snapshot_at) FROM market_snapshots WHERE market_id = m.market_id
+                        )
+                    LEFT JOIN market_scores sc ON m.market_id = sc.market_id
+                    WHERE m.resolved = FALSE AND m.hidden = FALSE
+                    ORDER BY sc.composite_score DESC NULLS LAST
+                    LIMIT 12
+                """)
+                rows = cur.fetchall()
+        if not rows:
+            reply_temp(message, "No trending markets yet. Check back soon.")
+            return
+        lines = ["<b>Trending Markets</b>\nRanked by intelligence score"]
+        for row in rows:
+            title = str(row[1] or "")[:42]
+            theme = row[2] or "?"
+            end_time_str = row[3]
+            volume = float(row[4] or 0)
+            participants = int(row[5] or 0)
+            controversy = float(row[6] or 0)
+            score = float(row[7] or 0)
+            badge = row[8] or ""
+            recent_events = int(row[9] or 0)
+            market_id = str(row[0]).strip()
+            market_link = build_market_link(market_id)
+
+            badge_display = f" {badge}" if badge else ""
+            time_display = ""
+            if end_time_str:
+                try:
+                    end_dt = datetime.fromisoformat(end_time_str)
+                    time_left = (end_dt - now_utc()).total_seconds() / 3600
+                    if time_left > 0:
+                        time_display = f" | {time_left:.1f}h left"
+                except Exception:
+                    pass
+
+            lines.append(
+                f"\n<b>{escape_text(title)}</b>{badge_display}\n"
+                f"${volume:,.2f} vol | {participants} people | {controversy:.2f} controversy"
+                f"{time_display}\n"
+                f"<a href=\"{market_link}\">Vote</a>"
+            )
+        reply_temp(message, "\n".join(lines), parse_mode="HTML", disable_web_page_preview=True)
+    except Exception as e:
+        logger.error(f"error in trending command: {e}")
         reply_temp(message, f"❌ Error: {e}")
 
 
@@ -4729,6 +5207,8 @@ try:
         telebot.types.BotCommand("summary", "Show daily market summary"),
         telebot.types.BotCommand("preferences", "Choose market categories"),
         telebot.types.BotCommand("getmyid", "Get your telegram id"),
+        telebot.types.BotCommand("featured", "Featured creator markets"),
+        telebot.types.BotCommand("trending", "Trending markets by momentum"),
     ]
     
     private_commands = public_commands + [
