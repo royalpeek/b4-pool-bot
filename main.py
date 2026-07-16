@@ -2057,14 +2057,12 @@ def ingest_market(market):
                         INSERT INTO creators (wallet_address, last_seen_at, total_markets)
                         VALUES (%s, NOW(), 1)
                         ON CONFLICT (wallet_address) DO UPDATE SET
-                            last_seen_at = NOW(),
-                            total_markets = creators.total_markets + 1
+                            last_seen_at = NOW()
                     """, (creator,))
                     cur.execute("""
                         INSERT INTO creator_categories (wallet_address, theme, market_count)
                         VALUES (%s, %s, 1)
-                        ON CONFLICT (wallet_address, theme) DO UPDATE SET
-                            market_count = creator_categories.market_count + 1
+                        ON CONFLICT (wallet_address, theme) DO NOTHING
                     """, (creator, theme))
                 cur.execute("""
                     INSERT INTO market_fingerprints (
