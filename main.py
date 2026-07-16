@@ -432,6 +432,7 @@ def init_intelligence_tables():
                         scored_at TIMESTAMPTZ DEFAULT NOW()
                     )
                 """)
+                cur.execute("ALTER TABLE market_scores ADD COLUMN IF NOT EXISTS badge TEXT")
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS market_dna (
                         market_id TEXT PRIMARY KEY REFERENCES markets(market_id),
@@ -1184,6 +1185,18 @@ def update_market_flag(market_id, flag):
                 cur.execute(f"UPDATE announced_markets SET {flag} = TRUE WHERE market_id = %s", (str(market_id),))
     except Exception as e:
         logger.error(f"error updating flag {flag} for market {market_id}: {e}")
+
+
+def update_announced_end_time(market_id, new_end_time):
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE announced_markets SET end_time = %s WHERE market_id = %s AND end_time != %s",
+                    (new_end_time, str(market_id), new_end_time)
+                )
+    except Exception as e:
+        logger.error(f"error updating end_time for market {market_id}: {e}")
 
 
 def delete_announced_market(market_id):
@@ -2196,7 +2209,13 @@ def recalculate_creator_categories():
     """
     Recalculate creator category totals from latest market state.
     total_volume per (wallet, theme) = sum of latest volumes for that theme.
+    Shares rate limit with recalculate_creator_totals.
     """
+    global _last_recalc_run
+    now = time.time()
+    if now - _last_recalc_run < RECALC_INTERVAL:
+        return
+    _last_recalc_run = now
     try:
         with get_db() as conn:
             with conn.cursor() as cur:
@@ -3462,6 +3481,17 @@ def monitor_b4_markets():
                 if not api_market:
                     continue
                 
+                # refresh stale end_time from API
+                api_end_unix = api_market.get("end_time")
+                if api_end_unix:
+                    try:
+                        api_end_dt = datetime.fromtimestamp(int(api_end_unix), tz=timezone.utc).replace(tzinfo=None)
+                        api_end_iso = api_end_dt.isoformat()
+                        if announced.get("end_time") != api_end_iso:
+                            update_announced_end_time(announced_id, api_end_iso)
+                    except Exception:
+                        pass
+                
                 if api_market.get("hidden", False) and not announced.get("notified_ended"):
                     logger.info(f"market {announced_id} is now hidden, cleaning up notifications")
                     delete_all_market_messages(announced_id)
@@ -3568,7 +3598,7 @@ def check_scheduled_notifications():
                         market_link = market_data.get("market_link", build_market_link(market_id))
 
                         # 12-hour reminder
-                        if hours_until <= 12.0 and not market_data.get("notified_12h") and current_volume < FEATURED_REMINDER_TARGET_12H:
+                        if hours_until <= 12.0 and hours_until > 6.0 and not market_data.get("notified_12h") and current_volume < FEATURED_REMINDER_TARGET_12H:
                             teaser = get_random_teaser(sum(ord(c) for c in title) + 12)
                             notification = (
                                 f"⭐ <b>EDITOR'S PICK</b>\n\n"
@@ -3590,7 +3620,7 @@ def check_scheduled_notifications():
                             logger.info(f"featured 12h reminder sent for: {title}")
 
                         # 6-hour reminder
-                        elif hours_until <= 6.0 and not market_data.get("notified_6h") and current_volume < FEATURED_REMINDER_TARGET_6H:
+                        elif hours_until <= 6.0 and hours_until > 1.0 and not market_data.get("notified_6h") and current_volume < FEATURED_REMINDER_TARGET_6H:
                             notification = (
                                 f"⭐ <b>EDITOR'S PICK</b>\n\n"
                                 f"{custom_emoji('one_hour', '!')} <b>6 HOURS LEFT</b>\n\n"
@@ -3610,7 +3640,7 @@ def check_scheduled_notifications():
                             logger.info(f"featured 6h reminder sent for: {title}")
 
                         # 30-minute reminder
-                        elif minutes_until <= 30.0 and not market_data.get("notified_30m") and current_volume < FEATURED_REMINDER_TARGET_30M:
+                        elif minutes_until <= 30.0 and minutes_until > 10.0 and not market_data.get("notified_30m") and current_volume < FEATURED_REMINDER_TARGET_30M:
                             notification = (
                                 f"⭐ <b>EDITOR'S PICK</b>\n\n"
                                 f"{custom_emoji('ten_minutes', '4')} <b>FINAL 30 MINUTES</b>\n\n"
