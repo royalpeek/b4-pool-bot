@@ -1960,6 +1960,223 @@ def run_badge_engine(market_ids):
         logger.error(f"error in badge engine: {e}")
 
 
+# ── Featured Reminder Engine ──────────────────────────────────────────────────
+# Premium market alerts for Editor's Pick markets. Replaces generic countdowns
+# with intelligence-driven cards that create FOMO and drive voting activity.
+
+def format_time_remaining(seconds):
+    """Convert seconds to human-readable string: '11h 58m', '58m', '9m'."""
+    if seconds <= 0:
+        return "ended"
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    if h > 0:
+        return f"{h}h {m:02d}m"
+    return f"{m}m"
+
+
+def get_reminder_urgency(hours, minutes):
+    """
+    Return (emoji, heading, tier) based on remaining time.
+    Tier is used to select the right reminder window.
+    """
+    if hours > 6.0:
+        return "🕛", f"{int(round(hours))} Hours Left", "12h"
+    elif hours > 1.0:
+        h = int(hours)
+        m = int(minutes % 60)
+        return "⏰", f"{h}h {m:02d}m Left", "6h"
+    elif minutes > 30.0:
+        return "⏳", f"{int(round(minutes))} Minutes Left", "1h"
+    elif minutes > 10.0:
+        return "⚡", f"{int(round(minutes))} Minutes Left", "30m"
+    else:
+        return "🚨", "Final Minutes", "10m"
+
+
+def get_market_intelligence(market_id):
+    """
+    Fetch all available intelligence data for a market.
+    Returns dict with volume, participants, comments, momentum, badge, scores.
+    Gracefully returns empty/zero values if data doesn't exist.
+    """
+    intel = {
+        "volume": 0.0,
+        "yes_pool": 0.0,
+        "no_pool": 0.0,
+        "participants": 0,
+        "comments": 0,
+        "vol_growth": 0.0,
+        "part_growth": 0.0,
+        "comment_growth": 0.0,
+        "badge": None,
+        "composite_score": 0.0,
+        "controversy": 0.0,
+    }
+    try:
+        vol, yes, no = get_market_volume(market_id)
+        intel["volume"] = vol
+        intel["yes_pool"] = yes
+        intel["no_pool"] = no
+    except Exception:
+        pass
+
+    try:
+        snapshots = get_market_snapshots_for_momentum(market_id, 3)
+        if snapshots:
+            latest = snapshots[0]
+            intel["participants"] = int(latest[1] or 0)
+            intel["comments"] = int(latest[2] or 0)
+            if len(snapshots) >= 2:
+                vol_g, part_g, comment_g = calculate_momentum(market_id)
+                intel["vol_growth"] = vol_g
+                intel["part_growth"] = part_g
+                intel["comment_growth"] = comment_g
+    except Exception:
+        pass
+
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT sc.badge, sc.composite_score, sc.controversy
+                    FROM market_scores sc
+                    WHERE sc.market_id = %s
+                """, (market_id,))
+                row = cur.fetchone()
+                if row:
+                    intel["badge"] = row[0]
+                    intel["composite_score"] = float(row[1] or 0)
+                    intel["controversy"] = float(row[2] or 0)
+    except Exception:
+        pass
+
+    return intel
+
+
+def generate_dynamic_badges(intel):
+    """
+    Generate a list of dynamic badges from intelligence data.
+    Returns list of (emoji, label) tuples. Max 3 badges shown.
+    """
+    badges = []
+
+    if intel["vol_growth"] >= 20:
+        badges.append(("🔥", "Trending"))
+    if intel["comment_growth"] >= 30 or intel["comments"] >= 30:
+        badges.append(("💬", "Most Discussed"))
+    if intel["vol_growth"] >= 35:
+        badges.append(("⚡", "Fast Growing"))
+    if intel["participants"] >= 50:
+        badges.append(("👥", "Active Market"))
+    if intel["volume"] >= 500:
+        badges.append(("🏆", "Top Volume"))
+    if intel["controversy"] >= 0.5:
+        badges.append(("🔥", "Heated Debate"))
+
+    seen = set()
+    unique = []
+    for b in badges:
+        if b[1] not in seen:
+            seen.add(b[1])
+            unique.append(b)
+    return unique[:3]
+
+
+def build_status_line(intel):
+    """Build a one-line status summary from intelligence data."""
+    parts = []
+    if intel["vol_growth"] >= 20:
+        parts.append(f"Volume +{intel['vol_growth']:.0f}%")
+    if intel["comment_growth"] >= 20:
+        parts.append(f"Comments +{intel['comment_growth']:.0f}%")
+    if intel["participants"] > 0:
+        parts.append(f"{intel['participants']} participants")
+    if intel["controversy"] >= 0.4:
+        parts.append("Controversial")
+    if not parts:
+        parts.append("Building momentum")
+    return " · ".join(parts[:2])
+
+
+def build_featured_reminder_card(title, market_id, seconds_until, market_link=None):
+    """
+    Build a premium intelligence-driven reminder card for Editor's Pick markets.
+    Falls back gracefully if intelligence data is missing.
+    """
+    hours = seconds_until / 3600
+    minutes = seconds_until / 60
+
+    emoji, heading, tier = get_reminder_urgency(hours, minutes)
+    time_text = format_time_remaining(seconds_until)
+    intel = get_market_intelligence(market_id)
+    dynamic_badges = generate_dynamic_badges(intel)
+    status_line = build_status_line(intel)
+
+    if not market_link:
+        market_link = build_market_link(market_id)
+
+    lines = [
+        f"⭐ <b>EDITOR'S PICK</b>",
+        "",
+        f"{emoji} <b>{heading}</b>",
+        "",
+        f"<b>{escape_text(title)}</b>",
+        "",
+        "━━━━━━━━━━━━━━━━",
+        "",
+    ]
+
+    if intel["volume"] > 0:
+        lines.append(f"💰 Volume")
+        lines.append(f"${intel['volume']:,.2f}")
+        lines.append("")
+
+    if intel["participants"] > 0:
+        lines.append(f"👥 {intel['participants']} participants")
+        lines.append("")
+
+    if intel["comments"] > 0:
+        lines.append(f"💬 {intel['comments']} comments")
+        lines.append("")
+
+    lines.append(f"⏰ {time_text} remaining")
+    lines.append("")
+
+    if dynamic_badges:
+        badge_str = "  ".join(f"{e} {l}" for e, l in dynamic_badges)
+        lines.append(f"📈 {badge_str}")
+        lines.append("")
+
+    lines.append("━━━━━━━━━━━━━━━━")
+    lines.append("")
+
+    if intel["volume"] > 0 and intel["vol_growth"] > 0:
+        lines.append(f"Volume increased {intel['vol_growth']:.0f}% recently.")
+        lines.append("Don't miss the discussion.")
+    elif intel["volume"] > 0:
+        lines.append(f"${intel['volume']:,.2f} staked so far.")
+        lines.append("Still enough time to influence the outcome.")
+    else:
+        teaser = get_random_teaser(sum(ord(c) for c in title) + int(hours))
+        lines.append(teaser)
+
+    notification = "\n".join(lines)
+
+    rich_fallback = (
+        f"<h3>{escape_text(emoji)} {escape_text(heading)}</h3>"
+        f"<h2>{escape_text(title)}</h2>"
+        "<table>"
+        f"<tr><th>Volume</th><td>${intel['volume']:,.2f}</td></tr>"
+        f"<tr><th>Time Left</th><td>{escape_text(time_text)}</td></tr>"
+        f"<tr><th>Status</th><td>{escape_text(status_line)}</td></tr>"
+        "</table>"
+        "<p>Join the debate before the market closes.</p>"
+    )
+
+    return notification, rich_fallback, tier
+
+
 def _parse_fingerprint(title):
     title = str(title or "").strip()
     words = title.split()
@@ -3592,113 +3809,104 @@ def check_scheduled_notifications():
                     hours_until = time_until / 3600
                     minutes_until = time_until / 60
 
-                    # ── Smart Reminder Engine: Featured creator markets ──
+                    # ── Featured Reminder Engine: Editor's Pick markets ──
                     if market_data.get("is_featured") and FEATURED_WALLETS:
-                        current_volume = get_market_volume(market_id)[0]
                         market_link = market_data.get("market_link", build_market_link(market_id))
 
-                        # 12-hour reminder
-                        if hours_until <= 12.0 and hours_until > 6.0 and not market_data.get("notified_12h") and current_volume < FEATURED_REMINDER_TARGET_12H:
-                            teaser = get_random_teaser(sum(ord(c) for c in title) + 12)
-                            notification = (
-                                f"⭐ <b>EDITOR'S PICK</b>\n\n"
-                                f"{custom_emoji('one_hour', '!')} <b>12 HOURS LEFT</b>\n\n"
-                                f"<b>{escape_text(title)}</b>\n\n"
-                                f"Volume: <b>${current_volume:,.2f}</b> — still building.\n\n"
-                                f"{teaser}"
-                            )
+                        # 12-hour reminder (12h–6h window)
+                        if hours_until <= 12.0 and hours_until > 6.0 and not market_data.get("notified_12h"):
+                            notification, rich_fallback, _ = build_featured_reminder_card(title, market_id, time_until, market_link)
                             keyboard = create_market_keyboard(market_id, market_link, scope="reminder_1h")
                             broadcast_to_all(
-                                notification,
-                                market_id,
-                                keyboard,
-                                theme=raw_theme,
-                                notification_key=f"12h_{market_id}",
-                                rich_html=build_rich_reminder(title, int(minutes_until), None, urgent=False),
+                                notification, market_id, keyboard,
+                                theme=raw_theme, notification_key=f"12h_{market_id}",
+                                rich_html=rich_fallback,
                             )
                             update_market_flag(market_id, "notified_12h")
                             logger.info(f"featured 12h reminder sent for: {title}")
 
-                        # 6-hour reminder
-                        elif hours_until <= 6.0 and hours_until > 1.0 and not market_data.get("notified_6h") and current_volume < FEATURED_REMINDER_TARGET_6H:
-                            notification = (
-                                f"⭐ <b>EDITOR'S PICK</b>\n\n"
-                                f"{custom_emoji('one_hour', '!')} <b>6 HOURS LEFT</b>\n\n"
-                                f"<b>{escape_text(title)}</b>\n\n"
-                                f"Volume: <b>${current_volume:,.2f}</b> — still room to move."
-                            )
+                        # 6-hour reminder (6h–1h window)
+                        elif hours_until <= 6.0 and hours_until > 1.0 and not market_data.get("notified_6h"):
+                            notification, rich_fallback, _ = build_featured_reminder_card(title, market_id, time_until, market_link)
                             keyboard = create_market_keyboard(market_id, market_link, scope="reminder_1h")
                             broadcast_to_all(
-                                notification,
-                                market_id,
-                                keyboard,
-                                theme=raw_theme,
-                                notification_key=f"6h_{market_id}",
-                                rich_html=build_rich_reminder(title, int(minutes_until), None, urgent=False),
+                                notification, market_id, keyboard,
+                                theme=raw_theme, notification_key=f"6h_{market_id}",
+                                rich_html=rich_fallback,
                             )
                             update_market_flag(market_id, "notified_6h")
                             logger.info(f"featured 6h reminder sent for: {title}")
 
-                        # 30-minute reminder
-                        elif minutes_until <= 30.0 and minutes_until > 10.0 and not market_data.get("notified_30m") and current_volume < FEATURED_REMINDER_TARGET_30M:
-                            notification = (
-                                f"⭐ <b>EDITOR'S PICK</b>\n\n"
-                                f"{custom_emoji('ten_minutes', '4')} <b>FINAL 30 MINUTES</b>\n\n"
-                                f"<b>{escape_text(title)}</b>\n\n"
-                                f"Volume: <b>${current_volume:,.2f}</b> — last call for First Staker."
+                        # 1-hour reminder (1h–30m window)
+                        elif hours_until <= 1.0 and minutes_until > 30.0 and not market_data.get("notified_1h"):
+                            notification, rich_fallback, _ = build_featured_reminder_card(title, market_id, time_until, market_link)
+                            keyboard = create_market_keyboard(market_id, market_link, scope="reminder_1h")
+                            broadcast_to_all(
+                                notification, market_id, keyboard,
+                                theme=raw_theme, notification_key=f"1h_{market_id}",
+                                rich_html=rich_fallback,
                             )
+                            update_market_flag(market_id, "notified_1h")
+                            logger.info(f"featured 1h reminder sent for: {title}")
+
+                        # 30-minute reminder (30m–10m window)
+                        elif minutes_until <= 30.0 and minutes_until > 10.0 and not market_data.get("notified_30m"):
+                            notification, rich_fallback, _ = build_featured_reminder_card(title, market_id, time_until, market_link)
                             keyboard = create_market_keyboard(market_id, market_link, scope="reminder_10m")
                             broadcast_to_all(
-                                notification,
-                                market_id,
-                                keyboard,
-                                theme=raw_theme,
-                                notification_key=f"30m_{market_id}",
-                                rich_html=build_rich_reminder(title, int(minutes_until), None, urgent=True),
+                                notification, market_id, keyboard,
+                                theme=raw_theme, notification_key=f"30m_{market_id}",
+                                rich_html=rich_fallback,
                             )
                             update_market_flag(market_id, "notified_30m")
                             logger.info(f"featured 30m reminder sent for: {title}")
 
-                    if hours_until <= 1.0 and not market_data.get("notified_1h"):
+                        # 10-minute reminder (10m–0 window)
+                        elif minutes_until <= 10.0 and not market_data.get("notified_5m"):
+                            notification, rich_fallback, _ = build_featured_reminder_card(title, market_id, time_until, market_link)
+                            keyboard = create_market_keyboard(market_id, market_link, scope="reminder_10m")
+                            broadcast_to_all(
+                                notification, market_id, keyboard,
+                                theme=raw_theme, notification_key=f"10m_{market_id}",
+                                rich_html=rich_fallback,
+                            )
+                            update_market_flag(market_id, "notified_5m")
+                            logger.info(f"featured 10m reminder sent for: {title}")
+
+                    # ── Standard reminders: all other markets ──
+                    elif hours_until <= 1.0 and not market_data.get("notified_1h"):
                         mins_left = int(minutes_until)
-                        
-                        # try ai message
                         ai_message = generate_smart_notification(title, market_data.get("theme", "other"), "1h")
                         market_link = market_data.get("market_link", build_market_link(market_id))
-                        
+
                         if ai_message:
                             notification = (
                                 f"{custom_emoji('one_hour', '!')} <b>1 HOUR LEFT</b>\n\n"
                                 f"<b>{escape_text(title)}</b>\n\n"
-                                f"Time Remaining: <b>{mins_left} Minutes</b>\n\n"
+                                f"Time Remaining: <b>{format_time_remaining(time_until)}</b>\n\n"
                                 f"{ai_message}"
                             )
                         else:
                             notification = (
                                 f"{custom_emoji('one_hour', '!')} <b>1 HOUR LEFT</b>\n\n"
                                 f"<b>{escape_text(title)}</b>\n\n"
-                                f"Time Remaining: <b>{mins_left} Minutes</b>\n\n"
+                                f"Time Remaining: <b>{format_time_remaining(time_until)}</b>\n\n"
                                 f"This is your last chance to stake!"
                             )
-                        
+
                         keyboard = create_market_keyboard(market_id, market_link, scope="reminder_1h")
                         broadcast_to_all(
-                            notification,
-                            market_id,
-                            keyboard,
-                            theme=raw_theme,
-                            notification_key=f"1h_{market_id}",
+                            notification, market_id, keyboard,
+                            theme=raw_theme, notification_key=f"1h_{market_id}",
                             rich_html=build_rich_reminder(title, mins_left, ai_message, urgent=False),
                         )
                         update_market_flag(market_id, "notified_1h")
                         logger.info(f"1 hour reminder sent for: {title}")
 
                     elif minutes_until <= 10.0 and not market_data.get("notified_5m"):
-                        
-                        # try ai message
                         ai_message = generate_smart_notification(title, market_data.get("theme", "other"), "10m")
                         market_link = market_data.get("market_link", build_market_link(market_id))
-                        
+
                         if ai_message:
                             notification = (
                                 f"{custom_emoji('ten_minutes', '4')} <b>10 MINUTES LEFT</b>\n\n"
@@ -3712,14 +3920,11 @@ def check_scheduled_notifications():
                                 f"Time Remaining: <b>10 Minutes</b>\n\n"
                                 f"Act Now Or Lose This Opportunity!"
                             )
-                        
+
                         keyboard = create_market_keyboard(market_id, market_link, scope="reminder_10m")
                         broadcast_to_all(
-                            notification,
-                            market_id,
-                            keyboard,
-                            theme=raw_theme,
-                            notification_key=f"10m_{market_id}",
+                            notification, market_id, keyboard,
+                            theme=raw_theme, notification_key=f"10m_{market_id}",
                             rich_html=build_rich_reminder(title, 10, ai_message, urgent=True),
                         )
                         update_market_flag(market_id, "notified_5m")
