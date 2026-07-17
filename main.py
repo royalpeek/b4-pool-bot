@@ -2123,8 +2123,6 @@ def build_featured_reminder_card(title, market_id, seconds_until, market_link=No
         "",
         "━━━━━━━━━━━━━━━━",
         "",
-        f"⏰ {time_text} remaining",
-        "",
     ]
 
     if dynamic_badges:
