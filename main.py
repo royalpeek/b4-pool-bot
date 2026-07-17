@@ -3252,145 +3252,12 @@ def build_admin_keyboard():
         types.InlineKeyboardButton("Test", callback_data="admin_test"),
         types.InlineKeyboardButton("Clean", callback_data="admin_clean"),
         types.InlineKeyboardButton("Stats", callback_data="admin_stats"),
-        types.InlineKeyboardButton("Tone", callback_data="admin_tone"),
-        types.InlineKeyboardButton("Studio", callback_data="studio_menu"),
         types.InlineKeyboardButton("Premium", callback_data="admin_premium"),
-        types.InlineKeyboardButton("AI", callback_data="admin_ai"),
-        types.InlineKeyboardButton("Emojis", callback_data="admin_emojis"),
     )
     return keyboard
 
 
-def build_studio_keyboard():
-    keyboard = types.InlineKeyboardMarkup(row_width=2)
-    keyboard.add(
-        types.InlineKeyboardButton("Templates", callback_data="studio_templates"),
-        types.InlineKeyboardButton("Buttons", callback_data="studio_buttons"),
-        types.InlineKeyboardButton("Preview", callback_data="studio_preview"),
-        types.InlineKeyboardButton("Commands", callback_data="studio_commands"),
-        types.InlineKeyboardButton("Admin", callback_data="admin_menu"),
-    )
-    return keyboard
 
-
-def get_studio_text():
-    return (
-        "<b>Admin Message Studio</b>\n\n"
-        "Edit bot wording, rich text layouts, inline buttons, social links, and broadcast helpers without touching code.\n\n"
-        "<b>Useful placeholders</b>\n"
-        "<code>{title}</code>, <code>{theme}</code>, <code>{close_time}</code>, <code>{go_live_time}</code>, "
-        "<code>{market_link}</code>, <code>{promo_text}</code>, <code>{ai_text}</code>, <code>{cover_image}</code>\n\n"
-        "Use /studio_commands to see editing commands."
-    )
-
-
-def get_studio_commands_text():
-    return (
-        "<b>Studio Commands</b>\n\n"
-        "<b>Templates</b>\n"
-        "<code>/settemplate key | message</code>\n"
-        "<code>/setrich key | rich message</code>\n"
-        "<code>/deltemplate key</code>\n"
-        "<code>/templates</code>\n\n"
-        "<b>Inline Buttons</b>\n"
-        "<code>/addbutton scope | label | url</code>\n"
-        "<code>/delbutton id</code>\n"
-        "<code>/buttons</code>\n\n"
-        "<b>Broadcast</b>\n"
-        "<code>/studiobroadcast all | message</code>\n"
-        "<code>/studiobroadcast premium | message</code>\n\n"
-        "<b>Easy Broadcast With One Button</b>\n"
-        "<code>/quickbroadcast Button Text | Button Link | Message</code>\n\n"
-        "<b>Scopes</b>\n"
-        "<code>all</code>, <code>new_market</code>, <code>scheduled_market</code>, "
-        "<code>reminder_1h</code>, <code>reminder_10m</code>, <code>go_live_reminder</code>, "
-        "<code>image_followup</code>, <code>broadcast</code>\n\n"
-        "<b>Examples</b>\n"
-        "<code>/addbutton all | Follow X | https://x.com/yourname</code>\n"
-        "<code>/addbutton new_market | Community | https://t.me/yourgroup</code>\n"
-        "<code>/addbutton broadcast | Follow X | https://x.com/yourname</code>\n"
-        "<code>/quickbroadcast Follow us on X | https://x.com/yourname | Big update today!</code>\n"
-        "<code>/settemplate new_market_text | NEW MARKET: {title}\\n\\n{ai_text}</code>"
-    )
-
-
-def get_ai_settings_text():
-    status = "active" if ai_client else "not configured"
-    return (
-        "<b>AI Settings</b>\n\n"
-        f"Status: <b>{escape_text(status)}</b>\n"
-        f"Current model: <code>{escape_text(get_ai_model())}</code>\n"
-        f"Tone: <b>{escape_text(get_ai_tone().title())}</b>\n\n"
-        "Free Groq model now recommended:\n"
-        "<code>openai/gpt-oss-20b</code>\n\n"
-        "Change model:\n"
-        "<code>/aimodel openai/gpt-oss-20b</code>\n\n"
-        "Change tone:\n"
-        "<code>/tone</code>\n\n"
-        "Keep API keys in Railway only."
-    )
-
-
-def get_emoji_settings_text():
-    lines = [
-        "<b>Custom Emoji Settings</b>",
-        "",
-        "Change any notification emoji without editing code.",
-        "",
-    ]
-    for key in sorted(VALID_CUSTOM_EMOJI_KEYS):
-        emoji_id = get_custom_emoji_id(key) or "disabled"
-        fallback = get_custom_emoji_fallback(key)
-        lines.append(f"<code>{escape_text(key)}</code>: <code>{escape_text(emoji_id)}</code> | fallback: <code>{escape_text(fallback)}</code>")
-    lines.extend([
-        "",
-        "Set emoji:",
-        "<code>/setemoji live 5416081784641168838</code>",
-        "",
-        "Set emoji with fallback text:",
-        "<code>/setemoji premium 5251203410396458957 PREMIUM</code>",
-        "",
-        "Disable custom emoji:",
-        "<code>/setemoji live none LIVE</code>",
-        "",
-        "Keys: <code>live</code>, <code>premium</code>, <code>one_hour</code>, <code>ten_minutes</code>, <code>ended</code>",
-    ])
-    return "\n".join(lines)
-
-
-def get_templates_text():
-    templates = list_templates()
-    if not templates:
-        return "No custom templates saved yet.\n\nUse /settemplate or /setrich to add one."
-    lines = ["<b>Saved Templates</b>"]
-    for template in templates:
-        lines.append(
-            f"\n<code>{escape_text(template.get('template_key'))}</code>\n"
-            f"Text: {'yes' if template.get('body') else 'no'} | Rich: {'yes' if template.get('rich_body') else 'no'}"
-        )
-    return "\n".join(lines)
-
-
-def get_buttons_text():
-    buttons = get_custom_buttons()
-    if not buttons:
-        return "No custom buttons saved yet.\n\nUse /addbutton scope | label | url"
-    lines = ["<b>Custom Buttons</b>"]
-    for button in buttons:
-        lines.append(
-            f"\nID <code>{button.get('id')}</code> | <b>{escape_text(button.get('scope'))}</b>\n"
-            f"{escape_text(button.get('label'))}\n"
-            f"<code>{escape_text(button.get('url'))}</code>"
-        )
-    return "\n".join(lines)
-
-
-def build_tone_keyboard():
-    keyboard = types.InlineKeyboardMarkup(row_width=2)
-    for tone in VALID_TONES:
-        keyboard.add(types.InlineKeyboardButton(tone.title(), callback_data=f"tone_{tone}"))
-    keyboard.add(types.InlineKeyboardButton("⬅️ Admin", callback_data="admin_menu"))
-    return keyboard
 
 
 def build_theme_keyboard(selected_themes):
@@ -3401,8 +3268,6 @@ def build_theme_keyboard(selected_themes):
         prefix = "✅" if theme in selected else "☑️"
         keyboard.add(types.InlineKeyboardButton(f"{prefix} {label}", callback_data=f"theme_{theme}"))
     return keyboard
-
-
 
 
 def get_stats_text():
@@ -4033,7 +3898,7 @@ def handle_dashboard_callback(call):
             refresh_market(call)
             return
 
-        if data.startswith("admin_") or data.startswith("tone_") or data.startswith("studio_"):
+        if data.startswith("admin_"):
             if not is_admin(user_id):
                 answer("admin only", show_alert=True)
                 return
@@ -4048,21 +3913,6 @@ def handle_dashboard_callback(call):
                 reply_markup=build_admin_keyboard(),
                 parse_mode="HTML"
             )
-        elif data == "studio_menu":
-            delete_callback_message(call)
-            send_temp_message(call.message.chat.id, get_studio_text(), reply_markup=build_studio_keyboard(), parse_mode="HTML")
-        elif data == "studio_templates":
-            delete_callback_message(call)
-            send_temp_message(call.message.chat.id, get_templates_text(), reply_markup=build_studio_keyboard(), parse_mode="HTML")
-        elif data == "studio_buttons":
-            delete_callback_message(call)
-            send_temp_message(call.message.chat.id, get_buttons_text(), reply_markup=build_studio_keyboard(), parse_mode="HTML")
-        elif data == "studio_commands":
-            delete_callback_message(call)
-            send_temp_message(call.message.chat.id, get_studio_commands_text(), reply_markup=build_studio_keyboard(), parse_mode="HTML")
-        elif data == "studio_preview":
-            delete_callback_message(call)
-            send_studio_preview(call.message.chat.id)
         elif data == "admin_pause":
             set_pause_state(True)
             delete_callback_message(call)
@@ -4104,40 +3954,6 @@ def handle_dashboard_callback(call):
                 "<code>/premium_add USER_ID 6months</code>\n"
                 "<code>/premium_add USER_ID yearly</code>",
                 reply_markup=build_admin_keyboard(),
-                parse_mode="HTML"
-            )
-        elif data == "admin_tone":
-            delete_callback_message(call)
-            send_temp_message(
-                call.message.chat.id,
-                f"🎛 <b>AI Tone</b>\n\nCurrent tone: <b>{get_ai_tone().title()}</b>",
-                reply_markup=build_tone_keyboard(),
-                parse_mode="HTML"
-            )
-        elif data == "admin_ai":
-            delete_callback_message(call)
-            send_temp_message(
-                call.message.chat.id,
-                get_ai_settings_text(),
-                reply_markup=build_admin_keyboard(),
-                parse_mode="HTML"
-            )
-        elif data == "admin_emojis":
-            delete_callback_message(call)
-            send_temp_message(
-                call.message.chat.id,
-                get_emoji_settings_text(),
-                reply_markup=build_admin_keyboard(),
-                parse_mode="HTML"
-            )
-        elif data.startswith("tone_"):
-            tone = data.replace("tone_", "")
-            set_ai_tone(tone)
-            delete_callback_message(call)
-            send_temp_message(
-                call.message.chat.id,
-                f"🎛 <b>AI Tone</b>\n\nCurrent tone: <b>{tone.title()}</b>",
-                reply_markup=build_tone_keyboard(),
                 parse_mode="HTML"
             )
         elif data.startswith("theme_"):
@@ -4337,360 +4153,6 @@ def admin_dashboard(message):
         logger.error(f"error in admin dashboard: {e}")
 
 
-def send_studio_preview(chat_id):
-    markets = [market for market in fetch_b4_markets() if is_valid_market(market) and is_market_active(market)]
-    if not markets:
-        send_temp_message(chat_id, "No active API market available for preview.", parse_mode="HTML")
-        return
-    market = markets[0]
-    market_id = str(market.get("market_id", "")).strip()
-    raw_theme = normalize_theme(market.get("theme", "other"))
-    ai_message = generate_smart_notification(str(market.get("title", "")).strip(), raw_theme, "new")
-    context = build_market_template_context(market, ai_message)
-    keyboard = create_market_keyboard(market_id, build_market_link(market_id), scope="new_market", context=context)
-    send_notification_to_chat(
-        chat_id,
-        build_new_market_notification(market, ai_message),
-        keyboard=keyboard,
-        photo_url=get_market_cover_image(market),
-        rich_html=build_rich_new_market(market, ai_message, heading="Studio Preview"),
-    )
-
-
-@bot.message_handler(commands=['studio'])
-def studio_command(message):
-    try:
-        if not is_admin(message.from_user.id):
-            reply_temp(message, "Permission denied.")
-            return
-        reply_temp(message, get_studio_text(), reply_markup=build_studio_keyboard(), parse_mode="HTML")
-    except Exception as e:
-        logger.error(f"error in studio: {e}")
-
-
-@bot.message_handler(commands=['studio_commands'])
-def studio_commands_command(message):
-    try:
-        if not is_admin(message.from_user.id):
-            reply_temp(message, "Permission denied.")
-            return
-        reply_temp(message, get_studio_commands_text(), reply_markup=build_studio_keyboard(), parse_mode="HTML")
-    except Exception as e:
-        logger.error(f"error in studio_commands: {e}")
-
-
-@bot.message_handler(commands=['ai', 'aistatus'])
-def ai_status_command(message):
-    try:
-        if not is_admin(message.from_user.id):
-            reply_temp(message, "Permission denied.")
-            return
-        reply_temp(message, get_ai_settings_text(), reply_markup=build_admin_keyboard(), parse_mode="HTML")
-    except Exception as e:
-        logger.error(f"error in ai status command: {e}")
-
-
-@bot.message_handler(commands=['aimodel'])
-def ai_model_command(message):
-    try:
-        if not is_admin(message.from_user.id):
-            reply_temp(message, "Permission denied.")
-            return
-        parts = str(message.text or "").split(maxsplit=1)
-        if len(parts) == 1:
-            reply_temp(message, get_ai_settings_text(), reply_markup=build_admin_keyboard(), parse_mode="HTML")
-            return
-        model = parts[1].strip()
-        if not set_ai_model(model):
-            reply_temp(
-                message,
-                "Invalid model name.\n\nExample:\n<code>/aimodel openai/gpt-oss-20b</code>",
-                parse_mode="HTML"
-            )
-            return
-        reply_temp(
-            message,
-            f"<b>AI model updated</b>\n\nCurrent model: <code>{escape_text(get_ai_model())}</code>",
-            parse_mode="HTML"
-        )
-    except Exception as e:
-        logger.error(f"error in aimodel command: {e}")
-
-
-@bot.message_handler(commands=['emojis'])
-def emojis_command(message):
-    try:
-        if not is_admin(message.from_user.id):
-            reply_temp(message, "Permission denied.")
-            return
-        reply_temp(message, get_emoji_settings_text(), reply_markup=build_admin_keyboard(), parse_mode="HTML")
-    except Exception as e:
-        logger.error(f"error in emojis command: {e}")
-
-
-@bot.message_handler(commands=['setemoji'])
-def setemoji_command(message):
-    try:
-        if not is_admin(message.from_user.id):
-            reply_temp(message, "Permission denied.")
-            return
-        parts = str(message.text or "").split(maxsplit=3)
-        if len(parts) < 3:
-            reply_temp(
-                message,
-                "Use:\n<code>/setemoji key custom_emoji_id fallback</code>\n\n"
-                "Example:\n<code>/setemoji live 5416081784641168838 LIVE</code>\n\n"
-                "Disable:\n<code>/setemoji live none LIVE</code>\n\n"
-                "Keys: <code>live</code>, <code>premium</code>, <code>one_hour</code>, <code>ten_minutes</code>, <code>ended</code>",
-                parse_mode="HTML"
-            )
-            return
-        key = parts[1].strip().lower()
-        emoji_id = parts[2].strip()
-        fallback = parts[3].strip() if len(parts) > 3 else None
-        if not set_custom_emoji(key, emoji_id, fallback):
-            reply_temp(
-                message,
-                "Invalid emoji setting.\n\n"
-                "The key must be one of: <code>live</code>, <code>premium</code>, <code>one_hour</code>, <code>ten_minutes</code>, <code>ended</code>.\n"
-                "The emoji ID must be numbers only, or <code>none</code>.",
-                parse_mode="HTML"
-            )
-            return
-        reply_temp(
-            message,
-            f"<b>Emoji updated</b>\n\n<code>{escape_text(key)}</code>: {custom_emoji(key, get_custom_emoji_fallback(key))}\n"
-            f"ID: <code>{escape_text(get_custom_emoji_id(key) or 'disabled')}</code>\n"
-            f"Fallback: <code>{escape_text(get_custom_emoji_fallback(key))}</code>",
-            parse_mode="HTML"
-        )
-    except Exception as e:
-        logger.error(f"error in setemoji command: {e}")
-
-
-@bot.message_handler(commands=['templates'])
-def templates_command(message):
-    try:
-        if not is_admin(message.from_user.id):
-            reply_temp(message, "Permission denied.")
-            return
-        reply_temp(message, get_templates_text(), reply_markup=build_studio_keyboard(), parse_mode="HTML")
-    except Exception as e:
-        logger.error(f"error in templates: {e}")
-
-
-@bot.message_handler(commands=['settemplate'])
-def settemplate_command(message):
-    try:
-        if not is_admin(message.from_user.id):
-            reply_temp(message, "Permission denied.")
-            return
-        payload = message.text.split(maxsplit=1)
-        if len(payload) < 2 or "|" not in payload[1]:
-            reply_temp(message, "Format: /settemplate key | message")
-            return
-        key, body = [part.strip() for part in payload[1].split("|", 1)]
-        body = body.replace("\\n", "\n")
-        existing = get_template(key)
-        rich_body = existing.get("rich_body") if existing else None
-        if save_template(key, body, rich_body):
-            reply_temp(message, f"Saved text template <code>{escape_text(key)}</code>.", parse_mode="HTML")
-        else:
-            reply_temp(message, "Could not save template.")
-    except Exception as e:
-        logger.error(f"error in settemplate: {e}")
-
-
-@bot.message_handler(commands=['setrich'])
-def setrich_command(message):
-    try:
-        if not is_admin(message.from_user.id):
-            reply_temp(message, "Permission denied.")
-            return
-        payload = message.text.split(maxsplit=1)
-        if len(payload) < 2 or "|" not in payload[1]:
-            reply_temp(message, "Format: /setrich key | rich message")
-            return
-        key, rich_body = [part.strip() for part in payload[1].split("|", 1)]
-        existing = get_template(key)
-        body = existing.get("body") if existing else rich_body
-        rich_body = rich_body.replace("\\n", "\n")
-        if save_template(key, body, rich_body):
-            reply_temp(message, f"Saved rich template <code>{escape_text(key)}</code>.", parse_mode="HTML")
-        else:
-            reply_temp(message, "Could not save rich template.")
-    except Exception as e:
-        logger.error(f"error in setrich: {e}")
-
-
-@bot.message_handler(commands=['deltemplate'])
-def deltemplate_command(message):
-    try:
-        if not is_admin(message.from_user.id):
-            reply_temp(message, "Permission denied.")
-            return
-        args = message.text.split(maxsplit=1)
-        if len(args) < 2:
-            reply_temp(message, "Format: /deltemplate key")
-            return
-        deleted = delete_template(args[1].strip())
-        reply_temp(message, "Template deleted." if deleted else "Template not found.")
-    except Exception as e:
-        logger.error(f"error in deltemplate: {e}")
-
-
-@bot.message_handler(commands=['buttons'])
-def buttons_command(message):
-    try:
-        if not is_admin(message.from_user.id):
-            reply_temp(message, "Permission denied.")
-            return
-        reply_temp(message, get_buttons_text(), reply_markup=build_studio_keyboard(), parse_mode="HTML")
-    except Exception as e:
-        logger.error(f"error in buttons: {e}")
-
-
-@bot.message_handler(commands=['addbutton'])
-def addbutton_command(message):
-    try:
-        if not is_admin(message.from_user.id):
-            reply_temp(message, "Permission denied.")
-            return
-        payload = message.text.split(maxsplit=1)
-        if len(payload) < 2:
-            reply_temp(message, "Format: /addbutton scope | label | url")
-            return
-        parts = [part.strip() for part in payload[1].split("|")]
-        if len(parts) < 3:
-            reply_temp(message, "Format: /addbutton scope | label | url")
-            return
-        button_id = add_custom_button(parts[0], parts[1], parts[2])
-        if button_id:
-            reply_temp(message, f"Button saved with ID <code>{button_id}</code>.", parse_mode="HTML")
-        else:
-            reply_temp(message, "Could not save button. Check the scope and URL.")
-    except Exception as e:
-        logger.error(f"error in addbutton: {e}")
-
-
-@bot.message_handler(commands=['delbutton'])
-def delbutton_command(message):
-    try:
-        if not is_admin(message.from_user.id):
-            reply_temp(message, "Permission denied.")
-            return
-        args = message.text.split(maxsplit=1)
-        if len(args) < 2:
-            reply_temp(message, "Format: /delbutton id")
-            return
-        deleted = delete_custom_button(int(args[1].strip()))
-        reply_temp(message, "Button deleted." if deleted else "Button not found.")
-    except Exception as e:
-        logger.error(f"error in delbutton: {e}")
-
-
-@bot.message_handler(commands=['studiobroadcast'])
-def studiobroadcast_command(message):
-    try:
-        if not is_admin(message.from_user.id):
-            reply_temp(message, "Permission denied.")
-            return
-        payload = message.text.split(maxsplit=1)
-        if len(payload) < 2 or "|" not in payload[1]:
-            reply_temp(message, "Format: /studiobroadcast all | message")
-            return
-
-        audience, body = [part.strip() for part in payload[1].split("|", 1)]
-        audience = audience.lower()
-        if audience not in {"all", "premium"}:
-            reply_temp(message, "Audience must be all or premium.")
-            return
-
-        rich_html = simple_rich_markup(body.replace("\\n", "\n"))
-        text = escape_text(body.replace("\\n", "\n"))
-        keyboard = create_custom_keyboard("broadcast", {"audience": audience})
-        broadcast_to_all(
-            text,
-            keyboard=keyboard,
-            notification_key=f"studio_broadcast_{int(time.time())}",
-            premium_only=audience == "premium",
-            rich_html=rich_html,
-        )
-        reply_temp(message, f"Studio broadcast sent to <b>{escape_text(audience)}</b> subscribers.", parse_mode="HTML")
-    except Exception as e:
-        logger.error(f"error in studiobroadcast: {e}")
-        reply_temp(message, f"Error: {e}")
-
-
-def handle_quick_broadcast(message, premium_only=False):
-    if not is_admin(message.from_user.id):
-        reply_temp(message, "Permission denied.")
-        return
-
-    payload = message.text.split(maxsplit=1)
-    command_name = "quickpremium" if premium_only else "quickbroadcast"
-    if len(payload) < 2:
-        reply_temp(message, f"Format: /{command_name} Button Text | Button Link | Message")
-        return
-
-    parts = [part.strip() for part in payload[1].split("|", 2)]
-    if len(parts) < 3:
-        reply_temp(message, f"Format: /{command_name} Button Text | Button Link | Message")
-        return
-
-    button_text, button_url, body = parts
-    keyboard = create_single_button_keyboard(button_text, button_url)
-    if not keyboard:
-        reply_temp(message, "Button link must start with http://, https://, or tg://")
-        return
-
-    body = body.replace("\\n", "\n")
-    broadcast_to_all(
-        escape_text(body),
-        keyboard=keyboard,
-        notification_key=f"{command_name}_{int(time.time())}",
-        premium_only=premium_only,
-        rich_html=simple_rich_markup(body),
-    )
-    audience = "premium users" if premium_only else "all subscribers"
-    reply_temp(message, f"Broadcast sent to <b>{audience}</b>.", parse_mode="HTML")
-
-
-@bot.message_handler(commands=['quickbroadcast'])
-def quickbroadcast_command(message):
-    try:
-        handle_quick_broadcast(message, premium_only=False)
-    except Exception as e:
-        logger.error(f"error in quickbroadcast: {e}")
-        reply_temp(message, f"Error: {e}")
-
-
-@bot.message_handler(commands=['quickpremium'])
-def quickpremium_command(message):
-    try:
-        handle_quick_broadcast(message, premium_only=True)
-    except Exception as e:
-        logger.error(f"error in quickpremium: {e}")
-        reply_temp(message, f"Error: {e}")
-
-
-@bot.message_handler(commands=['tone'])
-def tone_command(message):
-    try:
-        if not is_admin(message.from_user.id):
-            reply_temp(message, "❌ Permission Denied. Admin Only Command")
-            return
-
-        reply_temp(
-            message,
-            f"🎛 <b>AI Tone</b>\n\nCurrent tone: <b>{get_ai_tone().title()}</b>",
-            reply_markup=build_tone_keyboard(),
-            parse_mode="HTML"
-        )
-    except Exception as e:
-        logger.error(f"error in tone command: {e}")
-
-
 @bot.message_handler(commands=['summary'])
 def summary_command(message):
     try:
@@ -4845,54 +4307,6 @@ def live_ending(message):
         reply_temp(message, msg)
     except Exception as e:
         logger.error(f"error in liveending: {e}")
-
-
-@bot.message_handler(commands=['users'])
-def show_users(message):
-    try:
-        if not is_admin(message.from_user.id):
-            reply_temp(message, "❌ Permission Denied. Admin Only Command")
-            return
-        total_users = len(get_all_users())
-        reply_temp(message, f"📊 User Statistics\n\n👥 Total Users: {total_users}")
-    except Exception as e:
-        logger.error(f"error in users: {e}")
-
-
-@bot.message_handler(commands=['listusers'])
-def list_users(message):
-    try:
-        if not is_admin(message.from_user.id):
-            reply_temp(message, "❌ Permission Denied. Admin Only Command")
-            return
-
-        users = get_all_users()
-        if not users:
-            reply_temp(message, "No Users Yet")
-            return
-
-        users_list = "📋 Registered Users\n\n"
-        for user in users:
-            username = user.get("username", "No Username")
-            first_name = user.get("first_name", "No Name")
-            join_date = user.get("join_date", "Unknown")
-            users_list += f"ID: {user['user_id']}\nName: {first_name}\nUsername: @{username}\nJoined: {join_date}\n\n"
-
-        reply_temp(message, users_list)
-    except Exception as e:
-        logger.error(f"error in listusers: {e}")
-
-
-@bot.message_handler(commands=['stats'])
-def show_stats(message):
-    try:
-        if not is_admin(message.from_user.id):
-            reply_temp(message, "❌ Permission Denied. Admin Only Command")
-            return
-
-        reply_temp(message, get_stats_text(), parse_mode="HTML")
-    except Exception as e:
-        logger.error(f"error in stats: {e}")
 
 
 @bot.message_handler(commands=['broadcast'])
@@ -5558,11 +4972,6 @@ try:
         telebot.types.BotCommand("pause", "Pause all notifications"),
         telebot.types.BotCommand("resume", "Resume notifications"),
         telebot.types.BotCommand("test", "Send test notification"),
-        telebot.types.BotCommand("tone", "Change AI message tone"),
-        telebot.types.BotCommand("ai", "Show AI settings"),
-        telebot.types.BotCommand("aimodel", "Change AI model"),
-        telebot.types.BotCommand("emojis", "Show custom emoji settings"),
-        telebot.types.BotCommand("setemoji", "Change custom emoji"),
         telebot.types.BotCommand("preview", "Preview latest market alert"),
         telebot.types.BotCommand("health", "Show bot health"),
         telebot.types.BotCommand("premium_add", "Add premium user or chat"),
@@ -5570,25 +4979,10 @@ try:
         telebot.types.BotCommand("premium_remove", "Remove premium user or chat"),
         telebot.types.BotCommand("premium_users", "List premium users or chats"),
         telebot.types.BotCommand("premium_digest", "Preview premium digest"),
-        telebot.types.BotCommand("studio", "Open admin message studio"),
-        telebot.types.BotCommand("studio_commands", "Show message studio commands"),
-        telebot.types.BotCommand("templates", "List custom templates"),
-        telebot.types.BotCommand("buttons", "List custom inline buttons"),
-        telebot.types.BotCommand("settemplate", "Edit plain message template"),
-        telebot.types.BotCommand("setrich", "Edit rich message template"),
-        telebot.types.BotCommand("deltemplate", "Delete custom template"),
-        telebot.types.BotCommand("addbutton", "Add custom inline button"),
-        telebot.types.BotCommand("delbutton", "Delete custom inline button"),
-        telebot.types.BotCommand("studiobroadcast", "Send rich broadcast with studio buttons"),
-        telebot.types.BotCommand("quickbroadcast", "Broadcast with one custom button"),
-        telebot.types.BotCommand("quickpremium", "Premium broadcast with one custom button"),
         telebot.types.BotCommand("reset", "Reset all data"),
         telebot.types.BotCommand("cleanmessages", "Delete tracked messages only"),
         telebot.types.BotCommand("refreshlinks", "Refresh market button links"),
         telebot.types.BotCommand("broadcast", "Broadcast message"),
-        telebot.types.BotCommand("stats", "Show bot statistics"),
-        telebot.types.BotCommand("users", "Show user count"),
-        telebot.types.BotCommand("listusers", "List all users"),
         telebot.types.BotCommand("intel", "Intelligence engine status"),
         telebot.types.BotCommand("recalc", "Recalculate creator totals"),
         telebot.types.BotCommand("creators", "Top creators by volume"),
