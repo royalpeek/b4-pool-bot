@@ -5,6 +5,7 @@ import json
 import os
 import time
 import logging
+import statistics
 import psycopg
 import html
 from threading import Thread
@@ -459,6 +460,19 @@ def init_intelligence_tables():
                 cur.execute("""
                     CREATE INDEX IF NOT EXISTS idx_predictions_market
                     ON ai_predictions (market_id, created_at DESC)
+                """)
+
+                # ── Analytics Engine migrations ──
+                cur.execute("ALTER TABLE market_fingerprints ADD COLUMN IF NOT EXISTS question_type TEXT")
+                cur.execute("ALTER TABLE market_fingerprints ADD COLUMN IF NOT EXISTS sentiment_lean TEXT")
+                cur.execute("ALTER TABLE markets ADD COLUMN IF NOT EXISTS final_volume NUMERIC")
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS analytics_cache (
+                        cache_key TEXT PRIMARY KEY,
+                        cache_data JSONB NOT NULL,
+                        computed_at TIMESTAMPTZ DEFAULT NOW(),
+                        expires_at TIMESTAMPTZ
+                    )
                 """)
         logger.info("intelligence tables ready")
     except Exception as e:
@@ -2197,6 +2211,699 @@ def _extract_topic_tags(theme, keywords):
     return sorted(tags)
 
 
+# ── Analytics Engine ──────────────────────────────────────────────────────────
+# Reusable analytics functions that power all intelligence features.
+# Every metric flows through these functions — no one-off queries.
+
+ANALYTICS_REFRESH_SECONDS = int(os.getenv("ANALYTICS_REFRESH_SECONDS", "1800"))  # 30 min
+
+QUESTION_TYPE_RULES = {
+    "Ethics": ["should", "moral", "ethical", "right", "wrong", "fair", "just", "equal", "justice"],
+    "Relationships": ["love", "marriage", "dating", "relationship", "partner", "boyfriend", "girlfriend", "wife", "husband", "cheating", "breakup"],
+    "AI": ["ai", "artificial intelligence", "chatgpt", "gpt", "robot", "machine learning", "deep learning", "neural"],
+    "Politics": ["election", "president", "government", "democrat", "republican", "congress", "senate", "vote", "political", "trump", "biden"],
+    "Finance": ["stock", "invest", "crypto", "bitcoin", "ethereum", "inflation", "recession", "gdp", "interest rate", "bank", "loan", "debt"],
+    "Career": ["job", "career", "hire", "fired", "salary", "work", "remote", "office", "promotion", "interview"],
+    "Parenting": ["parent", "child", "kid", "baby", "pregnancy", "school", "teenager", "discipline", "raising"],
+    "Technology": ["apple", "google", "microsoft", "iphone", "android", "software", "app", "tech", "internet", "social media"],
+    "Health": ["health", "doctor", "hospital", "disease", "vaccine", "cancer", "mental health", "diet", "exercise", "sleep"],
+    "Sports": ["nba", "nfl", "mlb", "soccer", "football", "basketball", "tennis", "championship", "world cup", "olympics"],
+    "Crypto": ["bitcoin", "btc", "ethereum", "eth", "solana", "sol", "crypto", "token", "defi", "nft", "blockchain"],
+    "Lifestyle": ["travel", "food", "fashion", "home", "car", "luxury", "minimalism", "vegan", "coffee"],
+    "Environment": ["climate", "environment", "pollution", "renewable", "solar", "fossil fuel", "carbon", "green"],
+    "Education": ["university", "college", "degree", "student", "teacher", "school", "learning", "online course"],
+    "Workplace": ["boss", "coworker", "office", "remote work", "hiring", "layoff", "salary", "promotion", "burnout"],
+    "Entertainment": ["movie", "music", "album", "oscar", "grammy", "netflix", "celebrity", "actor", "show", "tv"],
+}
+
+
+def classify_question_type(title):
+    """Classify a market title into a topic type. Returns best match or 'General'."""
+    title_lower = str(title or "").lower()
+    scores = {}
+    for qtype, keywords in QUESTION_TYPE_RULES.items():
+        score = sum(1 for kw in keywords if kw in title_lower)
+        if score > 0:
+            scores[qtype] = score
+    if not scores:
+        return "General"
+    return max(scores, key=scores.get)
+
+
+def classify_sentiment(title):
+    """Classify question sentiment leaning. Returns positive/negative/neutral/mixed."""
+    title_lower = str(title or "").lower()
+    positive = ["good", "great", "best", "success", "win", "improve", "better", "love", "happy", "positive", "boom", "growth"]
+    negative = ["bad", "worst", "fail", "lose", "decline", "worse", "hate", "sad", "negative", "crash", "recession", "die", "dead"]
+    pos = sum(1 for w in positive if w in title_lower)
+    neg = sum(1 for w in negative if w in title_lower)
+    if pos > 0 and neg > 0:
+        return "mixed"
+    if pos > 0:
+        return "positive"
+    if neg > 0:
+        return "negative"
+    return "neutral"
+
+
+# ── Analytics Cache ───────────────────────────────────────────────────────────
+
+def get_cached(cache_key):
+    """Retrieve cached analytics data if still valid."""
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT cache_data, expires_at FROM analytics_cache
+                    WHERE cache_key = %s
+                """, (cache_key,))
+                row = cur.fetchone()
+                if row:
+                    expires = row[1]
+                    if expires and expires > now_utc():
+                        return row[0]
+    except Exception:
+        pass
+    return None
+
+
+def set_cached(cache_key, data, ttl_seconds=None):
+    """Store analytics data in cache with TTL."""
+    if ttl_seconds is None:
+        ttl_seconds = ANALYTICS_REFRESH_SECONDS
+    expires = now_utc() + timedelta(seconds=ttl_seconds)
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO analytics_cache (cache_key, cache_data, computed_at, expires_at)
+                    VALUES (%s, %s, NOW(), %s)
+                    ON CONFLICT (cache_key) DO UPDATE SET
+                        cache_data = EXCLUDED.cache_data,
+                        computed_at = NOW(),
+                        expires_at = EXCLUDED.expires_at
+                """, (cache_key, json.dumps(data), expires))
+    except Exception as e:
+        logger.error(f"error setting cache {cache_key}: {e}")
+
+
+def invalidate_cache(pattern=None):
+    """Invalidate cached analytics. If pattern is None, clear all."""
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                if pattern:
+                    cur.execute("DELETE FROM analytics_cache WHERE cache_key LIKE %s", (f"{pattern}%",))
+                else:
+                    cur.execute("DELETE FROM analytics_cache")
+    except Exception as e:
+        logger.error(f"error invalidating cache: {e}")
+
+
+# ── Analytics Functions ───────────────────────────────────────────────────────
+# Each function is reusable: returns a dict of metrics, uses cache.
+# All callers (commands, future dashboards, AI) use the same functions.
+
+def analyze_creator(wallet, force_refresh=False):
+    """Lifetime analytics for a single creator. Returns dict of metrics."""
+    cache_key = f"analytics:creator:{wallet}"
+    if not force_refresh:
+        cached = get_cached(cache_key)
+        if cached:
+            return cached
+    result = {
+        "wallet": wallet,
+        "total_markets": 0,
+        "total_volume": 0.0,
+        "avg_volume": 0.0,
+        "median_volume": 0.0,
+        "peak_volume": 0.0,
+        "total_participants": 0,
+        "avg_participants": 0.0,
+        "avg_controversy": 0.0,
+        "total_comments": 0,
+        "avg_comments": 0.0,
+        "total_likes": 0,
+        "resolved_markets": 0,
+        "success_rate": 0.0,
+        "avg_market_duration_hours": 0.0,
+        "themes": {},
+        "question_types": {},
+        "sentiments": {},
+    }
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                # Market counts and basic stats
+                cur.execute("""
+                    SELECT COUNT(*), COALESCE(SUM(latest_volume), 0),
+                           COALESCE(AVG(latest_volume), 0),
+                           COALESCE(MAX(latest_volume), 0),
+                           COALESCE(AVG(latest_participants), 0),
+                           COALESCE(AVG(latest_controversy), 0)
+                    FROM (
+                        SELECT market_id,
+                               latest_volume, latest_participants, latest_controversy
+                        FROM market_scores
+                        WHERE creator = %s
+                    ) sub
+                """, (wallet,))
+                row = cur.fetchone()
+                if row:
+                    result["total_markets"] = row[0]
+                    result["total_volume"] = round(float(row[1] or 0), 2)
+                    result["avg_volume"] = round(float(row[2] or 0), 2)
+                    result["peak_volume"] = round(float(row[3] or 0), 2)
+                    result["avg_participants"] = round(float(row[4] or 0), 1)
+                    result["avg_controversy"] = round(float(row[5] or 0), 3)
+
+                # Comments and likes (from snapshots)
+                cur.execute("""
+                    SELECT COALESCE(SUM(s.comments), 0), COALESCE(SUM(s.likes), 0)
+                    FROM market_snapshots s
+                    JOIN markets m ON m.market_id = s.market_id
+                    WHERE m.creator = %s
+                """, (wallet,))
+                row = cur.fetchone()
+                if row:
+                    result["total_comments"] = int(row[0] or 0)
+                    result["total_likes"] = int(row[1] or 0)
+                    if result["total_markets"] > 0:
+                        result["avg_comments"] = round(result["total_comments"] / result["total_markets"], 1)
+                        result["avg_likes"] = round(result["total_likes"] / result["total_markets"], 1)
+
+                # Median volume
+                cur.execute("""
+                    SELECT latest_volume FROM market_scores
+                    WHERE creator = %s AND latest_volume > 0
+                """, (wallet,))
+                volumes = [float(r[0]) for r in cur.fetchall() if r[0]]
+                if volumes:
+                    result["median_volume"] = round(statistics.median(volumes), 2)
+
+                # Resolved markets + success rate
+                cur.execute("""
+                    SELECT COUNT(*), COALESCE(AVG(final_volume), 0)
+                    FROM markets
+                    WHERE creator = %s AND resolved = true
+                """, (wallet,))
+                row = cur.fetchone()
+                if row and row[0] > 0:
+                    result["resolved_markets"] = row[0]
+                    result["success_rate"] = round(float(row[1] or 0) / max(result["avg_volume"], 1), 2)
+
+                # Market duration
+                cur.execute("""
+                    SELECT COALESCE(AVG(EXTRACT(EPOCH FROM (end_time - created_at)) / 3600), 0)
+                    FROM markets WHERE creator = %s AND end_time IS NOT NULL AND created_at IS NOT NULL
+                """, (wallet,))
+                row = cur.fetchone()
+                if row:
+                    result["avg_market_duration_hours"] = round(float(row[0] or 0), 1)
+
+                # Theme breakdown
+                cur.execute("""
+                    SELECT theme, COUNT(*)
+                    FROM markets WHERE creator = %s AND theme IS NOT NULL
+                    GROUP BY theme ORDER BY COUNT(*) DESC
+                """, (wallet,))
+                result["themes"] = {r[0]: r[1] for r in cur.fetchall()}
+
+                # Question type breakdown
+                cur.execute("""
+                    SELECT f.question_type, COUNT(*)
+                    FROM market_fingerprints f
+                    JOIN markets m ON m.market_id = f.market_id
+                    WHERE m.creator = %s AND f.question_type IS NOT NULL
+                    GROUP BY f.question_type ORDER BY COUNT(*) DESC
+                """, (wallet,))
+                result["question_types"] = {r[0]: r[1] for r in cur.fetchall()}
+
+                # Sentiment breakdown
+                cur.execute("""
+                    SELECT f.sentiment_lean, COUNT(*)
+                    FROM market_fingerprints f
+                    JOIN markets m ON m.market_id = f.market_id
+                    WHERE m.creator = %s AND f.sentiment_lean IS NOT NULL
+                    GROUP BY f.sentiment_lean ORDER BY COUNT(*) DESC
+                """, (wallet,))
+                result["sentiments"] = {r[0]: r[1] for r in cur.fetchall()}
+
+    except Exception as e:
+        logger.error(f"error analyzing creator {wallet}: {e}")
+    set_cached(cache_key, result)
+    return result
+
+
+def analyze_market(market_id):
+    """Full analytics for a single market. Returns dict with scores, history, intel."""
+    market_id = str(market_id or "").strip()
+    cache_key = f"analytics:market:{market_id}"
+    cached = get_cached(cache_key)
+    if cached:
+        return cached
+    result = {
+        "market_id": market_id,
+        "volume": 0.0,
+        "participants": 0,
+        "comments": 0,
+        "likes": 0,
+        "controversy": 0.0,
+        "momentum": 0.0,
+        "badge": None,
+        "question_type": None,
+        "sentiment_lean": None,
+        "category": None,
+        "creator": None,
+        "title": None,
+        "final_volume": None,
+        "resolved": False,
+        "history": [],
+    }
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT title, creator, theme, resolved, final_volume
+                    FROM markets WHERE market_id = %s
+                """, (market_id,))
+                mrow = cur.fetchone()
+                if mrow:
+                    result["title"] = mrow[0]
+                    result["creator"] = mrow[1]
+                    result["category"] = mrow[2]
+                    result["resolved"] = mrow[3]
+                    result["final_volume"] = float(mrow[4]) if mrow[4] else None
+
+                cur.execute("""
+                    SELECT latest_volume, latest_participants, latest_controversy, badge
+                    FROM market_scores WHERE market_id = %s
+                """, (market_id,))
+                srow = cur.fetchone()
+                if srow:
+                    result["volume"] = float(srow[0] or 0)
+                    result["participants"] = int(srow[1] or 0)
+                    result["controversy"] = float(srow[2] or 0)
+                    result["badge"] = srow[3]
+
+                cur.execute("""
+                    SELECT COALESCE(MAX(comments), 0), COALESCE(MAX(likes), 0)
+                    FROM market_snapshots WHERE market_id = %s
+                """, (market_id,))
+                srow = cur.fetchone()
+                if srow:
+                    result["comments"] = int(srow[0] or 0)
+                    result["likes"] = int(srow[1] or 0)
+
+                # Momentum (volume change between last two snapshots)
+                cur.execute("""
+                    SELECT volume FROM market_snapshots
+                    WHERE market_id = %s ORDER BY snapshot_time DESC LIMIT 2
+                """, (market_id,))
+                snaps = [float(r[0]) for r in cur.fetchall()]
+                if len(snaps) == 2 and snaps[1] > 0:
+                    result["momentum"] = round((snaps[0] - snaps[1]) / snaps[1], 3)
+
+                # Fingerprints
+                cur.execute("""
+                    SELECT question_type, sentiment_lean, category
+                    FROM market_fingerprints WHERE market_id = %s
+                """, (market_id,))
+                frow = cur.fetchone()
+                if frow:
+                    result["question_type"] = frow[0]
+                    result["sentiment_lean"] = frow[1]
+
+                # Snapshot history (last 20)
+                cur.execute("""
+                    SELECT yes_pool, no_pool, volume, participants, comments, likes, snapshot_time
+                    FROM market_snapshots WHERE market_id = %s
+                    ORDER BY snapshot_time DESC LIMIT 20
+                """, (market_id,))
+                result["history"] = [
+                    {
+                        "yes_pool": float(r[0]), "no_pool": float(r[1]),
+                        "volume": float(r[2]), "participants": int(r[3]),
+                        "comments": int(r[4]), "likes": int(r[5]),
+                        "time": r[6].isoformat() if r[6] else None,
+                    }
+                    for r in cur.fetchall()
+                ]
+    except Exception as e:
+        logger.error(f"error analyzing market {market_id}: {e}")
+    set_cached(cache_key, result)
+    return result
+
+
+def analyze_category(theme, force_refresh=False):
+    """Aggregate analytics for a topic category. Returns dict of metrics."""
+    cache_key = f"analytics:category:{theme}"
+    if not force_refresh:
+        cached = get_cached(cache_key)
+        if cached:
+            return cached
+    result = {
+        "theme": theme,
+        "total_markets": 0,
+        "total_volume": 0.0,
+        "avg_volume": 0.0,
+        "median_volume": 0.0,
+        "peak_volume": 0.0,
+        "avg_participants": 0.0,
+        "avg_controversy": 0.0,
+        "total_comments": 0,
+        "avg_comments": 0.0,
+        "avg_market_duration_hours": 0.0,
+        "question_type_breakdown": {},
+        "sentiment_breakdown": {},
+        "top_creators": [],
+        "success_metrics": {},
+    }
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT COUNT(*), COALESCE(SUM(latest_volume), 0),
+                           COALESCE(AVG(latest_volume), 0),
+                           COALESCE(MAX(latest_volume), 0),
+                           COALESCE(AVG(latest_participants), 0),
+                           COALESCE(AVG(latest_controversy), 0)
+                    FROM market_scores ms
+                    JOIN markets m ON m.market_id = ms.market_id
+                    WHERE m.theme = %s
+                """, (theme,))
+                row = cur.fetchone()
+                if row:
+                    result["total_markets"] = row[0]
+                    result["total_volume"] = round(float(row[1] or 0), 2)
+                    result["avg_volume"] = round(float(row[2] or 0), 2)
+                    result["peak_volume"] = round(float(row[3] or 0), 2)
+                    result["avg_participants"] = round(float(row[4] or 0), 1)
+                    result["avg_controversy"] = round(float(row[5] or 0), 3)
+
+                # Median volume
+                cur.execute("""
+                    SELECT ms.latest_volume FROM market_scores ms
+                    JOIN markets m ON m.market_id = ms.market_id
+                    WHERE m.theme = %s AND ms.latest_volume > 0
+                """, (theme,))
+                volumes = [float(r[0]) for r in cur.fetchall() if r[0]]
+                if volumes:
+                    result["median_volume"] = round(statistics.median(volumes), 2)
+
+                # Comments
+                cur.execute("""
+                    SELECT COALESCE(SUM(s.comments), 0)
+                    FROM market_snapshots s
+                    JOIN markets m ON m.market_id = s.market_id
+                    WHERE m.theme = %s
+                """, (theme,))
+                row = cur.fetchone()
+                if row:
+                    result["total_comments"] = int(row[0] or 0)
+                    if result["total_markets"] > 0:
+                        result["avg_comments"] = round(result["total_comments"] / result["total_markets"], 1)
+
+                # Duration
+                cur.execute("""
+                    SELECT COALESCE(AVG(EXTRACT(EPOCH FROM (end_time - created_at)) / 3600), 0)
+                    FROM markets WHERE theme = %s AND end_time IS NOT NULL AND created_at IS NOT NULL
+                """, (theme,))
+                row = cur.fetchone()
+                if row:
+                    result["avg_market_duration_hours"] = round(float(row[0] or 0), 1)
+
+                # Question type breakdown
+                cur.execute("""
+                    SELECT f.question_type, COUNT(*)
+                    FROM market_fingerprints f
+                    JOIN markets m ON m.market_id = f.market_id
+                    WHERE m.theme = %s AND f.question_type IS NOT NULL
+                    GROUP BY f.question_type ORDER BY COUNT(*) DESC
+                """, (theme,))
+                result["question_type_breakdown"] = {r[0]: r[1] for r in cur.fetchall()}
+
+                # Sentiment breakdown
+                cur.execute("""
+                    SELECT f.sentiment_lean, COUNT(*)
+                    FROM market_fingerprints f
+                    JOIN markets m ON m.market_id = f.market_id
+                    WHERE m.theme = %s AND f.sentiment_lean IS NOT NULL
+                    GROUP BY f.sentiment_lean ORDER BY COUNT(*) DESC
+                """, (theme,))
+                result["sentiment_breakdown"] = {r[0]: r[1] for r in cur.fetchall()}
+
+                # Top creators by volume
+                cur.execute("""
+                    SELECT m.creator, SUM(ms.latest_volume) as vol
+                    FROM market_scores ms
+                    JOIN markets m ON m.market_id = ms.market_id
+                    WHERE m.theme = %s AND m.creator IS NOT NULL AND m.creator != ''
+                    GROUP BY m.creator ORDER BY vol DESC LIMIT 10
+                """, (theme,))
+                result["top_creators"] = [{"wallet": r[0], "volume": round(float(r[1]), 2)} for r in cur.fetchall()]
+
+                # Success metrics per category
+                cur.execute("""
+                    SELECT COUNT(*), COALESCE(AVG(final_volume), 0)
+                    FROM markets WHERE theme = %s AND resolved = true AND final_volume IS NOT NULL
+                """, (theme,))
+                row = cur.fetchone()
+                if row and row[0] > 0:
+                    result["success_metrics"]["resolved"] = row[0]
+                    result["success_metrics"]["avg_final_volume"] = round(float(row[1]), 2)
+
+    except Exception as e:
+        logger.error(f"error analyzing category {theme}: {e}")
+    set_cached(cache_key, result)
+    return result
+
+
+def analyze_question_patterns(force_refresh=False):
+    """Cross-market analysis of question patterns vs performance metrics.
+    Returns: opening word performance, word count buckets, question type performance, sentiment performance."""
+    cache_key = "analytics:question_patterns"
+    if not force_refresh:
+        cached = get_cached(cache_key)
+        if cached:
+            return cached
+    result = {
+        "opening_word_performance": [],
+        "word_count_buckets": [],
+        "question_type_performance": [],
+        "sentiment_performance": [],
+    }
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                # Opening word vs avg volume
+                cur.execute("""
+                    SELECT f.opening_word, COUNT(*) as cnt,
+                           COALESCE(AVG(ms.latest_volume), 0) as avg_vol,
+                           COALESCE(AVG(ms.latest_controversy), 0) as avg_cont,
+                           COALESCE(AVG(ms.latest_participants), 0) as avg_part
+                    FROM market_fingerprints f
+                    JOIN market_scores ms ON ms.market_id = f.market_id
+                    WHERE f.opening_word IS NOT NULL
+                    GROUP BY f.opening_word
+                    HAVING COUNT(*) >= 3
+                    ORDER BY avg_vol DESC LIMIT 20
+                """, ())
+                result["opening_word_performance"] = [
+                    {"word": r[0], "count": r[1], "avg_volume": round(float(r[2]), 2),
+                     "avg_controversy": round(float(r[3]), 3), "avg_participants": round(float(r[4]), 1)}
+                    for r in cur.fetchall()
+                ]
+
+                # Word count buckets
+                cur.execute("""
+                    SELECT
+                        CASE
+                            WHEN f.word_count <= 6 THEN 'short (1-6)'
+                            WHEN f.word_count <= 10 THEN 'medium (7-10)'
+                            WHEN f.word_count <= 15 THEN 'long (11-15)'
+                            WHEN f.word_count <= 20 THEN 'very_long (16-20)'
+                            else 'extreme (20+)'
+                        END as bucket,
+                        COUNT(*) as cnt,
+                        COALESCE(AVG(ms.latest_volume), 0) as avg_vol,
+                        COALESCE(AVG(ms.latest_controversy), 0) as avg_cont,
+                        COALESCE(AVG(ms.latest_participants), 0) as avg_part
+                    FROM market_fingerprints f
+                    JOIN market_scores ms ON ms.market_id = f.market_id
+                    GROUP BY bucket
+                    ORDER BY avg_vol DESC
+                """, ())
+                result["word_count_buckets"] = [
+                    {"bucket": r[0], "count": r[1], "avg_volume": round(float(r[2]), 2),
+                     "avg_controversy": round(float(r[3]), 3), "avg_participants": round(float(r[4]), 1)}
+                    for r in cur.fetchall()
+                ]
+
+                # Question type performance
+                cur.execute("""
+                    SELECT f.question_type, COUNT(*) as cnt,
+                           COALESCE(AVG(ms.latest_volume), 0) as avg_vol,
+                           COALESCE(AVG(ms.latest_controversy), 0) as avg_cont,
+                           COALESCE(AVG(ms.latest_participants), 0) as avg_part,
+                           COALESCE(AVG(ms.latest_volume) * COUNT(*), 0) as total_vol
+                    FROM market_fingerprints f
+                    JOIN market_scores ms ON ms.market_id = f.market_id
+                    WHERE f.question_type IS NOT NULL
+                    GROUP BY f.question_type
+                    ORDER BY total_vol DESC
+                """, ())
+                result["question_type_performance"] = [
+                    {"type": r[0], "count": r[1], "avg_volume": round(float(r[2]), 2),
+                     "avg_controversy": round(float(r[3]), 3), "avg_participants": round(float(r[4]), 1),
+                     "total_volume": round(float(r[5]), 2)}
+                    for r in cur.fetchall()
+                ]
+
+                # Sentiment performance
+                cur.execute("""
+                    SELECT f.sentiment_lean, COUNT(*) as cnt,
+                           COALESCE(AVG(ms.latest_volume), 0) as avg_vol,
+                           COALESCE(AVG(ms.latest_controversy), 0) as avg_cont,
+                           COALESCE(AVG(ms.latest_participants), 0) as avg_part
+                    FROM market_fingerprints f
+                    JOIN market_scores ms ON ms.market_id = f.market_id
+                    WHERE f.sentiment_lean IS NOT NULL
+                    GROUP BY f.sentiment_lean
+                    ORDER BY avg_vol DESC
+                """, ())
+                result["sentiment_performance"] = [
+                    {"sentiment": r[0], "count": r[1], "avg_volume": round(float(r[2]), 2),
+                     "avg_controversy": round(float(r[3]), 3), "avg_participants": round(float(r[4]), 1)}
+                    for r in cur.fetchall()
+                ]
+
+    except Exception as e:
+        logger.error(f"error analyzing question patterns: {e}")
+    set_cached(cache_key, result)
+    return result
+
+
+def calculate_success_metrics(force_refresh=False):
+    """Platform-wide success metrics. Volume distribution, threshold rates, category success."""
+    cache_key = "analytics:success_metrics"
+    if not force_refresh:
+        cached = get_cached(cache_key)
+        if cached:
+            return cached
+    result = {
+        "total_markets": 0,
+        "resolved_markets": 0,
+        "avg_final_volume": 0.0,
+        "median_final_volume": 0.0,
+        "peak_final_volume": 0.0,
+        "volume_distribution": {},
+        "threshold_rates": {},
+        "category_success": [],
+    }
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM markets")
+                result["total_markets"] = cur.fetchone()[0]
+
+                cur.execute("SELECT COUNT(*), COALESCE(AVG(final_volume), 0), COALESCE(MAX(final_volume), 0) FROM markets WHERE resolved = true AND final_volume IS NOT NULL")
+                row = cur.fetchone()
+                if row and row[0] > 0:
+                    result["resolved_markets"] = row[0]
+                    result["avg_final_volume"] = round(float(row[1]), 2)
+                    result["peak_final_volume"] = round(float(row[2]), 2)
+
+                # Median final volume
+                cur.execute("SELECT final_volume FROM markets WHERE resolved = true AND final_volume IS NOT NULL")
+                vols = [float(r[0]) for r in cur.fetchall()]
+                if vols:
+                    result["median_final_volume"] = round(statistics.median(vols), 2)
+
+                # Volume distribution buckets
+                thresholds = [100, 500, 1000, 2000, 5000, 10000, 25000, 50000]
+                for t in thresholds:
+                    cur.execute("SELECT COUNT(*) FROM markets WHERE final_volume >= %s AND resolved = true", (t,))
+                    cnt = cur.fetchone()[0]
+                    result["volume_distribution"][f"${t}+"] = cnt
+
+                # Threshold success rates
+                for t in [500, 1000, 2000, 5000]:
+                    if result["resolved_markets"] > 0:
+                        cur.execute("SELECT COUNT(*) FROM markets WHERE final_volume >= %s AND resolved = true", (t,))
+                        cnt = cur.fetchone()[0]
+                        result["threshold_rates"][f"${t}+"] = round(cnt / result["resolved_markets"], 3)
+
+                # Category success breakdown
+                cur.execute("""
+                    SELECT m.theme,
+                           COUNT(*) as total,
+                           COALESCE(AVG(m.final_volume), 0) as avg_vol,
+                           COALESCE(MAX(m.final_volume), 0) as peak_vol,
+                           COALESCE(AVG(ms.latest_controversy), 0) as avg_cont
+                    FROM markets m
+                    LEFT JOIN market_scores ms ON ms.market_id = m.market_id
+                    WHERE m.resolved = true AND m.final_volume IS NOT NULL
+                    GROUP BY m.theme
+                    ORDER BY avg_vol DESC
+                """, ())
+                result["category_success"] = [
+                    {"theme": r[0] or "other", "resolved": r[1],
+                     "avg_volume": round(float(r[2]), 2), "peak_volume": round(float(r[3]), 2),
+                     "avg_controversy": round(float(r[4]), 3)}
+                    for r in cur.fetchall()
+                ]
+
+    except Exception as e:
+        logger.error(f"error calculating success metrics: {e}")
+    set_cached(cache_key, result)
+    return result
+
+
+def rank_markets(sort_by="volume", limit=20):
+    """Rank markets by various metrics. Returns sorted list of market summaries."""
+    cache_key = f"analytics:rank:{sort_by}:{limit}"
+    cached = get_cached(cache_key)
+    if cached:
+        return cached
+    valid_sorts = {
+        "volume": "ms.latest_volume DESC",
+        "engagement": "(COALESCE(ms.latest_participants, 0) + COALESCE(ms.latest_volume, 0)) DESC",
+        "controversy": "ms.latest_controversy DESC",
+        "comments": "COALESCE((SELECT MAX(s.comments) FROM market_snapshots s WHERE s.market_id = m.market_id), 0) DESC",
+        "growth": "COALESCE((SELECT s1.volume - s2.volume FROM market_snapshots s1 JOIN market_snapshots s2 ON s2.market_id = s1.market_id AND s2.snapshot_time < s1.snapshot_time WHERE s1.market_id = m.market_id ORDER BY s1.snapshot_time DESC LIMIT 1), 0) DESC",
+        "balanced": "ABS(COALESCE(ms.latest_volume, 0) - 2000) ASC",
+        "one_sided": "ABS(COALESCE(ms.latest_volume, 0) - 2000) DESC",
+    }
+    order_clause = valid_sorts.get(sort_by, "ms.latest_volume DESC")
+    result = []
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(f"""
+                    SELECT m.market_id, m.title, m.theme, m.creator, m.resolved, m.final_volume,
+                           ms.latest_volume, ms.latest_participants, ms.latest_controversy, ms.badge
+                    FROM markets m
+                    JOIN market_scores ms ON ms.market_id = m.market_id
+                    WHERE ms.latest_volume > 0
+                    ORDER BY {order_clause}
+                    LIMIT %s
+                """, (limit,))
+                result = [
+                    {
+                        "market_id": r[0], "title": r[1], "theme": r[2], "creator": r[3],
+                        "resolved": r[4], "final_volume": float(r[5]) if r[5] else None,
+                        "volume": float(r[6] or 0), "participants": int(r[7] or 0),
+                        "controversy": round(float(r[8] or 0), 3), "badge": r[9],
+                    }
+                    for r in cur.fetchall()
+                ]
+    except Exception as e:
+        logger.error(f"error ranking markets by {sort_by}: {e}")
+    set_cached(cache_key, result)
+    return result
+
+
 def ingest_market(market):
     market_id = str(market.get("market_id", "")).strip()
     if not market_id:
@@ -2269,21 +2976,43 @@ def ingest_market(market):
                         ON CONFLICT (wallet_address) DO UPDATE SET
                             last_seen_at = NOW()
                     """, (creator,))
-                    cur.execute("""
-                        INSERT INTO creator_categories (wallet_address, theme, market_count)
-                        VALUES (%s, %s, 1)
-                        ON CONFLICT (wallet_address, theme) DO NOTHING
-                    """, (creator, theme))
+                cur.execute("""
+                    INSERT INTO creator_categories (wallet_address, theme, market_count)
+                    VALUES (%s, %s, 1)
+                    ON CONFLICT (wallet_address, theme) DO NOTHING
+                """, (creator, theme))
+
+                # ── Classify question type and sentiment ──
+                question_type = classify_question_type(title)
+                sentiment_lean = classify_sentiment(title)
+
                 cur.execute("""
                     INSERT INTO market_fingerprints (
                         market_id, opening_word, word_count, has_question_mark,
-                        is_yes_no, topic_tags, detected_keywords, category
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (market_id) DO NOTHING
+                        is_yes_no, topic_tags, detected_keywords, category,
+                        question_type, sentiment_lean
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (market_id) DO UPDATE SET
+                        question_type = EXCLUDED.question_type,
+                        sentiment_lean = EXCLUDED.sentiment_lean
                 """, (
                     market_id, opening_word, word_count, has_question,
                     is_yes_no, topic_tags, keywords, theme,
+                    question_type, sentiment_lean,
                 ))
+
+                # ── Market DNA snapshot for question pattern analytics ──
+                try:
+                    cur.execute("""
+                        INSERT INTO market_dna (market_id, title, question_type, sentiment_lean, category)
+                        VALUES (%s, %s, %s, %s, %s)
+                        ON CONFLICT (market_id) DO UPDATE SET
+                            question_type = EXCLUDED.question_type,
+                            sentiment_lean = EXCLUDED.sentiment_lean,
+                            category = EXCLUDED.category
+                    """, (market_id, title, question_type, sentiment_lean, theme))
+                except Exception:
+                    pass  # market_dna table may not exist yet
     except Exception as e:
         logger.error(f"error ingesting market {market_id}: {e}")
 
@@ -2342,6 +3071,31 @@ def snapshot_market(market_id, market):
                 ))
     except Exception as e:
         logger.error(f"error snapshotting market {market_id}: {e}")
+
+
+def capture_market_resolution(market_id, market_data):
+    """Store final volume when a market resolves. Used for success metrics analytics."""
+    market_id = str(market_id or "").strip()
+    if not market_id:
+        return
+    try:
+        yes_pool_raw = int(market_data.get("yes_pool") or 0)
+        no_pool_raw = int(market_data.get("no_pool") or 0)
+        yes_pool = yes_pool_raw / USDC_DIVISOR
+        no_pool = no_pool_raw / USDC_DIVISOR
+        final_volume = round(yes_pool + no_pool, 6)
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE markets SET final_volume = %s WHERE market_id = %s
+                """, (final_volume, market_id))
+                cur.execute("""
+                    INSERT INTO market_events (market_id, event_type, event_data)
+                    VALUES (%s, 'market_resolved', %s)
+                """, (market_id, json.dumps({"final_volume": final_volume})))
+        invalidate_cache("market:")
+    except Exception as e:
+        logger.error(f"error capturing resolution for {market_id}: {e}")
 
 
 def recalculate_creator_totals():
@@ -3792,6 +4546,7 @@ def check_scheduled_notifications():
                         notification_key=f"closed_{market_id}",
                         rich_html=build_rich_market_closed(title),
                     )
+                    capture_market_resolution(market_id, market_data)
                     update_market_flag(market_id, "notified_ended")
                     logger.info(f"ended notification sent for: {title}")
                     schedule_message_deletion(market_id, title)
