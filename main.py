@@ -2593,13 +2593,14 @@ def run_intelligence_pipeline(markets):
             logger.error(f"intelligence pipeline error for {market.get('market_id', '?')}: {e}")
 
 
-def create_market_keyboard(market_id, market_link, scope="new_market", context=None):
+def create_market_keyboard(market_id, market_link, scope="new_market", context=None, label=None):
     """create inline buttons for market notifications"""
     context = context or {}
     context.setdefault("market_id", market_id)
     context.setdefault("market_link", market_link)
     keyboard = types.InlineKeyboardMarkup()
-    keyboard.add(types.InlineKeyboardButton("Vote Now", url=market_link))
+    button_label = label or "Vote Now"
+    keyboard.add(types.InlineKeyboardButton(button_label, url=market_link))
     for button in get_custom_buttons(scope):
         keyboard.add(
             types.InlineKeyboardButton(
@@ -3792,11 +3793,12 @@ def check_scheduled_notifications():
                     # ── Featured Reminder Engine: Editor's Pick markets ──
                     if market_data.get("is_featured") and FEATURED_WALLETS:
                         market_link = market_data.get("market_link", build_market_link(market_id))
+                        featured_label = "⭐ Vote Now"
 
                         # 12-hour reminder (12h–6h window)
                         if hours_until <= 12.0 and hours_until > 6.0 and not market_data.get("notified_12h"):
                             notification, rich_fallback, _ = build_featured_reminder_card(title, market_id, time_until, market_link)
-                            keyboard = create_market_keyboard(market_id, market_link, scope="reminder_1h")
+                            keyboard = create_market_keyboard(market_id, market_link, scope="reminder_1h", label=featured_label)
                             broadcast_to_all(
                                 notification, market_id, keyboard,
                                 theme=raw_theme, notification_key=f"12h_{market_id}",
@@ -3808,7 +3810,7 @@ def check_scheduled_notifications():
                         # 6-hour reminder (6h–1h window)
                         elif hours_until <= 6.0 and hours_until > 1.0 and not market_data.get("notified_6h"):
                             notification, rich_fallback, _ = build_featured_reminder_card(title, market_id, time_until, market_link)
-                            keyboard = create_market_keyboard(market_id, market_link, scope="reminder_1h")
+                            keyboard = create_market_keyboard(market_id, market_link, scope="reminder_1h", label=featured_label)
                             broadcast_to_all(
                                 notification, market_id, keyboard,
                                 theme=raw_theme, notification_key=f"6h_{market_id}",
@@ -3820,7 +3822,7 @@ def check_scheduled_notifications():
                         # 1-hour reminder (1h–30m window)
                         elif hours_until <= 1.0 and minutes_until > 30.0 and not market_data.get("notified_1h"):
                             notification, rich_fallback, _ = build_featured_reminder_card(title, market_id, time_until, market_link)
-                            keyboard = create_market_keyboard(market_id, market_link, scope="reminder_1h")
+                            keyboard = create_market_keyboard(market_id, market_link, scope="reminder_1h", label=featured_label)
                             broadcast_to_all(
                                 notification, market_id, keyboard,
                                 theme=raw_theme, notification_key=f"1h_{market_id}",
@@ -3832,7 +3834,7 @@ def check_scheduled_notifications():
                         # 30-minute reminder (30m–10m window)
                         elif minutes_until <= 30.0 and minutes_until > 10.0 and not market_data.get("notified_30m"):
                             notification, rich_fallback, _ = build_featured_reminder_card(title, market_id, time_until, market_link)
-                            keyboard = create_market_keyboard(market_id, market_link, scope="reminder_10m")
+                            keyboard = create_market_keyboard(market_id, market_link, scope="reminder_10m", label=featured_label)
                             broadcast_to_all(
                                 notification, market_id, keyboard,
                                 theme=raw_theme, notification_key=f"30m_{market_id}",
@@ -3844,7 +3846,7 @@ def check_scheduled_notifications():
                         # 10-minute reminder (10m–0 window)
                         elif minutes_until <= 10.0 and not market_data.get("notified_5m"):
                             notification, rich_fallback, _ = build_featured_reminder_card(title, market_id, time_until, market_link)
-                            keyboard = create_market_keyboard(market_id, market_link, scope="reminder_10m")
+                            keyboard = create_market_keyboard(market_id, market_link, scope="reminder_10m", label=featured_label)
                             broadcast_to_all(
                                 notification, market_id, keyboard,
                                 theme=raw_theme, notification_key=f"10m_{market_id}",
