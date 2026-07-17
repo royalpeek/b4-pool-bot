@@ -2090,8 +2090,6 @@ def build_status_line(intel):
         parts.append(f"Volume +{intel['vol_growth']:.0f}%")
     if intel["comment_growth"] >= 20:
         parts.append(f"Comments +{intel['comment_growth']:.0f}%")
-    if intel["participants"] > 0:
-        parts.append(f"{intel['participants']} participants")
     if intel["controversy"] >= 0.4:
         parts.append("Controversial")
     if not parts:
@@ -2125,23 +2123,9 @@ def build_featured_reminder_card(title, market_id, seconds_until, market_link=No
         "",
         "━━━━━━━━━━━━━━━━",
         "",
+        f"⏰ {time_text} remaining",
+        "",
     ]
-
-    if intel["volume"] > 0:
-        lines.append(f"💰 Volume")
-        lines.append(f"${intel['volume']:,.2f}")
-        lines.append("")
-
-    if intel["participants"] > 0:
-        lines.append(f"👥 {intel['participants']} participants")
-        lines.append("")
-
-    if intel["comments"] > 0:
-        lines.append(f"💬 {intel['comments']} comments")
-        lines.append("")
-
-    lines.append(f"⏰ {time_text} remaining")
-    lines.append("")
 
     if dynamic_badges:
         badge_str = "  ".join(f"{e} {l}" for e, l in dynamic_badges)
@@ -2155,7 +2139,6 @@ def build_featured_reminder_card(title, market_id, seconds_until, market_link=No
         lines.append(f"Volume increased {intel['vol_growth']:.0f}% recently.")
         lines.append("Don't miss the discussion.")
     elif intel["volume"] > 0:
-        lines.append(f"${intel['volume']:,.2f} staked so far.")
         lines.append("Still enough time to influence the outcome.")
     else:
         teaser = get_random_teaser(sum(ord(c) for c in title) + int(hours))
@@ -2167,7 +2150,6 @@ def build_featured_reminder_card(title, market_id, seconds_until, market_link=No
         f"<h3>{escape_text(emoji)} {escape_text(heading)}</h3>"
         f"<h2>{escape_text(title)}</h2>"
         "<table>"
-        f"<tr><th>Volume</th><td>${intel['volume']:,.2f}</td></tr>"
         f"<tr><th>Time Left</th><td>{escape_text(time_text)}</td></tr>"
         f"<tr><th>Status</th><td>{escape_text(status_line)}</td></tr>"
         "</table>"
