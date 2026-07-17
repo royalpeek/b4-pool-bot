@@ -1356,8 +1356,8 @@ def send_temp_message(chat_id, text, reply_markup=None, parse_mode=None, reply_t
     return sent
 
 
-def reply_temp(message, text, reply_markup=None, parse_mode=None):
-    sent = bot.reply_to(message, text, reply_markup=reply_markup, parse_mode=parse_mode)
+def reply_temp(message, text, reply_markup=None, parse_mode=None, disable_web_page_preview=False):
+    sent = bot.reply_to(message, text, reply_markup=reply_markup, parse_mode=parse_mode, disable_web_page_preview=disable_web_page_preview)
     schedule_delete_message(message.chat.id, sent.message_id)
     try_delete_user_message(message)
     return sent
