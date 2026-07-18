@@ -50,7 +50,9 @@ NOTIFICATION_COOLDOWN_SECONDS = int(os.getenv("NOTIFICATION_COOLDOWN_SECONDS", "
 SEND_DELAY_SECONDS = float(os.getenv("SEND_DELAY_SECONDS", "0.1"))
 BROADCAST_WORKERS = max(1, int(os.getenv("BROADCAST_WORKERS", "4")))
 MARKET_POLL_SECONDS = float(os.getenv("MARKET_POLL_SECONDS", "1"))
-PUBLIC_ALERT_DELAY_SECONDS = float(os.getenv("PUBLIC_ALERT_DELAY_SECONDS", "45"))
+PUBLIC_ALERT_DELAY_SECONDS = float(os.getenv("PUBLIC_ALERT_DELAY_SECONDS", "90"))
+ENABLE_PUBLIC_10_MIN_REMINDER = os.getenv("ENABLE_PUBLIC_10_MIN_REMINDER", "false").lower() == "true"
+ENABLE_PUBLIC_FIRST_STAKER_ALERT = os.getenv("ENABLE_PUBLIC_FIRST_STAKER_ALERT", "false").lower() == "true"
 COVER_IMAGE_WAIT_SECONDS = float(os.getenv("COVER_IMAGE_WAIT_SECONDS", "8"))
 COVER_IMAGE_RETRY_SECONDS = float(os.getenv("COVER_IMAGE_RETRY_SECONDS", "1"))
 API_TIMEOUT_SECONDS = float(os.getenv("API_TIMEOUT_SECONDS", "6"))
@@ -3901,10 +3903,10 @@ def wait_for_market_cover_image(market_id, market):
     return None
 
 
-def build_market_promo_text(market):
+def build_market_promo_text(market, include_first_staker=True):
     lines = []
 
-    if market.get("first_staker_promo_available"):
+    if include_first_staker and market.get("first_staker_promo_available"):
         match_amount = market.get("first_staker_match_usdc")
         min_stake = market.get("first_staker_min_stake_usdc")
         if match_amount and min_stake:
@@ -3960,12 +3962,13 @@ def get_premium_market_heading(market):
     return "Premium Priority Alert"
 
 
-def build_market_template_context(market, ai_message=None):
+def build_market_template_context(market, ai_message=None, is_premium=False):
     market_id = str(market.get("market_id", "")).strip()
     raw_theme = normalize_theme(market.get("theme", "other"))
     end_time_unix = market.get("end_time")
     end_time = datetime.fromtimestamp(int(end_time_unix), tz=timezone.utc).replace(tzinfo=None) if end_time_unix else None
     go_live_at = get_market_go_live_at(market)
+    include_first_staker = is_premium or ENABLE_PUBLIC_FIRST_STAKER_ALERT
     context = {
         "market_id": market_id,
         "market_link": build_market_link(market_id) if market_id else "",
@@ -3974,22 +3977,23 @@ def build_market_template_context(market, ai_message=None):
         "raw_theme": escape_text(raw_theme),
         "close_time": escape_text(format_market_time(end_time) if end_time else ""),
         "go_live_time": escape_text(format_market_time(go_live_at) if go_live_at else ""),
-        "promo_text": escape_text(build_market_promo_text(market)),
+        "promo_text": escape_text(build_market_promo_text(market, include_first_staker=include_first_staker)),
         "ai_text": ai_message or "",
         "cover_image": escape_text(get_market_cover_image(market) or ""),
-        "first_staker_match_usdc": escape_text(market.get("first_staker_match_usdc", "")),
-        "first_staker_min_stake_usdc": escape_text(market.get("first_staker_min_stake_usdc", "")),
+        "first_staker_match_usdc": escape_text(market.get("first_staker_match_usdc", "")) if include_first_staker else "",
+        "first_staker_min_stake_usdc": escape_text(market.get("first_staker_min_stake_usdc", "")) if include_first_staker else "",
         "sponsor_match_count": escape_text(market.get("sponsor_match_count", "")),
     }
     return context
 
 
-def build_new_market_notification(market, ai_message):
+def build_new_market_notification(market, ai_message, is_premium=False):
     title = str(market.get("title", "")).strip()
     end_time_unix = market.get("end_time")
     end_time = datetime.fromtimestamp(int(end_time_unix), tz=timezone.utc).replace(tzinfo=None)
     end_time_str = format_market_time(end_time)
-    promo_text = build_market_promo_text(market)
+    include_first_staker = is_premium or ENABLE_PUBLIC_FIRST_STAKER_ALERT
+    promo_text = build_market_promo_text(market, include_first_staker=include_first_staker)
     body_text = ai_message or build_fast_market_cta(title, "new")
     featured = is_featured_creator(market)
 
@@ -4015,12 +4019,12 @@ def build_new_market_notification(market, ai_message):
     message += "\n\n"
     message += body_text
 
-    return render_template_text("new_market_text", build_market_template_context(market, body_text), message)
+    return render_template_text("new_market_text", build_market_template_context(market, body_text, is_premium=is_premium), message)
 
 
 def build_premium_priority_notification(market, ai_message):
     heading = get_premium_market_heading(market)
-    base = build_new_market_notification(market, ai_message)
+    base = build_new_market_notification(market, ai_message, is_premium=True)
     return (
         f"{custom_emoji('premium', '🛡')} <b>{escape_text(heading.upper())}</b>\n"
         "Premium first-hand notice.\n\n"
@@ -4094,12 +4098,13 @@ def build_rich_scheduled_market(market):
     return render_template_rich("scheduled_market_rich", build_market_template_context(market), fallback)
 
 
-def build_rich_new_market(market, ai_message, heading="New Market Live", cover_url=None):
+def build_rich_new_market(market, ai_message, heading="New Market Live", cover_url=None, is_premium=False):
     title = str(market.get("title", "")).strip()
     end_time_unix = market.get("end_time")
     end_time = datetime.fromtimestamp(int(end_time_unix), tz=timezone.utc).replace(tzinfo=None)
     cover_url = cover_url or get_market_cover_image(market)
-    promo_text = build_market_promo_text(market)
+    include_first_staker = is_premium or ENABLE_PUBLIC_FIRST_STAKER_ALERT
+    promo_text = build_market_promo_text(market, include_first_staker=include_first_staker)
     body_text = ai_message or build_fast_market_cta(title, "new")
     featured = is_featured_creator(market)
     if featured:
@@ -4120,7 +4125,7 @@ def build_rich_new_market(market, ai_message, heading="New Market Live", cover_u
         html_parts.append(f"<blockquote>{escape_text(promo_text)}</blockquote>")
     html_parts.append(f"<p>{body_text}</p>")
     fallback = "".join(html_parts)
-    return render_template_rich("new_market_rich", build_market_template_context(market, body_text), fallback)
+    return render_template_rich("new_market_rich", build_market_template_context(market, body_text, is_premium=is_premium), fallback)
 
 
 def build_rich_reminder(title, minutes_left, ai_message=None, urgent=False):
@@ -4216,7 +4221,7 @@ def build_rich_digest():
 
     boosted_items = ""
     for market in boosted[:5]:
-        promo_text = build_market_promo_text(market) or "Promo active"
+        promo_text = build_market_promo_text(market, include_first_staker=ENABLE_PUBLIC_FIRST_STAKER_ALERT) or "Promo active"
         boosted_items += (
             f"<li><b>{escape_text(market.get('title'))}</b><br/>"
             f"{escape_text(promo_text)}</li>"
@@ -4671,7 +4676,7 @@ def announce_live_market(market, existing=None):
 
     def send_public_alert():
         ai_message = generate_smart_notification(title, raw_theme, "new")
-        notification = build_new_market_notification(market, ai_message)
+        notification = build_new_market_notification(market, ai_message, is_premium=False)
         cover_image_url = wait_for_market_cover_image(market_id, market)
         if PUBLIC_ALERT_DELAY_SECONDS > 0:
             time.sleep(PUBLIC_ALERT_DELAY_SECONDS)
@@ -4682,7 +4687,7 @@ def announce_live_market(market, existing=None):
             theme=raw_theme,
             notification_key=f"public_new_{market_id}",
             photo_url=cover_image_url,
-            rich_html=build_rich_new_market(market, ai_message, cover_url=cover_image_url),
+            rich_html=build_rich_new_market(market, ai_message, cover_url=cover_image_url, is_premium=False),
             exclude_premium=True,
         )
 
@@ -4931,6 +4936,7 @@ def check_scheduled_notifications():
                                 notification, market_id, keyboard,
                                 theme=raw_theme, notification_key=f"10m_{market_id}",
                                 rich_html=rich_fallback,
+                                premium_only=not ENABLE_PUBLIC_10_MIN_REMINDER,
                             )
                             update_market_flag(market_id, "notified_5m")
                             logger.info(f"featured 10m reminder sent for: {title}")
@@ -4988,6 +4994,7 @@ def check_scheduled_notifications():
                             notification, market_id, keyboard,
                             theme=raw_theme, notification_key=f"10m_{market_id}",
                             rich_html=build_rich_reminder(title, 10, ai_message, urgent=True),
+                            premium_only=not ENABLE_PUBLIC_10_MIN_REMINDER,
                         )
                         update_market_flag(market_id, "notified_5m")
                         logger.info(f"10 minute reminder sent for: {title}")
