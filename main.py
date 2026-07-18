@@ -3903,7 +3903,7 @@ def wait_for_market_cover_image(market_id, market):
     return None
 
 
-def build_market_promo_text(market, include_first_staker=True):
+def build_market_promo_text(market, include_first_staker=True, include_sponsor=True):
     lines = []
 
     if include_first_staker and market.get("first_staker_promo_available"):
@@ -3916,10 +3916,11 @@ def build_market_promo_text(market, include_first_staker=True):
         else:
             lines.append("🎁 First-staker promo available")
 
-    sponsor_count = int(market.get("sponsor_match_count") or 0)
-    if sponsor_count > 0:
-        label = "sponsor boost" if sponsor_count == 1 else "sponsor boosts"
-        lines.append(f"🤝 {sponsor_count} {label} active")
+    if include_sponsor:
+        sponsor_count = int(market.get("sponsor_match_count") or 0)
+        if sponsor_count > 0:
+            label = "sponsor boost" if sponsor_count == 1 else "sponsor boosts"
+            lines.append(f"🤝 {sponsor_count} {label} active")
 
     return "\n".join(lines)
 
@@ -3977,12 +3978,12 @@ def build_market_template_context(market, ai_message=None, is_premium=False):
         "raw_theme": escape_text(raw_theme),
         "close_time": escape_text(format_market_time(end_time) if end_time else ""),
         "go_live_time": escape_text(format_market_time(go_live_at) if go_live_at else ""),
-        "promo_text": escape_text(build_market_promo_text(market, include_first_staker=include_first_staker)),
+        "promo_text": escape_text(build_market_promo_text(market, include_first_staker=include_first_staker, include_sponsor=is_premium)),
         "ai_text": ai_message or "",
         "cover_image": escape_text(get_market_cover_image(market) or ""),
         "first_staker_match_usdc": escape_text(market.get("first_staker_match_usdc", "")) if include_first_staker else "",
         "first_staker_min_stake_usdc": escape_text(market.get("first_staker_min_stake_usdc", "")) if include_first_staker else "",
-        "sponsor_match_count": escape_text(market.get("sponsor_match_count", "")),
+        "sponsor_match_count": escape_text(market.get("sponsor_match_count", "")) if is_premium else "",
     }
     return context
 
@@ -4605,6 +4606,7 @@ def build_premium_digest_text():
     return "\n".join(lines)
 
 def send_daily_summary_if_due():
+    return  # disabled — daily digest removed
     now = datetime.now(timezone.utc)
     if now.hour != DAILY_SUMMARY_UTC_HOUR:
         return
@@ -5379,12 +5381,7 @@ def admin_dashboard(message):
 @bot.message_handler(commands=['summary'])
 def summary_command(message):
     try:
-        save_user(message)
-        add_chat(
-            str(message.chat.id),
-            message.chat.title if message.chat.type != 'private' else f"user_{message.from_user.username or message.from_user.id}"
-        )
-        send_temp_rich(message.chat.id, build_rich_digest(), build_daily_summary_text())
+        reply_temp(message, "Digest is currently disabled.", parse_mode="HTML")
         try_delete_user_message(message)
     except Exception as e:
         logger.error(f"error in summary command: {e}")
@@ -5675,7 +5672,7 @@ def premium_digest_command(message):
         if not is_admin(message.from_user.id):
             reply_temp(message, "❌ Permission Denied. Admin Only Command")
             return
-        reply_temp(message, build_premium_digest_text(), parse_mode="HTML")
+        reply_temp(message, "Premium digest is currently disabled.", parse_mode="HTML")
     except Exception as e:
         logger.error(f"error in premium_digest: {e}")
 
@@ -6174,7 +6171,7 @@ try:
         telebot.types.BotCommand("status", "Check bot status"),
         telebot.types.BotCommand("liveending", "Show markets ending soon"),
         telebot.types.BotCommand("recent", "Show recent announced markets"),
-        telebot.types.BotCommand("summary", "Show daily market summary"),
+        telebot.types.BotCommand("summary", "Daily summary (disabled)"),
         telebot.types.BotCommand("preferences", "Choose market categories"),
         telebot.types.BotCommand("getmyid", "Get your telegram id"),
         telebot.types.BotCommand("featured", "Featured creator markets"),
@@ -6201,7 +6198,7 @@ try:
         telebot.types.BotCommand("setpremiumwallet", "Set USDC Solana payment address"),
         telebot.types.BotCommand("premium_remove", "Remove premium user or chat"),
         telebot.types.BotCommand("premium_users", "List premium users or chats"),
-        telebot.types.BotCommand("premium_digest", "Preview premium digest"),
+        telebot.types.BotCommand("premium_digest", "Premium digest (disabled)"),
         telebot.types.BotCommand("reset", "Reset all data"),
         telebot.types.BotCommand("cleanmessages", "Delete tracked messages only"),
         telebot.types.BotCommand("refreshlinks", "Refresh market button links"),
