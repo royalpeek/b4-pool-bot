@@ -4676,6 +4676,26 @@ def announce_live_market(market, existing=None):
         premium_filter=lambda chat_id: premium_chat_wants_market(chat_id, market),
     )
 
+    def send_premium_cover_image():
+        cover_image_url = get_market_cover_image(market)
+        if not cover_image_url:
+            cover_image_url = wait_for_market_cover_image(market_id, market)
+        if not cover_image_url:
+            return
+        broadcast_to_all(
+            f"🖼️ <b>{escape_text(title)}</b>",
+            market_id,
+            create_market_keyboard(market_id, build_market_link(market_id), scope="image_followup"),
+            theme=raw_theme,
+            notification_key=f"premium_cover_{market_id}",
+            premium_only=True,
+            premium_filter=lambda chat_id: premium_chat_wants_market(chat_id, market),
+            photo_url=cover_image_url,
+            rich_html=build_rich_image_followup(title, cover_image_url),
+        )
+
+    Thread(target=send_premium_cover_image, daemon=True).start()
+
     def send_public_alert():
         ai_message = generate_smart_notification(title, raw_theme, "new")
         notification = build_new_market_notification(market, ai_message, is_premium=False)
@@ -4938,7 +4958,6 @@ def check_scheduled_notifications():
                                 notification, market_id, keyboard,
                                 theme=raw_theme, notification_key=f"10m_{market_id}",
                                 rich_html=rich_fallback,
-                                premium_only=not ENABLE_PUBLIC_10_MIN_REMINDER,
                             )
                             update_market_flag(market_id, "notified_5m")
                             logger.info(f"featured 10m reminder sent for: {title}")
