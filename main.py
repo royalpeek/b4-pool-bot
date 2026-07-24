@@ -1793,31 +1793,154 @@ def schedule_message_deletion(market_id, title):
     delete_thread.start()
 
 
-def fetch_b4_markets():
-    try:
-        response = requests.get(
-            B4_API_URL,
-            params={"page": 1, "limit": API_PAGE_LIMIT, "_": int(time.time())},
-            headers={"Cache-Control": "no-cache", "Pragma": "no-cache"},
-            timeout=API_TIMEOUT_SECONDS,
-        )
-        response.raise_for_status()
-        data = response.json()
+# ── Market Provider Abstraction ────────────────────────────────────────────────
+# Decouples the notification engine from the data source.
+# When V2 endpoints become available, add a new provider without touching
+# the monitor loop, notification builders, or intelligence pipeline.
 
-        if isinstance(data, dict) and "markets" in data:
-            logger.info(f"fetched {len(data['markets'])} markets from api")
+class MarketProvider:
+    """Base class for market data providers."""
+
+    def fetch_active_markets(self):
+        """Return list of active market dicts.
+
+        Each market must include at minimum:
+            market_id, title, end_time, yes_pool, no_pool,
+            yes_votes, no_votes, creator, theme, hidden, resolved,
+            mechanics_version, go_live_at
+
+        Additional V2 fields (when available):
+            yes_weighted_pool, no_weighted_pool, yes_display_weight,
+            no_display_weight, reputation data, etc.
+        """
+        raise NotImplementedError
+
+    def health_check(self):
+        """Return True if provider is reachable."""
+        raise NotImplementedError
+
+
+class PublicAPIProvider(MarketProvider):
+    """Provider using the B4 public REST API (V1).
+
+    This is the current data source. The public API returns all active
+    markets with mechanics_version=1 and some pre-calculated V2 fields
+    (weighted pools) but no authenticated data.
+    """
+
+    def __init__(self, api_url=None, timeout=None, page_limit=None):
+        self.api_url = api_url or B4_API_URL
+        self.timeout = timeout or API_TIMEOUT_SECONDS
+        self.page_limit = page_limit or API_PAGE_LIMIT
+
+    def fetch_active_markets(self):
+        try:
+            response = requests.get(
+                self.api_url,
+                params={"page": 1, "limit": self.page_limit, "_": int(time.time())},
+                headers={"Cache-Control": "no-cache", "Pragma": "no-cache"},
+                timeout=self.timeout,
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            if isinstance(data, dict) and "markets" in data:
+                markets = data["markets"]
+            elif isinstance(data, list):
+                markets = data
+            else:
+                logger.error(f"unexpected api response: {data}")
+                return []
+
+            logger.info(f"fetched {len(markets)} markets from public api")
             set_bot_state("last_api_check", now_utc().isoformat())
-            return data["markets"]
-        elif isinstance(data, list):
-            logger.info(f"fetched {len(data)} markets from api")
-            set_bot_state("last_api_check", now_utc().isoformat())
-            return data
-        else:
-            logger.error(f"unexpected api response: {data}")
+            return markets
+
+        except Exception as e:
+            logger.error(f"error fetching b4 markets: {e}")
             return []
-    except Exception as e:
-        logger.error(f"error fetching b4 markets: {e}")
-        return []
+
+    def health_check(self):
+        try:
+            response = requests.get(
+                self.api_url,
+                params={"page": 1, "limit": 1},
+                timeout=5,
+            )
+            return response.status_code == 200
+        except Exception:
+            return False
+
+
+class V2Provider(MarketProvider):
+    """Placeholder for V2 authenticated API provider.
+
+    Activate this provider when:
+    1. APK analysis reveals the authenticated API endpoints
+    2. Auth tokens become available (via wallet session or admin setup)
+    3. V2-specific data fields are needed for new features
+
+    Implementation will require:
+    - Authentication token management (JWT/wallet signature)
+    - Token refresh mechanism
+    - V2-specific field parsing (reputation, display weights, etc.)
+    - WebSocket connection for real-time updates (optional)
+    """
+
+    def __init__(self, auth_token=None, api_url=None):
+        self.auth_token = auth_token
+        self.api_url = api_url  # Will be set from APK analysis
+        self._fallback = PublicAPIProvider()
+
+    def fetch_active_markets(self):
+        if not self.auth_token or not self.api_url:
+            logger.warning("v2 provider not configured, falling back to public api")
+            return self._fallback.fetch_active_markets()
+
+        # TODO: Implement V2 API calls here
+        # Example structure:
+        # headers = {
+        #     "Authorization": f"Bearer {self.auth_token}",
+        #     "X-App-Version": "2.0",
+        # }
+        # response = requests.get(
+        #     f"{self.api_url}/markets",
+        #     headers=headers,
+        #     params={"mechanics_version": 2, "limit": self.page_limit},
+        #     timeout=self.timeout,
+        # )
+        # return response.json()["markets"]
+
+        logger.warning("v2 provider not yet implemented, falling back to public api")
+        return self._fallback.fetch_active_markets()
+
+    def health_check(self):
+        if not self.auth_token or not self.api_url:
+            return False
+        # TODO: Implement V2 health check
+        return False
+
+
+# Active market provider — swap this to change data source
+# Set MARKET_PROVIDER env var to "public" (default) or "v2"
+_market_provider_name = os.getenv("MARKET_PROVIDER", "public").lower()
+if _market_provider_name == "v2":
+    active_market_provider = V2Provider(
+        auth_token=os.getenv("B4_AUTH_TOKEN"),
+        api_url=os.getenv("B4_V2_API_URL"),
+    )
+else:
+    active_market_provider = PublicAPIProvider()
+
+
+def fetch_b4_markets():
+    """Fetch active markets using the configured provider.
+
+    All callers should use this function — it delegates to the active
+    MarketProvider. To switch data sources, set MARKET_PROVIDER env var
+    or swap active_market_provider at runtime.
+    """
+    return active_market_provider.fetch_active_markets()
 
 
 def build_onchain_cover_url(market_id):
@@ -5231,6 +5354,7 @@ def monitor_b4_markets():
 
                 except Exception as e:
                     logger.error(f"error processing market: {e}")
+
 
             check_scheduled_notifications()
             try:
