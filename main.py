@@ -142,6 +142,30 @@ _RECENTLY_ANNOUNCED_MAX = 500
 _inflight_public_alerts: set = set()
 _inflight_premium_alerts: set = set()
 
+# Dry-run: evaluate pipeline + log decisions without Telegram delivery.
+NOTIFICATION_DRY_RUN = os.getenv("NOTIFICATION_DRY_RUN", "false").lower() == "true"
+COVER_LIVE_CACHE_SECONDS = float(os.getenv("COVER_LIVE_CACHE_SECONDS", "45"))
+INTELLIGENCE_EVERY_N_LOOPS = max(1, int(os.getenv("INTELLIGENCE_EVERY_N_LOOPS", "30")))
+HEARTBEAT_SECONDS = float(os.getenv("HEARTBEAT_SECONDS", "60"))
+STALL_CRITICAL_SECONDS = float(os.getenv("STALL_CRITICAL_SECONDS", "120"))
+
+# Cover HEAD cache: mid -> (is_live, status_code, expires_monotonic)
+_cover_live_cache: dict = {}
+# Monitor heartbeat for stall detection /health
+_MONITOR_HEARTBEAT = {
+    "started_at": 0.0,
+    "last_loop_at": 0.0,
+    "last_scan_at": 0.0,
+    "last_eval_at": 0.0,
+    "last_broadcast_at": 0.0,
+    "last_broadcast_sent": 0,
+    "loop_count": 0,
+    "markets_scanned": 0,
+    "notifications_evaluated": 0,
+    "notifications_sent": 0,
+    "last_skip_reasons": [],
+}
+
 
 class _CacheEntry:
     __slots__ = ("value", "expires_at")
@@ -519,12 +543,21 @@ def run_startup_reconciliation():
             except Exception as e:
                 logger.error(f"startup api reconcile error for {mid}: {e}")
 
-        # --- Phase C: clean stale DB rows + count stalled lifecycle markets ---
+        # --- Phase C: heal flags, clean stale rows, count stalls ---
         for mid in get_all_announced_market_ids():
             try:
                 existing = get_announced_market(mid)
                 if not existing or existing.get("notified_ended"):
                     continue
+
+                # HEAL: premium/public already done but notified_new false → reminders blocked.
+                if not existing.get("notified_new") and (
+                    existing.get("premium_notified_onchain") or existing.get("public_notified")
+                ):
+                    mark_market_live_for_reminders(mid)
+                    audit_log(mid, "startup_reconcile", "healed_notified_new", "premium/public already set")
+                    stats["reconciled"] += 1
+
                 api_market = api_by_id.get(mid)
                 onchain_market = onchain_by_id.get(mid)
                 if api_market and not is_market_active(api_market):
@@ -533,7 +566,6 @@ def run_startup_reconciliation():
                     stats["removed"] += 1
                     audit_log(mid, "startup_reconcile", "removed_hidden_or_expired")
                     continue
-                # Stalled: registered but missing premium while cover is live, or missing public while API-indexed
                 if not market_premium_already_notified(existing) and is_market_app_live(mid):
                     stats["stalled"] += 1
                 elif api_market and not market_public_already_notified(existing) and not is_scheduled_market(api_market):
@@ -687,31 +719,69 @@ def build_pipeline_diagnostics_text():
     if not stalled_text:
         stalled_text = "  (none)\n"
 
+    def _ago(ts):
+        if not ts:
+            return "never"
+        try:
+            age = time.time() - float(ts)
+            if age < 0:
+                return str(ts)
+            return f"{int(age)}s ago"
+        except Exception:
+            return str(ts)
+
+    hb = _MONITOR_HEARTBEAT
+    monitor_running = bool(hb.get("started_at")) and (
+        time.time() - float(hb.get("last_loop_at") or 0) < STALL_CRITICAL_SECONDS * 2
+        if hb.get("last_loop_at") else False
+    )
+    pending_public = sum(
+        1 for r in active_rows
+        if not market_public_already_notified(r) and not r.get("notified_ended")
+    )
+    pending_premium = sum(
+        1 for r in active_rows
+        if not market_premium_already_notified(r) and not r.get("notified_ended")
+    )
+    pending_reminders = sum(
+        1 for r in active_rows
+        if (r.get("notified_new") or r.get("premium_notified_onchain") or r.get("public_notified"))
+        and not r.get("notified_ended")
+        and not r.get("notified_1h")
+    )
+
     return (
         f"🔧 <b>Pipeline Diagnostics</b>\n\n"
         f"⏸️ Paused: <b>{'YES' if paused else 'NO'}</b>\n"
+        f"🧪 Dry-run: <b>{'YES' if NOTIFICATION_DRY_RUN else 'NO'}</b>\n"
         f"📡 On-chain provider: <b>{'enabled' if ONCHAIN_PROVIDER_ENABLED else 'DISABLED'}</b>\n"
         f"♻️ Last startup reconcile: <code>{escape_text(last_reconcile)}</code>\n\n"
+        f"<b>Scheduler / monitor</b>\n"
+        f"▶️ Running: <b>{'YES' if monitor_running else 'NO / STALLED'}</b>\n"
+        f"💓 Last loop: <code>{escape_text(_ago(hb.get('last_loop_at')))}</code>\n"
+        f"🔍 Last scan: <code>{escape_text(_ago(hb.get('last_scan_at')))}</code>\n"
+        f"🧠 Last eval: <code>{escape_text(_ago(hb.get('last_eval_at')))}</code>\n"
+        f"📤 Last broadcast: <code>{escape_text(_ago(hb.get('last_broadcast_at')))}</code> "
+        f"(sent {hb.get('last_broadcast_sent', 0)})\n"
+        f"🔁 Loops: <b>{hb.get('loop_count', 0)}</b> | Scanned last: <b>{hb.get('markets_scanned', 0)}</b>\n"
+        f"📊 Evals: <b>{hb.get('notifications_evaluated', 0)}</b> | Sends: <b>{hb.get('notifications_sent', 0)}</b>\n\n"
         f"<b>Live scans</b>\n"
         f"⛓️ On-chain active: <b>{onchain_count}</b>\n"
-        f"🟢 APP_LIVE (cover 200): <b>{app_live_count}</b>\n"
+        f"🟢 APP_LIVE (cover): <b>{app_live_count}</b>\n"
         f"🌐 API-indexed active: <b>{api_count}</b>\n\n"
-        f"<b>Notification DB (active rows)</b>\n"
-        f"📦 Tracked rows: <b>{len(active_rows)}</b> / {len(announced)} total\n"
-        f"🔍 Discovered / on-chain source: <b>{discovered}</b>\n"
-        f"🟢 APP_LIVE / premium-eligible: <b>{app_live_db}</b>\n"
-        f"🌐 API-indexed / public path: <b>{api_indexed_db}</b>\n"
-        f"💎 Premium flags set: <b>{premium_sent}</b>\n"
-        f"📢 Public flags set: <b>{public_sent}</b>\n\n"
+        f"<b>Notification DB (active)</b>\n"
+        f"📦 Rows: <b>{len(active_rows)}</b> / {len(announced)} total\n"
+        f"💎 Premium flags: <b>{premium_sent}</b> | pending: <b>{pending_premium}</b>\n"
+        f"📢 Public flags: <b>{public_sent}</b> | pending: <b>{pending_public}</b>\n"
+        f"⏰ Reminder-eligible (no 1h yet): <b>{pending_reminders}</b>\n\n"
         f"<b>Sent today (audit)</b>\n"
         f"💎 Premium-related: <b>{premium_today}</b>\n"
         f"📢 Public-related: <b>{public_today}</b>\n\n"
         f"<b>Stalled between stages</b>\n{stalled_text}\n"
         f"👥 Chats: {len(get_all_chats())} | Premium: {len(get_premium_chat_ids())} | Priority: {len(get_priority_chat_ids())}\n"
-        f"📈 Process metrics: {escape_text(metrics_str)}\n"
+        f"📈 Metrics: {escape_text(metrics_str)}\n"
         f"🔔 Last notification: <code>{escape_text(get_bot_state('last_notification_sent', 'never'))}</code>\n"
-        f"📌 Last market: <code>{escape_text(get_bot_state('last_market_detected', 'none'))}</code>\n"
-        f"🔗 Last on-chain: <code>{escape_text(get_bot_state('last_onchain_market_detected', 'none'))}</code>"
+        f"📌 Last market: <code>{escape_text(get_bot_state('last_market_detected', 'none'))}</code>"
     )
 
 
@@ -2195,6 +2265,27 @@ def broadcast_to_all(
             if premium_filter:
                 chats = [chat_id for chat_id in chats if str(chat_id) in priority_ids or premium_filter(chat_id)]
         chats = prioritize_chats(chats)
+        # de-dupe while preserving order
+        seen = set()
+        deduped = []
+        for c in chats:
+            sc = str(c)
+            if sc in seen:
+                continue
+            seen.add(sc)
+            deduped.append(c)
+        chats = deduped
+
+        if NOTIFICATION_DRY_RUN:
+            logger.info(
+                f"DRY_RUN broadcast key={notification_key} targets={len(chats)} "
+                f"premium_only={premium_only} exclude_premium={exclude_premium} market={market_id}"
+            )
+            if notification_key:
+                mark_notification_sent_key(notification_key)
+            # Treat dry-run as success so flags advance and pipeline can be verified.
+            return max(1, len(chats)) if chats else 1
+
         sent = 0
         priority_chats = [chat_id for chat_id in chats if str(chat_id) in priority_ids]
         regular_chats = [chat_id for chat_id in chats if str(chat_id) not in priority_ids]
@@ -2230,14 +2321,24 @@ def broadcast_to_all(
         if sent:
             set_bot_state("last_notification_sent", now_utc().isoformat())
             PIPELINE_METRICS["broadcasts_sent"] += sent
+            _MONITOR_HEARTBEAT["last_broadcast_at"] = time.time()
+            _MONITOR_HEARTBEAT["last_broadcast_sent"] = sent
+            _MONITOR_HEARTBEAT["notifications_sent"] = int(_MONITOR_HEARTBEAT.get("notifications_sent", 0)) + sent
             if notification_key:
                 mark_notification_sent_key(notification_key)
         if not sent and notification_key:
             PIPELINE_METRICS["broadcasts_failed"] += 1
-            logger.warning(f"broadcast to 0 chats: key={notification_key} premium_only={premium_only} exclude_premium={exclude_premium} total_chats={len(chats)}")
+            logger.warning(
+                f"broadcast to 0 chats: key={notification_key} premium_only={premium_only} "
+                f"exclude_premium={exclude_premium} total_chats={len(chats)} "
+                f"base={len(base_chats)} premium_pool={len(premium_ids) if premium_ids is not None else 'n/a'}"
+            )
             if market_id:
-                audit_log(market_id, "broadcast", "zero_sends", f"key={notification_key} chats={len(chats)} premium_only={premium_only}")
-        logger.info(f"broadcast sent to {sent} chats")
+                audit_log(
+                    market_id, "broadcast", "zero_sends",
+                    f"key={notification_key} chats={len(chats)} premium_only={premium_only} exclude_premium={exclude_premium}",
+                )
+        logger.info(f"broadcast sent to {sent} chats key={notification_key}")
         return sent
     except Exception as e:
         logger.error(f"error in broadcast_to_all: {e}")
@@ -4746,43 +4847,118 @@ def get_market_cover_image(market):
     return cover_url or None
 
 
-def check_cover_image_published(market_id):
-    """APP_LIVE / BACKEND_PROCESSED signal: cover image HEAD returns HTTP 200.
+def check_cover_image_published(market_id, use_cache=True):
+    """APP_LIVE signal: cover image HEAD returns HTTP 200.
 
-    This is the single validated backend-publication probe used across the pipeline.
+    Cached to avoid stalling the monitor loop with hundreds of HEAD calls.
     """
     market_id = str(market_id or "").strip()
     if not market_id:
         return False, 0
+
+    now_m = time.monotonic()
+    if use_cache:
+        cached = _cover_live_cache.get(market_id)
+        if cached and cached[2] > now_m:
+            return cached[0], cached[1]
+
     url = build_onchain_cover_url(market_id)
     try:
-        resp = requests.head(url, timeout=min(API_TIMEOUT_SECONDS, 10), allow_redirects=True)
-        return resp.status_code == 200, resp.status_code
+        resp = requests.head(url, timeout=min(API_TIMEOUT_SECONDS, 6), allow_redirects=True)
+        ok, code = resp.status_code == 200, resp.status_code
     except Exception as e:
         logger.debug(f"cover HEAD failed for {market_id}: {e}")
-        return False, 0
+        ok, code = False, 0
+
+    _cover_live_cache[market_id] = (ok, code, now_m + COVER_LIVE_CACHE_SECONDS)
+    # Bound cache size
+    if len(_cover_live_cache) > 2000:
+        expired = [k for k, v in _cover_live_cache.items() if v[2] <= now_m]
+        for k in expired[:500]:
+            _cover_live_cache.pop(k, None)
+    return ok, code
 
 
 def is_market_app_live(market_id, market=None):
     """True when the market is actionable in the app (cover image published).
 
-    API markets with cover_image_status=ready are trusted as APP_LIVE.
-    On-chain markets must pass the cover HEAD check — we never hardcode ready.
+    Trust API cover_image_status=ready (no network). On-chain uses cached HEAD.
     """
     market_id = str(market_id or (market or {}).get("market_id", "")).strip()
     if market:
         status = str(market.get("cover_image_status") or "").strip().lower()
         source = str(market.get("source") or "").strip().lower()
-        if status == "ready" and "api" in source:
-            return True
+        # Public API markets ship ready status — trust without HEAD (prevents loop stall).
         if status == "ready" and get_market_cover_image(market):
-            # Verify on-chain "ready" claims — decode path used to hardcode ready.
             if source == "onchain":
                 ok, _ = check_cover_image_published(market_id)
                 return ok
             return True
+        if status == "ready":
+            # Some API payloads mark ready without cover_image_url field populated yet.
+            if "api" in source or not source:
+                return True
     ok, _ = check_cover_image_published(market_id)
     return ok
+
+
+def log_pipeline_decision(market_id, stage, decision, reason=""):
+    """Structured skip/send decision log for production tracing."""
+    msg = f"PIPELINE [{stage}] market={market_id} decision={decision}"
+    if reason:
+        msg += f" reason={reason}"
+    if decision in ("send", "sent", "queued"):
+        logger.info(msg)
+    else:
+        logger.info(msg)
+    reasons = _MONITOR_HEARTBEAT.get("last_skip_reasons") or []
+    if decision.startswith("skip") or decision in ("waiting", "blocked"):
+        reasons.append(f"{market_id[:12]}:{stage}:{decision}:{reason[:80]}")
+        _MONITOR_HEARTBEAT["last_skip_reasons"] = reasons[-30:]
+    audit_log(market_id, stage, decision, reason[:200] if reason else None)
+
+
+def count_broadcast_targets(
+    theme=None,
+    premium_only=False,
+    exclude_premium=False,
+    premium_filter=None,
+):
+    """Count chats that would receive a broadcast (same filters as broadcast_to_all)."""
+    try:
+        priority_ids = get_priority_chat_ids()
+        premium_ids = set(get_premium_chat_ids()) if (premium_only or exclude_premium or premium_filter) else None
+        if premium_ids is not None:
+            premium_ids.update(priority_ids)
+        base_chats = list(get_all_chats())
+        if premium_only or premium_filter:
+            base_chats.extend(priority_ids)
+        chats = [
+            chat_id for chat_id in base_chats
+            if str(chat_id) in priority_ids or not theme or chat_wants_theme(chat_id, theme)
+        ]
+        if premium_ids is not None:
+            if premium_only:
+                chats = [chat_id for chat_id in chats if str(chat_id) in premium_ids]
+            if exclude_premium:
+                chats = [chat_id for chat_id in chats if str(chat_id) not in premium_ids]
+            if premium_filter:
+                chats = [chat_id for chat_id in chats if str(chat_id) in priority_ids or premium_filter(chat_id)]
+        # de-dupe
+        return len({str(c) for c in chats})
+    except Exception as e:
+        logger.error(f"count_broadcast_targets error: {e}")
+        return 0
+
+
+def mark_market_live_for_reminders(market_id):
+    """Allow time-based reminders once any live new-market path has completed.
+
+    ROOT CAUSE FIX: previously notified_new was only set after successful PUBLIC
+    send. When every subscriber is premium (exclude_premium → 0 chats), public
+    never succeeded, notified_new stayed false, and ALL reminders stopped.
+    """
+    update_market_flag(market_id, "notified_new")
 
 
 def wait_for_market_cover_image(market_id, market):
@@ -5767,6 +5943,14 @@ def send_premium_app_live_notification(market, existing=None):
     keyboard = create_market_keyboard(market_id, build_market_link(market_id), scope="new_market", context=context)
     photo_url = get_market_cover_image(market) or build_onchain_cover_url(market_id)
 
+    targets = count_broadcast_targets(theme=None, premium_only=True)
+    if targets <= 0 and not NOTIFICATION_DRY_RUN:
+        # No premium audience: do not leave claim stuck; do not block public path.
+        release_market_flag(market_id, "premium_notified_onchain")
+        log_pipeline_decision(market_id, "app_live", "skip_no_premium_audience", "premium_only targets=0")
+        PIPELINE_METRICS["onchain_skipped"] += 1
+        return False
+
     sent = broadcast_to_all(
         build_onchain_premium_notification(market),
         market_id,
@@ -5778,18 +5962,20 @@ def send_premium_app_live_notification(market, existing=None):
         rich_html=build_rich_onchain_premium_notification(market),
     )
     if sent:
+        # Critical: unlock reminders even if public audience is empty.
+        mark_market_live_for_reminders(market_id)
         _recently_announced_onchain.add(market_id)
         if len(_recently_announced_onchain) > _RECENTLY_ANNOUNCED_MAX:
             _recently_announced_onchain.clear()
         set_bot_state("last_onchain_market_detected", f"{market_id} | {title}")
         PIPELINE_METRICS["onchain_detected"] += 1
         PIPELINE_METRICS["onchain_announced"] += 1
-        audit_log(market_id, "app_live", "announced_premium", f"title={title[:50]}")
+        log_pipeline_decision(market_id, "app_live", "sent", f"premium targets~{targets} title={title[:40]}")
         logger.info(f"premium APP_LIVE market announced: {title}")
         return True
 
     release_market_flag(market_id, "premium_notified_onchain")
-    audit_log(market_id, "app_live", "broadcast_zero_sends", "will retry next cycle")
+    log_pipeline_decision(market_id, "app_live", "broadcast_zero_sends", "will retry next cycle")
     PIPELINE_METRICS["onchain_skipped"] += 1
     return False
 
@@ -5854,10 +6040,22 @@ def send_public_api_indexed_notification(market, existing=None):
         try:
             latest = get_announced_market(market_id)
             if market_public_already_notified(latest):
+                log_pipeline_decision(market_id, "api_indexed", "skip_already_public", "")
                 return
 
-            # Prepare payload before delay; claim only immediately before send so a
-            # restart during PUBLIC_ALERT_DELAY_SECONDS can still retry.
+            public_targets = count_broadcast_targets(theme=raw_theme, exclude_premium=True)
+            # If every subscriber is premium, public path has zero targets. Close the path
+            # so we stop retrying forever, and ensure reminders stay unlocked via notified_new.
+            if public_targets <= 0 and not NOTIFICATION_DRY_RUN:
+                if claim_market_flag(market_id, "public_notified"):
+                    mark_market_live_for_reminders(market_id)
+                    set_market_lifecycle_state(market_id, "api_indexed")
+                    log_pipeline_decision(
+                        market_id, "api_indexed", "skip_no_public_audience",
+                        "exclude_premium targets=0; marked complete so reminders work",
+                    )
+                return
+
             ai_message = generate_smart_notification(title, raw_theme, "new")
             notification = build_new_market_notification(market, ai_message, is_premium=False)
             cover_image_url = wait_for_market_cover_image(market_id, market)
@@ -5871,9 +6069,9 @@ def send_public_api_indexed_notification(market, existing=None):
                 return
 
             if not claim_market_flag(market_id, "public_notified"):
+                log_pipeline_decision(market_id, "api_indexed", "skip_claim_lost", "public_notified")
                 return
             claimed = True
-            update_market_flag(market_id, "notified_new")
             set_market_lifecycle_state(market_id, "api_indexed")
 
             sent = broadcast_to_all(
@@ -5887,23 +6085,23 @@ def send_public_api_indexed_notification(market, existing=None):
                 exclude_premium=True,
             )
             if sent:
-                audit_log(market_id, "api_indexed", "announced_public", f"title={title[:50]}")
+                mark_market_live_for_reminders(market_id)
+                log_pipeline_decision(market_id, "api_indexed", "sent", f"public targets~{public_targets} title={title[:40]}")
                 logger.info(f"public API_INDEXED market announced: {title}")
             else:
                 release_market_flag(market_id, "public_notified")
-                release_market_flag(market_id, "notified_new")
                 claimed = False
-                audit_log(market_id, "api_indexed", "public_broadcast_zero_sends", "will retry next cycle")
+                log_pipeline_decision(market_id, "api_indexed", "broadcast_zero_sends", "will retry next cycle")
         except Exception as e:
             logger.error(f"public alert thread failed for {market_id}: {e}")
             if claimed:
                 release_market_flag(market_id, "public_notified")
-                release_market_flag(market_id, "notified_new")
-            audit_log(market_id, "api_indexed", "public_thread_error", str(e)[:200])
+            log_pipeline_decision(market_id, "api_indexed", "public_thread_error", str(e)[:200])
         finally:
             _inflight_public_alerts.discard(market_id)
 
     Thread(target=send_public_alert, daemon=True).start()
+    log_pipeline_decision(market_id, "api_indexed", "queued", f"public delay={PUBLIC_ALERT_DELAY_SECONDS}s")
     return True
 
 
@@ -5967,8 +6165,13 @@ def announce_live_market(market, existing=None):
     # Premium at APP_LIVE — API markets with ready covers are APP_LIVE.
     if not premium_already:
         if is_market_app_live(market_id, market):
-            # Use API premium template for API-first markets; claim-protected.
-            if claim_market_flag(market_id, "premium_notified_onchain"):
+            premium_filter = lambda chat_id: premium_chat_wants_market(chat_id, market)
+            premium_targets = count_broadcast_targets(
+                theme=raw_theme, premium_only=True, premium_filter=premium_filter,
+            )
+            if premium_targets <= 0 and not NOTIFICATION_DRY_RUN:
+                log_pipeline_decision(market_id, "app_live", "skip_no_premium_audience", "api premium targets=0")
+            elif claim_market_flag(market_id, "premium_notified_onchain"):
                 premium_ai_message = generate_smart_notification(title, raw_theme, "new") if AI_ON_PREMIUM_FAST_ALERT else None
                 premium_notification = build_premium_priority_notification(market, premium_ai_message)
                 sent = broadcast_to_all(
@@ -5978,19 +6181,19 @@ def announce_live_market(market, existing=None):
                     theme=raw_theme,
                     notification_key=f"premium_new_{market_id}",
                     premium_only=True,
-                    premium_filter=lambda chat_id: premium_chat_wants_market(chat_id, market),
+                    premium_filter=premium_filter,
                 )
                 if sent:
+                    mark_market_live_for_reminders(market_id)
                     PIPELINE_METRICS["api_announced"] += 1
-                    audit_log(market_id, "app_live", "announced_premium_api", f"title={title[:50]}")
+                    log_pipeline_decision(market_id, "app_live", "sent", f"premium_api targets~{premium_targets}")
                 else:
                     release_market_flag(market_id, "premium_notified_onchain")
-                    audit_log(market_id, "app_live", "premium_api_zero_sends", "will retry")
+                    log_pipeline_decision(market_id, "app_live", "premium_api_zero_sends", "will retry")
             else:
-                audit_log(market_id, "app_live", "premium_claim_lost")
+                log_pipeline_decision(market_id, "app_live", "premium_claim_lost", "")
         else:
-            # Cover not ready — try onchain-style premium once cover appears.
-            audit_log(market_id, "api_detect", "premium_waiting_app_live")
+            log_pipeline_decision(market_id, "api_detect", "premium_waiting_app_live", "cover not ready")
 
     def send_premium_cover_image():
         try:
@@ -6076,32 +6279,64 @@ def announce_scheduled_market_to_premium(market):
 def monitor_b4_markets():
     global last_onchain_poll_at
     logger.info("b4 market monitoring thread started")
+    _MONITOR_HEARTBEAT["started_at"] = time.time()
     loop_count = 0
     WATCHDOG_INTERVAL = 300
+    last_heartbeat_log = 0.0
     while True:
         try:
+            loop_started = time.time()
+            _MONITOR_HEARTBEAT["last_loop_at"] = loop_started
+            _MONITOR_HEARTBEAT["loop_count"] = loop_count
+
             if get_pause_state():
                 logger.info("notifications paused, skipping check")
                 time.sleep(10)
                 continue
 
+            # Heartbeat + stall detector
+            if loop_started - last_heartbeat_log >= HEARTBEAT_SECONDS:
+                last_heartbeat_log = loop_started
+                stall_age = loop_started - (_MONITOR_HEARTBEAT.get("last_eval_at") or loop_started)
+                logger.info(
+                    "HEARTBEAT monitor alive loop=%s markets_last=%s evals=%s sends=%s "
+                    "last_broadcast=%s dry_run=%s",
+                    loop_count,
+                    _MONITOR_HEARTBEAT.get("markets_scanned", 0),
+                    _MONITOR_HEARTBEAT.get("notifications_evaluated", 0),
+                    _MONITOR_HEARTBEAT.get("notifications_sent", 0),
+                    _MONITOR_HEARTBEAT.get("last_broadcast_at") or "never",
+                    NOTIFICATION_DRY_RUN,
+                )
+                if _MONITOR_HEARTBEAT.get("last_eval_at") and stall_age > STALL_CRITICAL_SECONDS:
+                    logger.critical(
+                        "CRITICAL: notification evaluation stalled for %.0fs (threshold %.0fs)",
+                        stall_age, STALL_CRITICAL_SECONDS,
+                    )
+
             if loop_count == 0 or loop_count % 60 == 0:
                 _chats = len(get_all_chats())
                 _premium = len(get_premium_chat_ids())
                 _priority = len(get_priority_chat_ids())
-                logger.info(f"pipeline health: chats={_chats} premium={_premium} priority={_priority} paused=False onchain={ONCHAIN_PROVIDER_ENABLED}")
+                logger.info(
+                    f"pipeline health: chats={_chats} premium={_premium} priority={_priority} "
+                    f"paused=False onchain={ONCHAIN_PROVIDER_ENABLED} dry_run={NOTIFICATION_DRY_RUN}"
+                )
 
+            # On-chain discovery: at most a few premium HEAD checks per cycle (cached).
             if ONCHAIN_PROVIDER_ENABLED and time.time() - last_onchain_poll_at >= ONCHAIN_POLL_SECONDS:
                 last_onchain_poll_at = time.time()
-                for market in fetch_onchain_markets():
-                    try:
-                        if is_valid_market(market) and is_market_active(market):
-                            # Discovery → register; premium only after APP_LIVE (cover HEAD 200).
-                            announce_onchain_market_to_premium(market)
-                    except Exception as e:
-                        logger.error(f"error processing on-chain market: {e}")
+                try:
+                    for market in fetch_onchain_markets():
+                        try:
+                            if is_valid_market(market) and is_market_active(market):
+                                announce_onchain_market_to_premium(market)
+                        except Exception as e:
+                            logger.error(f"error processing on-chain market: {e}")
+                except Exception as e:
+                    logger.error(f"on-chain poll error: {e}")
 
-                # Retry premium for markets registered on-chain but still waiting on APP_LIVE.
+                # Retry a small batch of pending APP_LIVE premiums (HEAD is cached).
                 try:
                     pending_premium = [
                         row for row in get_all_announced_markets()
@@ -6109,11 +6344,9 @@ def monitor_b4_markets():
                         and not row.get("notified_ended")
                         and str(row.get("source") or "").startswith("onchain")
                     ]
-                    for row in pending_premium[:40]:
+                    for row in pending_premium[:8]:
                         mid = str(row.get("market_id", "")).strip()
-                        if not mid:
-                            continue
-                        if not is_market_app_live(mid):
+                        if not mid or not is_market_app_live(mid):
                             continue
                         end_unix = None
                         try:
@@ -6141,24 +6374,23 @@ def monitor_b4_markets():
                         send_premium_app_live_notification(synthetic, existing=row)
                 except Exception as e:
                     logger.error(f"error retrying pending APP_LIVE premium: {e}")
-            
+
             markets = fetch_b4_markets()
+            _MONITOR_HEARTBEAT["last_scan_at"] = time.time()
+            _MONITOR_HEARTBEAT["markets_scanned"] = len(markets)
             logger.info(f"processing {len(markets)} markets")
-            
+
             announced_markets = get_all_announced_markets()
             api_market_ids = set(str(m.get("market_id", "")).strip() for m in markets)
-            
+            api_by_id = {str(m.get("market_id", "")).strip(): m for m in markets}
+
             for announced in announced_markets:
                 announced_id = str(announced.get("market_id", "")).strip()
-                
                 if announced_id not in api_market_ids:
                     continue
-                
-                api_market = next((m for m in markets if str(m.get("market_id", "")).strip() == announced_id), None)
+                api_market = api_by_id.get(announced_id)
                 if not api_market:
                     continue
-                
-                # refresh stale end_time from API
                 api_end_unix = api_market.get("end_time")
                 if api_end_unix:
                     try:
@@ -6168,39 +6400,39 @@ def monitor_b4_markets():
                             update_announced_end_time(announced_id, api_end_iso)
                     except Exception:
                         pass
-                
                 if api_market.get("hidden", False) and not announced.get("notified_ended"):
                     logger.info(f"market {announced_id} is now hidden, cleaning up notifications")
                     delete_all_market_messages(announced_id)
                     delete_announced_market(announced_id)
-                    logger.info(f"removed hidden market {announced_id} from tracking")
 
+            evaluated = 0
             for market in markets:
                 try:
                     market_id = str(market.get("market_id", "")).strip()
-
                     if not market_id:
                         continue
 
                     if not is_valid_market(market):
                         PIPELINE_METRICS["api_skipped"] += 1
-                        audit_log(market_id, "api_detect", "skipped_invalid")
-                        logger.warning(f"skipped {market_id}: failed validation")
+                        log_pipeline_decision(market_id, "api_detect", "skip_invalid", "")
                         continue
 
                     if not is_market_active(market):
-                        end_time_unix = market.get("end_time")
                         PIPELINE_METRICS["api_skipped"] += 1
-                        audit_log(market_id, "api_detect", "skipped_inactive", f"end={end_time_unix} resolved={market.get('resolved')} hidden={market.get('hidden')}")
-                        logger.warning(f"skipped {market_id}: market not active (end_time: {end_time_unix}, resolved: {market.get('resolved')}, hidden: {market.get('hidden')})")
+                        log_pipeline_decision(
+                            market_id, "api_detect", "skip_inactive",
+                            f"resolved={market.get('resolved')} hidden={market.get('hidden')}",
+                        )
                         continue
 
+                    evaluated += 1
                     existing = get_announced_market(market_id)
                     if not existing:
                         if is_scheduled_market(market):
+                            log_pipeline_decision(market_id, "api_detect", "queued_scheduled", "")
                             announce_scheduled_market_to_premium(market)
                         else:
-                            # API_INDEXED path: premium (if needed) + delayed public.
+                            log_pipeline_decision(market_id, "api_detect", "queued_live", "new row")
                             announce_live_market(market)
                     elif is_scheduled_market(market):
                         reconcile_market_from_api(market, existing=existing)
@@ -6208,8 +6440,14 @@ def monitor_b4_markets():
                     elif (
                         not market_public_already_notified(existing)
                         or not market_premium_already_notified(existing)
+                        or not existing.get("notified_new")
                     ):
-                        # Retry incomplete notification paths (crash/restart safe).
+                        log_pipeline_decision(
+                            market_id, "api_detect", "retry_incomplete",
+                            f"premium={market_premium_already_notified(existing)} "
+                            f"public={market_public_already_notified(existing)} "
+                            f"notified_new={bool(existing.get('notified_new'))}",
+                        )
                         announce_live_market(market, existing=existing)
                     else:
                         reconcile_market_from_api(market, existing=existing)
@@ -6218,18 +6456,26 @@ def monitor_b4_markets():
                 except Exception as e:
                     logger.error(f"error processing market: {e}")
 
+            _MONITOR_HEARTBEAT["last_eval_at"] = time.time()
+            _MONITOR_HEARTBEAT["notifications_evaluated"] = (
+                int(_MONITOR_HEARTBEAT.get("notifications_evaluated", 0)) + evaluated
+            )
 
             check_scheduled_notifications()
-            try:
-                run_intelligence_pipeline(markets)
-                score_markets()
-                active_ids = [str(m.get("market_id", "")).strip() for m in markets if str(m.get("market_id", "")).strip()]
-                if active_ids:
-                    run_badge_engine(active_ids)
-                recalculate_creator_totals()
-                recalculate_creator_categories()
-            except Exception as e:
-                logger.error(f"intelligence pipeline error: {e}")
+
+            # Intelligence is secondary — never let it starve notification delivery.
+            if loop_count % INTELLIGENCE_EVERY_N_LOOPS == 0:
+                try:
+                    run_intelligence_pipeline(markets)
+                    score_markets()
+                    active_ids = [str(m.get("market_id", "")).strip() for m in markets if str(m.get("market_id", "")).strip()]
+                    if active_ids:
+                        run_badge_engine(active_ids)
+                    recalculate_creator_totals()
+                    recalculate_creator_categories()
+                except Exception as e:
+                    logger.error(f"intelligence pipeline error: {e}")
+
             send_daily_summary_if_due()
             loop_count += 1
             if loop_count % WATCHDOG_INTERVAL == 0:
@@ -6238,7 +6484,9 @@ def monitor_b4_markets():
                 except Exception as e:
                     logger.error(f"watchdog run error: {e}")
             log_pipeline_metrics()
-            time.sleep(MARKET_POLL_SECONDS)
+            elapsed = time.time() - loop_started
+            sleep_for = max(0.2, MARKET_POLL_SECONDS - elapsed) if elapsed < MARKET_POLL_SECONDS else 0.2
+            time.sleep(sleep_for)
 
         except Exception as e:
             logger.error(f"error in monitor_b4_markets: {e}")
@@ -6283,13 +6531,31 @@ def check_scheduled_notifications():
                             update_market_flag(market_id, "notified_go_live_2m")
                             logger.info(f"premium go-live reminder sent for: {title}")
 
-                if not market_data.get("notified_new"):
+                # Reminders require the market to have been live-announced at least once.
+                # Accept notified_new OR premium path (recovery for the flag regression).
+                if not (
+                    market_data.get("notified_new")
+                    or market_data.get("premium_notified_onchain")
+                    or market_data.get("public_notified")
+                ):
                     continue
 
-                end_time = datetime.fromisoformat(end_time_str)
+                # Heal stuck rows: premium/public already sent but notified_new still false.
+                if not market_data.get("notified_new") and (
+                    market_data.get("premium_notified_onchain") or market_data.get("public_notified")
+                ):
+                    mark_market_live_for_reminders(market_id)
+
+                if isinstance(end_time_str, datetime):
+                    end_time = end_time_str.replace(tzinfo=None) if end_time_str.tzinfo else end_time_str
+                else:
+                    end_time = datetime.fromisoformat(str(end_time_str).replace("Z", "+00:00")).replace(tzinfo=None)
                 time_until = (end_time - now).total_seconds()
 
-                logger.info(f"market: {title} | time_until: {time_until:.0f}s | notified_1h: {market_data.get('notified_1h')} | notified_5m: {market_data.get('notified_5m')}")
+                logger.info(
+                    f"market: {title} | time_until: {time_until:.0f}s | "
+                    f"notified_1h: {market_data.get('notified_1h')} | notified_5m: {market_data.get('notified_5m')}"
+                )
 
                 if time_until > 0:
                     hours_until = time_until / 3600
