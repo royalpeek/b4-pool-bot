@@ -138,6 +138,9 @@ else:
 last_onchain_poll_at = 0.0
 _recently_announced_onchain: set = set()
 _RECENTLY_ANNOUNCED_MAX = 500
+# In-flight guards: prevent spawning duplicate delayed public workers every poll cycle.
+_inflight_public_alerts: set = set()
+_inflight_premium_alerts: set = set()
 
 
 class _CacheEntry:
@@ -277,6 +280,18 @@ def init_db():
                 cur.execute("ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS premium_notified_onchain BOOLEAN DEFAULT FALSE")
                 cur.execute("ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS premium_lead_seconds INTEGER")
                 cur.execute("ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS metadata_json TEXT")
+                # public_notified: public new-market alert sent (API_INDEXED path).
+                # notified_new historically meant "announced"; we keep it in sync with
+                # public_notified for reminder gating, but never set it before a successful send.
+                cur.execute("ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS public_notified BOOLEAN DEFAULT FALSE")
+                cur.execute("ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS lifecycle_state TEXT DEFAULT 'discovered_onchain'")
+                cur.execute("ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS app_live_at TIMESTAMP")
+                # Backfill: markets already marked notified_new were fully announced under the old model.
+                cur.execute("""
+                    UPDATE announced_markets
+                    SET public_notified = TRUE
+                    WHERE notified_new = TRUE AND (public_notified IS NULL OR public_notified = FALSE)
+                """)
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS market_messages (
                         id SERIAL PRIMARY KEY,
@@ -414,69 +429,290 @@ def get_all_announced_market_ids():
 
 
 def run_startup_reconciliation():
+    """Full pipeline recovery on every boot.
+
+    1. Scan on-chain active markets
+    2. Scan APP_LIVE (cover HEAD 200)
+    3. Scan API-indexed markets
+    4. Compare with announced_markets notification DB
+    5. Automatically recover missed premium/public notifications
+    """
     try:
         logger.info("running startup reconciliation...")
-        announced_ids = get_all_announced_market_ids()
-        if not announced_ids:
-            logger.info("no announced markets to reconcile")
-            return
+        stats = {
+            "onchain_scanned": 0,
+            "api_scanned": 0,
+            "app_live": 0,
+            "registered": 0,
+            "premium_recovered": 0,
+            "public_recovered": 0,
+            "reconciled": 0,
+            "removed": 0,
+            "stalled": 0,
+        }
 
         api_markets = fetch_b4_markets()
-        api_by_id = {str(m.get("market_id", "")).strip(): m for m in api_markets}
+        api_by_id = {
+            str(m.get("market_id", "")).strip(): m
+            for m in api_markets
+            if str(m.get("market_id", "")).strip()
+        }
+        stats["api_scanned"] = len(api_by_id)
 
         onchain_markets = []
         if ONCHAIN_PROVIDER_ENABLED:
             onchain_markets = fetch_onchain_markets()
-        onchain_by_id = {str(m.get("market_id", "")).strip(): m for m in onchain_markets}
+        onchain_by_id = {
+            str(m.get("market_id", "")).strip(): m
+            for m in onchain_markets
+            if str(m.get("market_id", "")).strip() and is_valid_market(m) and is_market_active(m)
+        }
+        stats["onchain_scanned"] = len(onchain_by_id)
 
-        reconciled = 0
-        reannounced = 0
-        for mid in announced_ids:
+        # --- Phase A: register every live on-chain market, recover APP_LIVE premium ---
+        for mid, market in onchain_by_id.items():
+            try:
+                existing = ensure_announced_market_row(market, source="onchain")
+                stats["registered"] += 1 if existing else 0
+                if market_premium_already_notified(existing):
+                    continue
+                if is_market_app_live(mid, market):
+                    stats["app_live"] += 1
+                    if send_premium_app_live_notification(market, existing=existing):
+                        stats["premium_recovered"] += 1
+                        audit_log(mid, "startup_reconcile", "recovered_premium_app_live")
+                        PIPELINE_METRICS["reconciliation_caught"] += 1
+            except Exception as e:
+                logger.error(f"startup onchain reconcile error for {mid}: {e}")
+
+        # --- Phase B: API-indexed markets → public (+ premium if missed) ---
+        for mid, market in api_by_id.items():
+            try:
+                if not is_valid_market(market) or not is_market_active(market):
+                    continue
+                existing = get_announced_market(mid)
+                if is_scheduled_market(market):
+                    if not existing:
+                        announce_scheduled_market_to_premium(market)
+                        stats["registered"] += 1
+                    elif not existing.get("notified_scheduled"):
+                        announce_scheduled_market_to_premium(market)
+                        stats["public_recovered"] += 1
+                    else:
+                        reconcile_market_from_api(market, existing=existing)
+                        stats["reconciled"] += 1
+                    continue
+
+                needs_premium = not market_premium_already_notified(existing)
+                needs_public = not market_public_already_notified(existing)
+                if not existing or needs_premium or needs_public:
+                    announce_live_market(market, existing=existing)
+                    if needs_premium:
+                        stats["premium_recovered"] += 1
+                    if needs_public:
+                        stats["public_recovered"] += 1
+                    audit_log(mid, "startup_reconcile", "recovered_api_indexed", f"premium={needs_premium} public={needs_public}")
+                    PIPELINE_METRICS["reconciliation_caught"] += 1
+                else:
+                    reconcile_market_from_api(market, existing=existing)
+                    stats["reconciled"] += 1
+            except Exception as e:
+                logger.error(f"startup api reconcile error for {mid}: {e}")
+
+        # --- Phase C: clean stale DB rows + count stalled lifecycle markets ---
+        for mid in get_all_announced_market_ids():
             try:
                 existing = get_announced_market(mid)
-                if not existing:
+                if not existing or existing.get("notified_ended"):
                     continue
-
                 api_market = api_by_id.get(mid)
                 onchain_market = onchain_by_id.get(mid)
-
-                if existing.get("notified_ended"):
-                    continue
-
                 if api_market and not is_market_active(api_market):
-                    if not existing.get("notified_ended"):
-                        delete_all_market_messages(mid)
-                        delete_announced_market(mid)
-                        audit_log(mid, "startup_reconcile", "removed_hidden_or_expired")
+                    delete_all_market_messages(mid)
+                    delete_announced_market(mid)
+                    stats["removed"] += 1
+                    audit_log(mid, "startup_reconcile", "removed_hidden_or_expired")
                     continue
-
-                if api_market and not existing.get("notified_new") and not existing.get("is_scheduled"):
-                    if not is_scheduled_market(api_market):
-                        announce_live_market(api_market, existing=existing)
-                        reannounced += 1
-                        audit_log(mid, "startup_reconcile", "reannounced_live")
-                    elif not existing.get("notified_scheduled"):
-                        announce_scheduled_market_to_premium(api_market)
-                        reannounced += 1
-                        audit_log(mid, "startup_reconcile", "reannounced_scheduled")
-                    else:
-                        reconcile_market_from_api(api_market, existing=existing)
-                        reconciled += 1
-                        audit_log(mid, "startup_reconcile", "reconciled")
-                elif api_market:
-                    reconcile_market_from_api(api_market, existing=existing)
-                    reconciled += 1
-                elif not onchain_market:
-                    if existing.get("notified_ended"):
-                        continue
+                # Stalled: registered but missing premium while cover is live, or missing public while API-indexed
+                if not market_premium_already_notified(existing) and is_market_app_live(mid):
+                    stats["stalled"] += 1
+                elif api_market and not market_public_already_notified(existing) and not is_scheduled_market(api_market):
+                    stats["stalled"] += 1
+                elif not api_market and not onchain_market:
                     logger.warning(f"startup reconcile: market {mid} not in API or on-chain, keeping for now")
-
             except Exception as e:
-                logger.error(f"startup reconcile error for {mid}: {e}")
+                logger.error(f"startup cleanup error for {mid}: {e}")
 
-        logger.info(f"startup reconciliation done: {reconciled} reconciled, {reannounced} reannounced")
+        set_bot_state("last_startup_reconcile", now_utc().isoformat())
+        set_bot_state("last_startup_reconcile_stats", json.dumps(stats))
+        logger.info(
+            "startup reconciliation done: onchain=%s api=%s app_live=%s "
+            "premium_recovered=%s public_recovered=%s reconciled=%s removed=%s stalled=%s",
+            stats["onchain_scanned"], stats["api_scanned"], stats["app_live"],
+            stats["premium_recovered"], stats["public_recovered"],
+            stats["reconciled"], stats["removed"], stats["stalled"],
+        )
     except Exception as e:
         logger.error(f"startup reconciliation failed: {e}")
+
+
+def count_notifications_sent_today(stage_prefixes=None, statuses=None):
+    """Count pipeline_audit_log rows for today (UTC)."""
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT COUNT(*) FROM pipeline_audit_log
+                    WHERE created_at >= date_trunc('day', NOW() AT TIME ZONE 'UTC')
+                      AND (%s::text[] IS NULL OR stage = ANY(%s))
+                      AND (%s::text[] IS NULL OR status = ANY(%s))
+                    """,
+                    (stage_prefixes, stage_prefixes, statuses, statuses),
+                )
+                row = cur.fetchone()
+                return int(row[0] or 0) if row else 0
+    except Exception as e:
+        logger.debug(f"count_notifications_sent_today: {e}")
+        return 0
+
+
+def build_pipeline_diagnostics_text():
+    """Admin diagnostics: full notification + lifecycle pipeline snapshot."""
+    paused = get_pause_state()
+    announced = get_all_announced_markets()
+    active_rows = [m for m in announced if not m.get("notified_ended")]
+
+    onchain_count = 0
+    app_live_count = 0
+    api_count = 0
+    try:
+        if ONCHAIN_PROVIDER_ENABLED:
+            onchain_count = len([
+                m for m in fetch_onchain_markets()
+                if is_valid_market(m) and is_market_active(m)
+            ])
+    except Exception as e:
+        logger.warning(f"pipeline diag onchain scan failed: {e}")
+
+    try:
+        api_markets = [
+            m for m in fetch_b4_markets()
+            if is_valid_market(m) and is_market_active(m)
+        ]
+        api_count = len(api_markets)
+    except Exception as e:
+        logger.warning(f"pipeline diag api scan failed: {e}")
+        api_markets = []
+
+    discovered = 0
+    backendish = 0
+    app_live_db = 0
+    api_indexed_db = 0
+    premium_sent = 0
+    public_sent = 0
+    stalled = []
+
+    for row in active_rows:
+        mid = str(row.get("market_id", "")).strip()
+        source = str(row.get("source") or "")
+        life = str(row.get("lifecycle_state") or "discovered_onchain")
+        if source.startswith("onchain") or life == "discovered_onchain":
+            discovered += 1
+        if life in ("backend_processed", "app_live", "api_indexed"):
+            backendish += 1
+        if life in ("app_live", "api_indexed") or market_premium_already_notified(row):
+            app_live_db += 1
+        if life == "api_indexed" or "api" in source or market_public_already_notified(row):
+            api_indexed_db += 1
+        if market_premium_already_notified(row):
+            premium_sent += 1
+        if market_public_already_notified(row):
+            public_sent += 1
+
+        # Stalled between stages
+        if not market_premium_already_notified(row):
+            try:
+                if is_market_app_live(mid):
+                    stalled.append((mid, row.get("title") or "", "APP_LIVE but premium not sent"))
+                    app_live_count += 1
+            except Exception:
+                pass
+        if mid in {str(m.get("market_id", "")).strip() for m in api_markets}:
+            if not market_public_already_notified(row) and not row.get("is_scheduled"):
+                if not any(s[0] == mid for s in stalled):
+                    stalled.append((mid, row.get("title") or "", "API_INDEXED but public not sent"))
+
+    # Count live APP_LIVE among current on-chain that have cover
+    try:
+        if ONCHAIN_PROVIDER_ENABLED:
+            for m in fetch_onchain_markets():
+                mid = str(m.get("market_id", "")).strip()
+                if mid and is_market_app_live(mid, m):
+                    app_live_count += 1
+    except Exception:
+        pass
+
+    premium_today = 0
+    public_today = 0
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT status, COUNT(*) FROM pipeline_audit_log
+                    WHERE created_at >= date_trunc('day', NOW() AT TIME ZONE 'UTC')
+                      AND status IN (
+                        'announced_premium', 'announced_premium_api', 'recovered_premium_app_live',
+                        'announced_public', 'recovered_api_indexed', 'announced'
+                      )
+                    GROUP BY status
+                    """
+                )
+                for status, cnt in cur.fetchall() or []:
+                    status = str(status)
+                    if "premium" in status or status == "announced":
+                        premium_today += int(cnt or 0)
+                    if "public" in status or "api_indexed" in status:
+                        public_today += int(cnt or 0)
+    except Exception as e:
+        logger.debug(f"pipeline today counts: {e}")
+
+    metrics_str = ", ".join(f"{k}={v}" for k, v in PIPELINE_METRICS.items() if v > 0) or "none yet"
+    last_reconcile = get_bot_state("last_startup_reconcile", "never")
+
+    stalled_text = ""
+    for mid, title, reason in stalled[:8]:
+        stalled_text += f"  • {mid[:14]}… {(title or '')[:28]} — {reason}\n"
+    if not stalled_text:
+        stalled_text = "  (none)\n"
+
+    return (
+        f"🔧 <b>Pipeline Diagnostics</b>\n\n"
+        f"⏸️ Paused: <b>{'YES' if paused else 'NO'}</b>\n"
+        f"📡 On-chain provider: <b>{'enabled' if ONCHAIN_PROVIDER_ENABLED else 'DISABLED'}</b>\n"
+        f"♻️ Last startup reconcile: <code>{escape_text(last_reconcile)}</code>\n\n"
+        f"<b>Live scans</b>\n"
+        f"⛓️ On-chain active: <b>{onchain_count}</b>\n"
+        f"🟢 APP_LIVE (cover 200): <b>{app_live_count}</b>\n"
+        f"🌐 API-indexed active: <b>{api_count}</b>\n\n"
+        f"<b>Notification DB (active rows)</b>\n"
+        f"📦 Tracked rows: <b>{len(active_rows)}</b> / {len(announced)} total\n"
+        f"🔍 Discovered / on-chain source: <b>{discovered}</b>\n"
+        f"🟢 APP_LIVE / premium-eligible: <b>{app_live_db}</b>\n"
+        f"🌐 API-indexed / public path: <b>{api_indexed_db}</b>\n"
+        f"💎 Premium flags set: <b>{premium_sent}</b>\n"
+        f"📢 Public flags set: <b>{public_sent}</b>\n\n"
+        f"<b>Sent today (audit)</b>\n"
+        f"💎 Premium-related: <b>{premium_today}</b>\n"
+        f"📢 Public-related: <b>{public_today}</b>\n\n"
+        f"<b>Stalled between stages</b>\n{stalled_text}\n"
+        f"👥 Chats: {len(get_all_chats())} | Premium: {len(get_premium_chat_ids())} | Priority: {len(get_priority_chat_ids())}\n"
+        f"📈 Process metrics: {escape_text(metrics_str)}\n"
+        f"🔔 Last notification: <code>{escape_text(get_bot_state('last_notification_sent', 'never'))}</code>\n"
+        f"📌 Last market: <code>{escape_text(get_bot_state('last_market_detected', 'none'))}</code>\n"
+        f"🔗 Last on-chain: <code>{escape_text(get_bot_state('last_onchain_market_detected', 'none'))}</code>"
+    )
 
 
 def run_pipeline_watchdog(api_markets):
@@ -1169,13 +1405,25 @@ def custom_emoji(key, fallback):
 
 
 def can_send_notification(notification_key):
+    """Cooldown-only cooldown check. Does NOT claim the key.
+
+    Permanent dedup is owned by market notification flags (premium_notified_onchain,
+    public_notified, etc.). This only prevents rapid double-fires within a short window.
+    """
+    if not notification_key:
+        return True
     now_ts = time.time()
     last_sent = float(get_bot_state(f"last_sent_{notification_key}", "0") or 0)
     if now_ts - last_sent < NOTIFICATION_COOLDOWN_SECONDS:
         logger.warning(f"cooldown blocked notification {notification_key}")
         return False
-    set_bot_state(f"last_sent_{notification_key}", now_ts)
     return True
+
+
+def mark_notification_sent_key(notification_key):
+    if not notification_key:
+        return
+    set_bot_state(f"last_sent_{notification_key}", str(time.time()))
 
 
 def generate_smart_notification(title, theme, notification_type="new"):
@@ -1543,7 +1791,8 @@ def update_market_flag(market_id, flag):
     allowed_flags = {
         "notified_new", "notified_1h", "notified_5m", "notified_ended",
         "delete_scheduled", "notified_scheduled", "notified_go_live_2m",
-        "image_followup_sent", "notified_12h", "notified_6h", "notified_30m"
+        "image_followup_sent", "notified_12h", "notified_6h", "notified_30m",
+        "public_notified", "premium_notified_onchain",
     }
     if flag not in allowed_flags:
         logger.error(f"invalid market flag requested: {flag}")
@@ -1555,6 +1804,83 @@ def update_market_flag(market_id, flag):
                 cur.execute(f"UPDATE announced_markets SET {flag} = TRUE WHERE market_id = %s", (str(market_id),))
     except Exception as e:
         logger.error(f"error updating flag {flag} for market {market_id}: {e}")
+
+
+def claim_market_flag(market_id, flag):
+    """Atomically claim a boolean notification flag. Returns True if this caller won the claim.
+
+    Use claim → send → release-on-failure so a crash mid-send can retry.
+    """
+    allowed_flags = {
+        "notified_new", "notified_1h", "notified_5m", "notified_ended",
+        "delete_scheduled", "notified_scheduled", "notified_go_live_2m",
+        "image_followup_sent", "notified_12h", "notified_6h", "notified_30m",
+        "public_notified", "premium_notified_onchain",
+    }
+    if flag not in allowed_flags:
+        logger.error(f"invalid market flag claim requested: {flag}")
+        return False
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    UPDATE announced_markets
+                    SET {flag} = TRUE
+                    WHERE market_id = %s
+                      AND ({flag} IS NULL OR {flag} = FALSE)
+                    RETURNING market_id
+                    """,
+                    (str(market_id),),
+                )
+                return cur.fetchone() is not None
+    except Exception as e:
+        logger.error(f"error claiming flag {flag} for market {market_id}: {e}")
+        return False
+
+
+def release_market_flag(market_id, flag):
+    """Release a previously claimed flag so a later cycle can retry."""
+    allowed_flags = {
+        "notified_new", "notified_1h", "notified_5m", "notified_ended",
+        "delete_scheduled", "notified_scheduled", "notified_go_live_2m",
+        "image_followup_sent", "notified_12h", "notified_6h", "notified_30m",
+        "public_notified", "premium_notified_onchain",
+    }
+    if flag not in allowed_flags:
+        return
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"UPDATE announced_markets SET {flag} = FALSE WHERE market_id = %s",
+                    (str(market_id),),
+                )
+    except Exception as e:
+        logger.error(f"error releasing flag {flag} for market {market_id}: {e}")
+
+
+def set_market_lifecycle_state(market_id, state, app_live_at=None):
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                if app_live_at is not None:
+                    cur.execute(
+                        """
+                        UPDATE announced_markets
+                        SET lifecycle_state = %s,
+                            app_live_at = COALESCE(app_live_at, %s)
+                        WHERE market_id = %s
+                        """,
+                        (state, app_live_at, str(market_id)),
+                    )
+                else:
+                    cur.execute(
+                        "UPDATE announced_markets SET lifecycle_state = %s WHERE market_id = %s",
+                        (state, str(market_id)),
+                    )
+    except Exception as e:
+        logger.error(f"error setting lifecycle state for {market_id}: {e}")
 
 
 def update_announced_end_time(market_id, new_end_time):
@@ -1904,10 +2230,13 @@ def broadcast_to_all(
         if sent:
             set_bot_state("last_notification_sent", now_utc().isoformat())
             PIPELINE_METRICS["broadcasts_sent"] += sent
+            if notification_key:
+                mark_notification_sent_key(notification_key)
         if not sent and notification_key:
             PIPELINE_METRICS["broadcasts_failed"] += 1
+            logger.warning(f"broadcast to 0 chats: key={notification_key} premium_only={premium_only} exclude_premium={exclude_premium} total_chats={len(chats)}")
             if market_id:
-                audit_log(market_id, "broadcast", "zero_sends", f"key={notification_key} chats={len(chats)}")
+                audit_log(market_id, "broadcast", "zero_sends", f"key={notification_key} chats={len(chats)} premium_only={premium_only}")
         logger.info(f"broadcast sent to {sent} chats")
         return sent
     except Exception as e:
@@ -2191,7 +2520,8 @@ def decode_onchain_market_account(pubkey, encoded_data):
             "resolved": False,
             "is_private": False,
             "cover_image_url": build_onchain_cover_url(market_id),
-            "cover_image_status": "ready",
+            # Never hardcode ready — APP_LIVE is proven by cover HEAD 200.
+            "cover_image_status": "pending",
             "source": "onchain",
         }
     except Exception as e:
@@ -4416,21 +4746,71 @@ def get_market_cover_image(market):
     return cover_url or None
 
 
+def check_cover_image_published(market_id):
+    """APP_LIVE / BACKEND_PROCESSED signal: cover image HEAD returns HTTP 200.
+
+    This is the single validated backend-publication probe used across the pipeline.
+    """
+    market_id = str(market_id or "").strip()
+    if not market_id:
+        return False, 0
+    url = build_onchain_cover_url(market_id)
+    try:
+        resp = requests.head(url, timeout=min(API_TIMEOUT_SECONDS, 10), allow_redirects=True)
+        return resp.status_code == 200, resp.status_code
+    except Exception as e:
+        logger.debug(f"cover HEAD failed for {market_id}: {e}")
+        return False, 0
+
+
+def is_market_app_live(market_id, market=None):
+    """True when the market is actionable in the app (cover image published).
+
+    API markets with cover_image_status=ready are trusted as APP_LIVE.
+    On-chain markets must pass the cover HEAD check — we never hardcode ready.
+    """
+    market_id = str(market_id or (market or {}).get("market_id", "")).strip()
+    if market:
+        status = str(market.get("cover_image_status") or "").strip().lower()
+        source = str(market.get("source") or "").strip().lower()
+        if status == "ready" and "api" in source:
+            return True
+        if status == "ready" and get_market_cover_image(market):
+            # Verify on-chain "ready" claims — decode path used to hardcode ready.
+            if source == "onchain":
+                ok, _ = check_cover_image_published(market_id)
+                return ok
+            return True
+    ok, _ = check_cover_image_published(market_id)
+    return ok
+
+
 def wait_for_market_cover_image(market_id, market):
     cover_url = get_market_cover_image(market)
     if cover_url or COVER_IMAGE_WAIT_SECONDS <= 0:
-        return cover_url
+        # For on-chain hardcoded URLs, confirm the asset exists.
+        if cover_url and str((market or {}).get("source") or "").lower() == "onchain":
+            ok, _ = check_cover_image_published(market_id)
+            if ok:
+                return cover_url
+        elif cover_url:
+            return cover_url
 
     deadline = time.time() + COVER_IMAGE_WAIT_SECONDS
     while time.time() < deadline:
         time.sleep(COVER_IMAGE_RETRY_SECONDS)
+        ok, status = check_cover_image_published(market_id)
+        if ok:
+            url = build_onchain_cover_url(market_id)
+            logger.info(f"cover image ready for market {market_id} (HEAD {status})")
+            return url
         for latest_market in fetch_b4_markets():
             latest_id = str(latest_market.get("market_id", "")).strip()
             if latest_id != str(market_id):
                 continue
             cover_url = get_market_cover_image(latest_market)
             if cover_url:
-                logger.info(f"cover image ready for market {market_id}")
+                logger.info(f"cover image ready for market {market_id} via API")
                 return cover_url
             logger.info(
                 f"cover image not ready for market {market_id}; "
@@ -5281,81 +5661,258 @@ def mark_onchain_premium_notified(market_id):
         logger.error(f"error marking on-chain premium notification for {market_id}: {e}")
 
 
-def announce_onchain_market_to_premium(market):
+def ensure_announced_market_row(market, source="onchain", existing=None):
+    """Register a market in announced_markets without sending notifications.
+
+    Lifecycle starts at DISCOVERED_ONCHAIN. Notification flags stay false until
+    NotificationManager paths succeed.
+    """
     market_id = str(market.get("market_id", "")).strip()
     if not market_id:
-        return
+        return None
 
-    if market_id in _recently_announced_onchain:
-        PIPELINE_METRICS["onchain_skipped"] += 1
-        return
-
-    existing = get_announced_market(market_id)
-    if existing and existing.get("premium_notified_onchain"):
-        PIPELINE_METRICS["onchain_skipped"] += 1
-        audit_log(market_id, "onchain_detect", "skipped_already_premium_notified")
-        return
-    if existing and existing.get("notified_new"):
-        PIPELINE_METRICS["onchain_skipped"] += 1
-        audit_log(market_id, "onchain_detect", "skipped_already_announced")
-        return
+    existing = existing or get_announced_market(market_id)
+    if existing:
+        return existing
 
     title = str(market.get("title", "")).strip()
     raw_theme = normalize_theme(market.get("theme", "other"))
-    end_time = datetime.fromtimestamp(int(market.get("end_time")), tz=timezone.utc).replace(tzinfo=None)
+    end_time_unix = market.get("end_time")
+    end_time = datetime.fromtimestamp(int(end_time_unix), tz=timezone.utc).replace(tzinfo=None)
     detected_at = now_utc()
+    saved = save_announced_market(
+        market_id,
+        title,
+        raw_theme,
+        end_time.isoformat(),
+        notified_new=False,
+        is_scheduled=False,
+        go_live_at=get_market_go_live_at(market),
+        source=source,
+        market_pubkey=market.get("market_pubkey"),
+        cover_image_url=market.get("cover_image_url") or get_market_cover_image(market),
+        onchain_detected_at=detected_at if source == "onchain" else None,
+        api_detected_at=detected_at if source == "api" else None,
+        premium_notified_onchain=False,
+        metadata=market,
+        is_featured=is_featured_creator(market),
+    )
+    if not saved:
+        return get_announced_market(market_id)
 
+    set_market_lifecycle_state(market_id, "discovered_onchain")
+    return get_announced_market(market_id)
+
+
+def market_public_already_notified(existing):
     if not existing:
-        saved = save_announced_market(
-            market_id,
-            title,
-            raw_theme,
-            end_time.isoformat(),
-            notified_new=False,
-            is_scheduled=False,
-            go_live_at=get_market_go_live_at(market),
-            source="onchain",
-            market_pubkey=market.get("market_pubkey"),
-            cover_image_url=get_market_cover_image(market),
-            onchain_detected_at=detected_at,
-            premium_notified_onchain=False,
-            metadata=market,
-        )
-        if not saved:
-            existing = get_announced_market(market_id)
-            if existing and existing.get("premium_notified_onchain"):
-                PIPELINE_METRICS["onchain_skipped"] += 1
-                audit_log(market_id, "onchain_detect", "skipped_save_race", "save failed, re-fetched shows already notified")
-                return
+        return False
+    # Legacy rows used notified_new as the only public/announced flag.
+    return bool(existing.get("public_notified") or existing.get("notified_new"))
+
+
+def market_premium_already_notified(existing):
+    if not existing:
+        return False
+    return bool(existing.get("premium_notified_onchain"))
+
+
+def send_premium_app_live_notification(market, existing=None):
+    """NotificationManager: premium alert when lifecycle reaches APP_LIVE.
+
+    Only component path for premium new-market Telegram delivery for early markets.
+    Flags are claimed before send and released on failure so restarts can retry.
+    """
+    market_id = str(market.get("market_id", "")).strip()
+    if not market_id:
+        return False
+
+    if market_id in _recently_announced_onchain:
+        PIPELINE_METRICS["onchain_skipped"] += 1
+        return False
+
+    existing = existing or get_announced_market(market_id)
+    if market_premium_already_notified(existing):
+        PIPELINE_METRICS["onchain_skipped"] += 1
+        audit_log(market_id, "app_live", "skipped_already_premium_notified")
+        return False
+    if market_public_already_notified(existing) and market_premium_already_notified(existing):
+        PIPELINE_METRICS["onchain_skipped"] += 1
+        audit_log(market_id, "app_live", "skipped_already_announced")
+        return False
+
+    if not is_market_app_live(market_id, market):
+        audit_log(market_id, "app_live", "waiting_cover", "cover HEAD not 200 yet")
+        return False
+
+    title = str(market.get("title", "")).strip()
+    existing = ensure_announced_market_row(market, source=market.get("source") or "onchain", existing=existing)
+    if not existing:
+        PIPELINE_METRICS["onchain_skipped"] += 1
+        return False
+
+    if not claim_market_flag(market_id, "premium_notified_onchain"):
+        PIPELINE_METRICS["onchain_skipped"] += 1
+        audit_log(market_id, "app_live", "skipped_claim_lost")
+        return False
+
+    set_market_lifecycle_state(market_id, "app_live", app_live_at=now_utc())
+    # Prefer verified cover URL at APP_LIVE.
+    if not get_market_cover_image(market):
+        market = dict(market)
+        market["cover_image_url"] = build_onchain_cover_url(market_id)
+        market["cover_image_status"] = "ready"
 
     context = build_market_template_context(market)
     keyboard = create_market_keyboard(market_id, build_market_link(market_id), scope="new_market", context=context)
+    photo_url = get_market_cover_image(market) or build_onchain_cover_url(market_id)
+
     sent = broadcast_to_all(
         build_onchain_premium_notification(market),
         market_id,
         keyboard,
         theme=None,
         notification_key=f"onchain_premium_new_{market_id}",
-        photo_url=get_market_cover_image(market),
+        photo_url=photo_url,
         premium_only=True,
         rich_html=build_rich_onchain_premium_notification(market),
     )
     if sent:
-        mark_onchain_premium_notified(market_id)
         _recently_announced_onchain.add(market_id)
         if len(_recently_announced_onchain) > _RECENTLY_ANNOUNCED_MAX:
             _recently_announced_onchain.clear()
         set_bot_state("last_onchain_market_detected", f"{market_id} | {title}")
         PIPELINE_METRICS["onchain_detected"] += 1
         PIPELINE_METRICS["onchain_announced"] += 1
-        audit_log(market_id, "onchain_detect", "announced_premium", f"title={title[:50]}")
-        logger.info(f"premium on-chain market announced: {title}")
-    else:
-        audit_log(market_id, "onchain_detect", "broadcast_zero_sends", "will retry next cycle")
+        audit_log(market_id, "app_live", "announced_premium", f"title={title[:50]}")
+        logger.info(f"premium APP_LIVE market announced: {title}")
+        return True
+
+    release_market_flag(market_id, "premium_notified_onchain")
+    audit_log(market_id, "app_live", "broadcast_zero_sends", "will retry next cycle")
+    PIPELINE_METRICS["onchain_skipped"] += 1
+    return False
+
+
+def announce_onchain_market_to_premium(market):
+    """On-chain discovery entrypoint.
+
+    Registers the market at DISCOVERED_ONCHAIN, then only notifies premium when
+    the cover image proves APP_LIVE. Never marks premium_sent before a successful send.
+    """
+    market_id = str(market.get("market_id", "")).strip()
+    if not market_id:
+        return
+
+    existing = ensure_announced_market_row(market, source="onchain")
+    if market_premium_already_notified(existing):
         PIPELINE_METRICS["onchain_skipped"] += 1
+        audit_log(market_id, "onchain_detect", "skipped_already_premium_notified")
+        return
+    if market_public_already_notified(existing) and market_premium_already_notified(existing):
+        PIPELINE_METRICS["onchain_skipped"] += 1
+        audit_log(market_id, "onchain_detect", "skipped_already_announced")
+        return
+
+    # Discover only — premium wait for APP_LIVE.
+    if not is_market_app_live(market_id, market):
+        audit_log(market_id, "onchain_detect", "registered_waiting_app_live", f"title={(market.get('title') or '')[:50]}")
+        PIPELINE_METRICS["onchain_detected"] += 1
+        return
+
+    send_premium_app_live_notification(market, existing=existing)
+
+
+def send_public_api_indexed_notification(market, existing=None):
+    """NotificationManager: public alert after API_INDEXED, with configured delay.
+
+    Uses public_notified claim so restarts never permanently swallow the alert.
+    In-memory inflight set prevents one delayed worker per poll cycle.
+    """
+    market_id = str(market.get("market_id", "")).strip()
+    if not market_id:
+        return False
+
+    existing = existing or get_announced_market(market_id)
+    if market_public_already_notified(existing):
+        audit_log(market_id, "api_indexed", "skipped_public_already_notified")
+        return False
+
+    if market_id in _inflight_public_alerts:
+        audit_log(market_id, "api_indexed", "skipped_public_inflight")
+        return False
+
+    title = str(market.get("title", "")).strip()
+    raw_theme = normalize_theme(market.get("theme", "other"))
+    context = build_market_template_context(market, None)
+    keyboard = create_market_keyboard(market_id, build_market_link(market_id), scope="new_market", context=context)
+
+    _inflight_public_alerts.add(market_id)
+
+    def send_public_alert():
+        claimed = False
+        try:
+            latest = get_announced_market(market_id)
+            if market_public_already_notified(latest):
+                return
+
+            # Prepare payload before delay; claim only immediately before send so a
+            # restart during PUBLIC_ALERT_DELAY_SECONDS can still retry.
+            ai_message = generate_smart_notification(title, raw_theme, "new")
+            notification = build_new_market_notification(market, ai_message, is_premium=False)
+            cover_image_url = wait_for_market_cover_image(market_id, market)
+            if PUBLIC_ALERT_DELAY_SECONDS > 0:
+                time.sleep(PUBLIC_ALERT_DELAY_SECONDS)
+
+            latest = get_announced_market(market_id)
+            if market_public_already_notified(latest):
+                return
+            if latest and latest.get("notified_ended"):
+                return
+
+            if not claim_market_flag(market_id, "public_notified"):
+                return
+            claimed = True
+            update_market_flag(market_id, "notified_new")
+            set_market_lifecycle_state(market_id, "api_indexed")
+
+            sent = broadcast_to_all(
+                notification,
+                market_id,
+                keyboard,
+                theme=raw_theme,
+                notification_key=f"public_new_{market_id}",
+                photo_url=cover_image_url,
+                rich_html=build_rich_new_market(market, ai_message, cover_url=cover_image_url, is_premium=False),
+                exclude_premium=True,
+            )
+            if sent:
+                audit_log(market_id, "api_indexed", "announced_public", f"title={title[:50]}")
+                logger.info(f"public API_INDEXED market announced: {title}")
+            else:
+                release_market_flag(market_id, "public_notified")
+                release_market_flag(market_id, "notified_new")
+                claimed = False
+                audit_log(market_id, "api_indexed", "public_broadcast_zero_sends", "will retry next cycle")
+        except Exception as e:
+            logger.error(f"public alert thread failed for {market_id}: {e}")
+            if claimed:
+                release_market_flag(market_id, "public_notified")
+                release_market_flag(market_id, "notified_new")
+            audit_log(market_id, "api_indexed", "public_thread_error", str(e)[:200])
+        finally:
+            _inflight_public_alerts.discard(market_id)
+
+    Thread(target=send_public_alert, daemon=True).start()
+    return True
 
 
 def announce_live_market(market, existing=None):
+    """API_INDEXED path: premium (if not yet) + delayed public.
+
+    Never sets notified_new / public_notified before a successful public send.
+    Never sets premium_notified_onchain before a successful premium send.
+    """
     market_id = str(market.get("market_id", "")).strip()
     title = str(market.get("title", "")).strip()
     raw_theme = normalize_theme(market.get("theme", "other"))
@@ -5365,20 +5922,17 @@ def announce_live_market(market, existing=None):
     keyboard = create_market_keyboard(market_id, build_market_link(market_id), scope="new_market", context=context)
     featured = is_featured_creator(market)
 
-    premium_already_notified = bool(existing and existing.get("premium_notified_onchain"))
-
     if existing:
         reconcile_market_from_api(market, existing=existing)
-        update_market_flag(market_id, "notified_new")
         update_market_live_state(market_id, is_scheduled=False, go_live_at=get_market_go_live_at(market))
-        should_broadcast = True
+        existing = get_announced_market(market_id) or existing
     else:
-        should_broadcast = save_announced_market(
+        saved = save_announced_market(
             market_id,
             title,
             raw_theme,
             end_time.isoformat(),
-            notified_new=True,
+            notified_new=False,
             is_scheduled=False,
             go_live_at=get_market_go_live_at(market),
             source="api",
@@ -5388,72 +5942,86 @@ def announce_live_market(market, existing=None):
             metadata=market,
             is_featured=featured,
         )
+        if not saved:
+            existing = get_announced_market(market_id)
+            if not existing:
+                PIPELINE_METRICS["api_skipped"] += 1
+                audit_log(market_id, "api_detect", "skipped_save_failed")
+                return
+        else:
+            set_market_lifecycle_state(market_id, "api_indexed")
+            existing = get_announced_market(market_id)
 
-    if not should_broadcast:
-        PIPELINE_METRICS["api_skipped"] += 1
-        audit_log(market_id, "api_detect", "skipped_already_saved")
-        logger.info(f"market {market_id} was already reserved for announcement")
+    premium_already = market_premium_already_notified(existing)
+    public_already = market_public_already_notified(existing)
+
+    if premium_already and public_already:
+        PIPELINE_METRICS["api_reconciled"] += 1
+        audit_log(market_id, "api_detect", "already_fully_notified")
         return
 
     PIPELINE_METRICS["api_detected"] += 1
-    PIPELINE_METRICS["api_announced"] += 1
-    audit_log(market_id, "api_detect", "announced", f"title={title[:50]}")
+    audit_log(market_id, "api_detect", "processing", f"title={title[:50]} premium={premium_already} public={public_already}")
+    set_market_lifecycle_state(market_id, "api_indexed")
 
-    if not premium_already_notified:
-        premium_ai_message = generate_smart_notification(title, raw_theme, "new") if AI_ON_PREMIUM_FAST_ALERT else None
-        premium_notification = build_premium_priority_notification(market, premium_ai_message)
-        broadcast_to_all(
-            premium_notification,
-            market_id,
-            keyboard,
-            theme=raw_theme,
-            notification_key=f"premium_new_{market_id}",
-            premium_only=True,
-            premium_filter=lambda chat_id: premium_chat_wants_market(chat_id, market),
-        )
+    # Premium at APP_LIVE — API markets with ready covers are APP_LIVE.
+    if not premium_already:
+        if is_market_app_live(market_id, market):
+            # Use API premium template for API-first markets; claim-protected.
+            if claim_market_flag(market_id, "premium_notified_onchain"):
+                premium_ai_message = generate_smart_notification(title, raw_theme, "new") if AI_ON_PREMIUM_FAST_ALERT else None
+                premium_notification = build_premium_priority_notification(market, premium_ai_message)
+                sent = broadcast_to_all(
+                    premium_notification,
+                    market_id,
+                    keyboard,
+                    theme=raw_theme,
+                    notification_key=f"premium_new_{market_id}",
+                    premium_only=True,
+                    premium_filter=lambda chat_id: premium_chat_wants_market(chat_id, market),
+                )
+                if sent:
+                    PIPELINE_METRICS["api_announced"] += 1
+                    audit_log(market_id, "app_live", "announced_premium_api", f"title={title[:50]}")
+                else:
+                    release_market_flag(market_id, "premium_notified_onchain")
+                    audit_log(market_id, "app_live", "premium_api_zero_sends", "will retry")
+            else:
+                audit_log(market_id, "app_live", "premium_claim_lost")
+        else:
+            # Cover not ready — try onchain-style premium once cover appears.
+            audit_log(market_id, "api_detect", "premium_waiting_app_live")
 
     def send_premium_cover_image():
-        cover_image_url = get_market_cover_image(market)
-        if not cover_image_url:
-            cover_image_url = wait_for_market_cover_image(market_id, market)
-        if not cover_image_url:
-            return
-        broadcast_to_all(
-            f"🖼️ <b>{escape_text(title)}</b>",
-            market_id,
-            create_market_keyboard(market_id, build_market_link(market_id), scope="image_followup"),
-            theme=raw_theme,
-            notification_key=f"premium_cover_{market_id}",
-            premium_only=True,
-            premium_filter=lambda chat_id: premium_chat_wants_market(chat_id, market),
-            photo_url=cover_image_url,
-            rich_html=build_rich_image_followup(title, cover_image_url),
-        )
+        try:
+            cover_image_url = get_market_cover_image(market)
+            if not cover_image_url:
+                cover_image_url = wait_for_market_cover_image(market_id, market)
+            if not cover_image_url:
+                return
+            broadcast_to_all(
+                f"🖼️ <b>{escape_text(title)}</b>",
+                market_id,
+                create_market_keyboard(market_id, build_market_link(market_id), scope="image_followup"),
+                theme=raw_theme,
+                notification_key=f"premium_cover_{market_id}",
+                premium_only=True,
+                premium_filter=lambda chat_id: premium_chat_wants_market(chat_id, market),
+                photo_url=cover_image_url,
+                rich_html=build_rich_image_followup(title, cover_image_url),
+            )
+        except Exception as e:
+            logger.error(f"premium cover followup failed for {market_id}: {e}")
 
     Thread(target=send_premium_cover_image, daemon=True).start()
 
-    def send_public_alert():
-        ai_message = generate_smart_notification(title, raw_theme, "new")
-        notification = build_new_market_notification(market, ai_message, is_premium=False)
-        cover_image_url = wait_for_market_cover_image(market_id, market)
-        if PUBLIC_ALERT_DELAY_SECONDS > 0:
-            time.sleep(PUBLIC_ALERT_DELAY_SECONDS)
-        broadcast_to_all(
-            notification,
-            market_id,
-            keyboard,
-            theme=raw_theme,
-            notification_key=f"public_new_{market_id}",
-            photo_url=cover_image_url,
-            rich_html=build_rich_new_market(market, ai_message, cover_url=cover_image_url, is_premium=False),
-            exclude_premium=True,
-        )
+    if not public_already:
+        send_public_api_indexed_notification(market, existing=existing)
 
-    Thread(target=send_public_alert, daemon=True).start()
     set_bot_state("last_market_detected", f"{market_id} | {title}")
     if not get_market_cover_image(market):
         schedule_image_followup(market_id, title, raw_theme)
-    logger.info(f"new market announced: {title}")
+    logger.info(f"new market pipeline started: {title} (premium_done={premium_already} public_done={public_already})")
 
 
 def announce_scheduled_market_to_premium(market):
@@ -5517,14 +6085,62 @@ def monitor_b4_markets():
                 time.sleep(10)
                 continue
 
+            if loop_count == 0 or loop_count % 60 == 0:
+                _chats = len(get_all_chats())
+                _premium = len(get_premium_chat_ids())
+                _priority = len(get_priority_chat_ids())
+                logger.info(f"pipeline health: chats={_chats} premium={_premium} priority={_priority} paused=False onchain={ONCHAIN_PROVIDER_ENABLED}")
+
             if ONCHAIN_PROVIDER_ENABLED and time.time() - last_onchain_poll_at >= ONCHAIN_POLL_SECONDS:
                 last_onchain_poll_at = time.time()
                 for market in fetch_onchain_markets():
                     try:
                         if is_valid_market(market) and is_market_active(market):
+                            # Discovery → register; premium only after APP_LIVE (cover HEAD 200).
                             announce_onchain_market_to_premium(market)
                     except Exception as e:
                         logger.error(f"error processing on-chain market: {e}")
+
+                # Retry premium for markets registered on-chain but still waiting on APP_LIVE.
+                try:
+                    pending_premium = [
+                        row for row in get_all_announced_markets()
+                        if not market_premium_already_notified(row)
+                        and not row.get("notified_ended")
+                        and str(row.get("source") or "").startswith("onchain")
+                    ]
+                    for row in pending_premium[:40]:
+                        mid = str(row.get("market_id", "")).strip()
+                        if not mid:
+                            continue
+                        if not is_market_app_live(mid):
+                            continue
+                        end_unix = None
+                        try:
+                            et = row.get("end_time")
+                            if isinstance(et, datetime):
+                                end_unix = int(et.replace(tzinfo=timezone.utc).timestamp()) if et.tzinfo is None else int(et.timestamp())
+                            elif et:
+                                end_unix = int(datetime.fromisoformat(str(et).replace("Z", "+00:00")).timestamp())
+                        except Exception:
+                            end_unix = None
+                        if not end_unix:
+                            continue
+                        synthetic = {
+                            "market_id": mid,
+                            "title": row.get("title") or "",
+                            "theme": row.get("theme") or "other",
+                            "end_time": end_unix,
+                            "market_pubkey": row.get("market_pubkey"),
+                            "cover_image_url": row.get("cover_image_url") or build_onchain_cover_url(mid),
+                            "cover_image_status": "pending",
+                            "source": "onchain",
+                            "hidden": False,
+                            "resolved": False,
+                        }
+                        send_premium_app_live_notification(synthetic, existing=row)
+                except Exception as e:
+                    logger.error(f"error retrying pending APP_LIVE premium: {e}")
             
             markets = fetch_b4_markets()
             logger.info(f"processing {len(markets)} markets")
@@ -5584,8 +6200,16 @@ def monitor_b4_markets():
                         if is_scheduled_market(market):
                             announce_scheduled_market_to_premium(market)
                         else:
+                            # API_INDEXED path: premium (if needed) + delayed public.
                             announce_live_market(market)
-                    elif not existing.get("notified_new") and not is_scheduled_market(market):
+                    elif is_scheduled_market(market):
+                        reconcile_market_from_api(market, existing=existing)
+                        PIPELINE_METRICS["api_reconciled"] += 1
+                    elif (
+                        not market_public_already_notified(existing)
+                        or not market_premium_already_notified(existing)
+                    ):
+                        # Retry incomplete notification paths (crash/restart safe).
                         announce_live_market(market, existing=existing)
                     else:
                         reconcile_market_from_api(market, existing=existing)
@@ -6482,16 +7106,24 @@ def premiumlead_command(message):
         reply_temp(message, f"Error: {e}")
 
 
-@bot.message_handler(commands=['health'])
+@bot.message_handler(commands=['health', 'pipeline', 'pipelinestatus'])
 def health_command(message):
+    """Admin diagnostics: /health, /pipeline, /pipelinestatus (aliases)."""
     try:
         if not is_admin(message.from_user.id):
             reply_temp(message, "❌ Permission Denied. Admin Only Command")
             return
-        send_temp_rich(message.chat.id, build_rich_health(), get_health_text())
+        # Full pipeline snapshot (preferred). Falls back to classic health text if build fails.
+        try:
+            text = build_pipeline_diagnostics_text()
+            reply_temp(message, text, parse_mode="HTML")
+        except Exception as e:
+            logger.error(f"pipeline diagnostics failed, using classic health: {e}")
+            send_temp_rich(message.chat.id, build_rich_health(), get_health_text())
         try_delete_user_message(message)
     except Exception as e:
-        logger.error(f"error in health: {e}")
+        logger.error(f"error in health/pipeline: {e}")
+        reply_temp(message, f"❌ Error: {e}")
 
 @bot.message_handler(commands=['recent'])
 def recent_command(message):
@@ -6998,7 +7630,8 @@ try:
         telebot.types.BotCommand("resume", "Resume notifications"),
         telebot.types.BotCommand("test", "Send test notification"),
         telebot.types.BotCommand("preview", "Preview latest market alert"),
-        telebot.types.BotCommand("health", "Show bot health"),
+        telebot.types.BotCommand("health", "Pipeline diagnostics"),
+        telebot.types.BotCommand("pipeline", "Pipeline diagnostics"),
         telebot.types.BotCommand("premium_add", "Add premium user or chat"),
         telebot.types.BotCommand("setpremiumwallet", "Set USDC Solana payment address"),
         telebot.types.BotCommand("premium_remove", "Remove premium user or chat"),
