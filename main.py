@@ -4820,12 +4820,12 @@ def get_premium_lead_report_text():
     min_lead = stats.get("min_lead")
     max_lead = stats.get("max_lead")
     lines = [
-        f"{custom_emoji('premium', '*')} <b>Premium Lead-Time Report</b>",
+        "<b>Premium Lead-Time Report</b>",
         "",
-        f"Reconciled markets: <b>{count}</b>",
-        f"Average advantage: <b>{average if average is not None else 'n/a'}s</b>",
-        f"Minimum advantage: <b>{min_lead if min_lead is not None else 'n/a'}s</b>",
-        f"Maximum advantage: <b>{max_lead if max_lead is not None else 'n/a'}s</b>",
+        f"Reconciled markets: <b>{escape_text(count)}</b>",
+        f"Average advantage: <b>{escape_text(average if average is not None else 'n/a')}s</b>",
+        f"Minimum advantage: <b>{escape_text(min_lead if min_lead is not None else 'n/a')}s</b>",
+        f"Maximum advantage: <b>{escape_text(max_lead if max_lead is not None else 'n/a')}s</b>",
     ]
     if recent:
         lines.append("\n<b>Recent measured markets</b>")
