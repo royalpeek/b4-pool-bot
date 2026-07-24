@@ -136,6 +136,8 @@ else:
     logger.warning("ai not configured, using template notifications")
 
 last_onchain_poll_at = 0.0
+_recently_announced_onchain: set = set()
+_RECENTLY_ANNOUNCED_MAX = 500
 
 
 class _CacheEntry:
@@ -336,10 +338,198 @@ def init_db():
                     WHERE market_link IS NULL
                        OR market_link NOT LIKE %s
                 """, (MARKET_LINK_BASE, f"{MARKET_LINK_BASE}/%"))
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS pipeline_audit_log (
+                        id SERIAL PRIMARY KEY,
+                        market_id TEXT,
+                        stage TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        detail TEXT,
+                        created_at TIMESTAMP DEFAULT NOW()
+                    )
+                """)
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_audit_market_id
+                    ON pipeline_audit_log (market_id)
+                """)
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_audit_created_at
+                    ON pipeline_audit_log (created_at)
+                """)
         logger.info("database tables ready")
     except Exception as e:
         logger.error(f"error initialising database: {e}")
         raise
+
+
+def audit_log(market_id, stage, status, detail=None):
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO pipeline_audit_log (market_id, stage, status, detail) VALUES (%s, %s, %s, %s)",
+                    (str(market_id) if market_id else None, stage, status, detail),
+                )
+    except Exception as e:
+        logger.error(f"audit log error [{stage}]: {e}")
+
+
+PIPELINE_METRICS = {
+    "onchain_detected": 0,
+    "onchain_announced": 0,
+    "onchain_skipped": 0,
+    "api_detected": 0,
+    "api_announced": 0,
+    "api_reconciled": 0,
+    "api_skipped": 0,
+    "broadcasts_sent": 0,
+    "broadcasts_failed": 0,
+    "watchdog_caught": 0,
+    "reconciliation_caught": 0,
+}
+METRICS_LOG_INTERVAL = 60
+_last_metrics_log = 0
+
+
+def log_pipeline_metrics():
+    global _last_metrics_log
+    now = time.time()
+    if now - _last_metrics_log < METRICS_LOG_INTERVAL:
+        return
+    _last_metrics_log = now
+    parts = [f"{k}={v}" for k, v in PIPELINE_METRICS.items() if v > 0]
+    if parts:
+        logger.info(f"pipeline metrics: {', '.join(parts)}")
+
+
+def get_all_announced_market_ids():
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT market_id FROM announced_markets")
+                return set(row[0] for row in cur.fetchall())
+    except Exception as e:
+        logger.error(f"error fetching announced market IDs: {e}")
+        return set()
+
+
+def run_startup_reconciliation():
+    try:
+        logger.info("running startup reconciliation...")
+        announced_ids = get_all_announced_market_ids()
+        if not announced_ids:
+            logger.info("no announced markets to reconcile")
+            return
+
+        api_markets = fetch_b4_markets()
+        api_by_id = {str(m.get("market_id", "")).strip(): m for m in api_markets}
+
+        onchain_markets = []
+        if ONCHAIN_PROVIDER_ENABLED:
+            onchain_markets = fetch_onchain_markets()
+        onchain_by_id = {str(m.get("market_id", "")).strip(): m for m in onchain_markets}
+
+        reconciled = 0
+        reannounced = 0
+        for mid in announced_ids:
+            try:
+                existing = get_announced_market(mid)
+                if not existing:
+                    continue
+
+                api_market = api_by_id.get(mid)
+                onchain_market = onchain_by_id.get(mid)
+
+                if existing.get("notified_ended"):
+                    continue
+
+                if api_market and not is_market_active(api_market):
+                    if not existing.get("notified_ended"):
+                        delete_all_market_messages(mid)
+                        delete_announced_market(mid)
+                        audit_log(mid, "startup_reconcile", "removed_hidden_or_expired")
+                    continue
+
+                if api_market and not existing.get("notified_new") and not existing.get("is_scheduled"):
+                    if not is_scheduled_market(api_market):
+                        announce_live_market(api_market, existing=existing)
+                        reannounced += 1
+                        audit_log(mid, "startup_reconcile", "reannounced_live")
+                    elif not existing.get("notified_scheduled"):
+                        announce_scheduled_market_to_premium(api_market)
+                        reannounced += 1
+                        audit_log(mid, "startup_reconcile", "reannounced_scheduled")
+                    else:
+                        reconcile_market_from_api(api_market, existing=existing)
+                        reconciled += 1
+                        audit_log(mid, "startup_reconcile", "reconciled")
+                elif api_market:
+                    reconcile_market_from_api(api_market, existing=existing)
+                    reconciled += 1
+                elif not onchain_market:
+                    if existing.get("notified_ended"):
+                        continue
+                    logger.warning(f"startup reconcile: market {mid} not in API or on-chain, keeping for now")
+
+            except Exception as e:
+                logger.error(f"startup reconcile error for {mid}: {e}")
+
+        logger.info(f"startup reconciliation done: {reconciled} reconciled, {reannounced} reannounced")
+    except Exception as e:
+        logger.error(f"startup reconciliation failed: {e}")
+
+
+def run_pipeline_watchdog(api_markets):
+    try:
+        onchain_markets = []
+        if ONCHAIN_PROVIDER_ENABLED:
+            onchain_markets = fetch_onchain_markets()
+
+        onchain_ids = set()
+        for m in onchain_markets:
+            mid = str(m.get("market_id", "")).strip()
+            if mid and is_valid_market(m) and is_market_active(m):
+                onchain_ids.add(mid)
+
+        api_ids = set()
+        for m in api_markets:
+            mid = str(m.get("market_id", "")).strip()
+            if mid and is_valid_market(m) and is_market_active(m):
+                api_ids.add(mid)
+
+        announced_ids = get_all_announced_market_ids()
+
+        dropped = []
+        for mid in onchain_ids:
+            if mid not in announced_ids:
+                dropped.append(mid)
+                audit_log(mid, "watchdog", "dropped_onchain_not_announced", f"on-chain active but not in announced_markets")
+                PIPELINE_METRICS["watchdog_caught"] += 1
+
+        for mid in api_ids:
+            if mid not in announced_ids:
+                dropped.append(mid)
+                audit_log(mid, "watchdog", "dropped_api_not_announced", f"API active but not in announced_markets")
+                PIPELINE_METRICS["watchdog_caught"] += 1
+
+        if dropped:
+            logger.warning(f"watchdog caught {len(dropped)} dropped markets: {dropped[:5]}")
+            for mid in dropped:
+                api_market = next((m for m in api_markets if str(m.get("market_id", "")).strip() == mid), None)
+                if api_market and is_valid_market(api_market) and is_market_active(api_market):
+                    if is_scheduled_market(api_market):
+                        announce_scheduled_market_to_premium(api_market)
+                    else:
+                        announce_live_market(api_market)
+                    audit_log(mid, "watchdog", "recovered", f"re-announced via watchdog")
+                else:
+                    onchain_market = next((m for m in onchain_markets if str(m.get("market_id", "")).strip() == mid), None)
+                    if onchain_market and is_valid_market(onchain_market) and is_market_active(onchain_market):
+                        announce_onchain_market_to_premium(onchain_market)
+                        audit_log(mid, "watchdog", "recovered_onchain", f"re-announced on-chain via watchdog")
+
+    except Exception as e:
+        logger.error(f"watchdog error: {e}")
 
 
 def init_intelligence_tables():
@@ -1658,7 +1848,7 @@ def broadcast_to_all(
 ):
     try:
         if notification_key and not can_send_notification(notification_key):
-            return
+            return 0
 
         priority_ids = get_priority_chat_ids()
         premium_ids = set(get_premium_chat_ids()) if (premium_only or exclude_premium or premium_filter) else None
@@ -1713,9 +1903,16 @@ def broadcast_to_all(
 
         if sent:
             set_bot_state("last_notification_sent", now_utc().isoformat())
+            PIPELINE_METRICS["broadcasts_sent"] += sent
+        if not sent and notification_key:
+            PIPELINE_METRICS["broadcasts_failed"] += 1
+            if market_id:
+                audit_log(market_id, "broadcast", "zero_sends", f"key={notification_key} chats={len(chats)}")
         logger.info(f"broadcast sent to {sent} chats")
+        return sent
     except Exception as e:
         logger.error(f"error in broadcast_to_all: {e}")
+        return 0
 
 
 def delete_all_market_messages(market_id):
@@ -1975,7 +2172,7 @@ def decode_onchain_market_account(pubkey, encoded_data):
         if title_end > len(data):
             return None
         title = data[ONCHAIN_TITLE_OFFSET:title_end].decode("utf-8", errors="strict").strip("\x00").strip()
-        if len(title) < 6 or "?" not in title:
+        if len(title) < 6:
             return None
 
         created_unix = int(market_id // 1_000_000)
@@ -2016,7 +2213,7 @@ def fetch_onchain_markets():
                     "encoding": "base64",
                     "commitment": "confirmed",
                     "filters": [{"dataSize": ONCHAIN_MARKET_ACCOUNT_SIZE}],
-                    "dataSlice": {"offset": 0, "length": 220},
+                    "dataSlice": {"offset": 0, "length": ONCHAIN_MARKET_ACCOUNT_SIZE},
                 },
             ],
         }
@@ -2045,6 +2242,7 @@ def fetch_onchain_markets():
         return sorted(markets, key=lambda item: item["market_id"], reverse=True)
     except Exception as e:
         logger.error(f"error fetching on-chain markets: {e}")
+        PIPELINE_METRICS["onchain_skipped"] += 1
         return []
 
 
@@ -5088,10 +5286,18 @@ def announce_onchain_market_to_premium(market):
     if not market_id:
         return
 
+    if market_id in _recently_announced_onchain:
+        PIPELINE_METRICS["onchain_skipped"] += 1
+        return
+
     existing = get_announced_market(market_id)
     if existing and existing.get("premium_notified_onchain"):
+        PIPELINE_METRICS["onchain_skipped"] += 1
+        audit_log(market_id, "onchain_detect", "skipped_already_premium_notified")
         return
     if existing and existing.get("notified_new"):
+        PIPELINE_METRICS["onchain_skipped"] += 1
+        audit_log(market_id, "onchain_detect", "skipped_already_announced")
         return
 
     title = str(market.get("title", "")).strip()
@@ -5118,23 +5324,35 @@ def announce_onchain_market_to_premium(market):
         if not saved:
             existing = get_announced_market(market_id)
             if existing and existing.get("premium_notified_onchain"):
+                PIPELINE_METRICS["onchain_skipped"] += 1
+                audit_log(market_id, "onchain_detect", "skipped_save_race", "save failed, re-fetched shows already notified")
                 return
 
     context = build_market_template_context(market)
     keyboard = create_market_keyboard(market_id, build_market_link(market_id), scope="new_market", context=context)
-    broadcast_to_all(
+    sent = broadcast_to_all(
         build_onchain_premium_notification(market),
         market_id,
         keyboard,
-        theme=raw_theme,
+        theme=None,
         notification_key=f"onchain_premium_new_{market_id}",
         photo_url=get_market_cover_image(market),
         premium_only=True,
         rich_html=build_rich_onchain_premium_notification(market),
     )
-    mark_onchain_premium_notified(market_id)
-    set_bot_state("last_onchain_market_detected", f"{market_id} | {title}")
-    logger.info(f"premium on-chain market announced: {title}")
+    if sent:
+        mark_onchain_premium_notified(market_id)
+        _recently_announced_onchain.add(market_id)
+        if len(_recently_announced_onchain) > _RECENTLY_ANNOUNCED_MAX:
+            _recently_announced_onchain.clear()
+        set_bot_state("last_onchain_market_detected", f"{market_id} | {title}")
+        PIPELINE_METRICS["onchain_detected"] += 1
+        PIPELINE_METRICS["onchain_announced"] += 1
+        audit_log(market_id, "onchain_detect", "announced_premium", f"title={title[:50]}")
+        logger.info(f"premium on-chain market announced: {title}")
+    else:
+        audit_log(market_id, "onchain_detect", "broadcast_zero_sends", "will retry next cycle")
+        PIPELINE_METRICS["onchain_skipped"] += 1
 
 
 def announce_live_market(market, existing=None):
@@ -5172,8 +5390,14 @@ def announce_live_market(market, existing=None):
         )
 
     if not should_broadcast:
+        PIPELINE_METRICS["api_skipped"] += 1
+        audit_log(market_id, "api_detect", "skipped_already_saved")
         logger.info(f"market {market_id} was already reserved for announcement")
         return
+
+    PIPELINE_METRICS["api_detected"] += 1
+    PIPELINE_METRICS["api_announced"] += 1
+    audit_log(market_id, "api_detect", "announced", f"title={title[:50]}")
 
     if not premium_already_notified:
         premium_ai_message = generate_smart_notification(title, raw_theme, "new") if AI_ON_PREMIUM_FAST_ALERT else None
@@ -5252,23 +5476,31 @@ def announce_scheduled_market_to_premium(market):
         is_featured=featured,
     )
     if not saved:
+        audit_log(market_id, "api_detect", "skipped_scheduled_already_saved")
         return
+
+    audit_log(market_id, "api_detect", "announced_scheduled", f"title={title[:50]}")
 
     context = build_market_template_context(market)
     keyboard = create_market_keyboard(market_id, build_market_link(market_id), scope="scheduled_market", context=context)
     notification = build_scheduled_market_notification(market)
-    cover_image_url = wait_for_market_cover_image(market_id, market)
-    broadcast_to_all(
-        notification,
-        market_id,
-        keyboard,
-        theme=raw_theme,
-        notification_key=f"scheduled_{market_id}",
-        photo_url=cover_image_url,
-        premium_only=True,
-        rich_html=build_rich_scheduled_market(market),
-    )
-    update_market_flag(market_id, "notified_scheduled")
+    rich_html = build_rich_scheduled_market(market)
+
+    def _send_scheduled():
+        cover_url = wait_for_market_cover_image(market_id, market)
+        broadcast_to_all(
+            notification,
+            market_id,
+            keyboard,
+            theme=raw_theme,
+            notification_key=f"scheduled_{market_id}",
+            photo_url=cover_url,
+            premium_only=True,
+            rich_html=rich_html,
+        )
+        update_market_flag(market_id, "notified_scheduled")
+
+    Thread(target=_send_scheduled, daemon=True).start()
     set_bot_state("last_market_detected", f"{market_id} | {title} (scheduled)")
     logger.info(f"premium scheduled market announced: {title}")
 
@@ -5276,6 +5508,8 @@ def announce_scheduled_market_to_premium(market):
 def monitor_b4_markets():
     global last_onchain_poll_at
     logger.info("b4 market monitoring thread started")
+    loop_count = 0
+    WATCHDOG_INTERVAL = 300
     while True:
         try:
             if get_pause_state():
@@ -5333,11 +5567,15 @@ def monitor_b4_markets():
                         continue
 
                     if not is_valid_market(market):
+                        PIPELINE_METRICS["api_skipped"] += 1
+                        audit_log(market_id, "api_detect", "skipped_invalid")
                         logger.warning(f"skipped {market_id}: failed validation")
                         continue
 
                     if not is_market_active(market):
                         end_time_unix = market.get("end_time")
+                        PIPELINE_METRICS["api_skipped"] += 1
+                        audit_log(market_id, "api_detect", "skipped_inactive", f"end={end_time_unix} resolved={market.get('resolved')} hidden={market.get('hidden')}")
                         logger.warning(f"skipped {market_id}: market not active (end_time: {end_time_unix}, resolved: {market.get('resolved')}, hidden: {market.get('hidden')})")
                         continue
 
@@ -5351,6 +5589,7 @@ def monitor_b4_markets():
                         announce_live_market(market, existing=existing)
                     else:
                         reconcile_market_from_api(market, existing=existing)
+                        PIPELINE_METRICS["api_reconciled"] += 1
 
                 except Exception as e:
                     logger.error(f"error processing market: {e}")
@@ -5368,6 +5607,13 @@ def monitor_b4_markets():
             except Exception as e:
                 logger.error(f"intelligence pipeline error: {e}")
             send_daily_summary_if_due()
+            loop_count += 1
+            if loop_count % WATCHDOG_INTERVAL == 0:
+                try:
+                    run_pipeline_watchdog(markets)
+                except Exception as e:
+                    logger.error(f"watchdog run error: {e}")
+            log_pipeline_metrics()
             time.sleep(MARKET_POLL_SECONDS)
 
         except Exception as e:
@@ -6788,6 +7034,8 @@ try:
     logger.info("bot commands registered")
 except Exception as e:
     logger.error(f"error registering commands: {e}")
+
+run_startup_reconciliation()
 
 monitor_thread = Thread(target=monitor_b4_markets, daemon=True)
 monitor_thread.start()
