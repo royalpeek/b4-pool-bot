@@ -8,6 +8,8 @@ import logging
 import statistics
 import psycopg
 import html
+import base64
+import struct
 from threading import Thread
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
@@ -58,6 +60,15 @@ COVER_IMAGE_RETRY_SECONDS = float(os.getenv("COVER_IMAGE_RETRY_SECONDS", "1"))
 API_TIMEOUT_SECONDS = float(os.getenv("API_TIMEOUT_SECONDS", "6"))
 API_PAGE_LIMIT = int(os.getenv("API_PAGE_LIMIT", "100"))
 AI_ON_PREMIUM_FAST_ALERT = os.getenv("AI_ON_PREMIUM_FAST_ALERT", "false").lower() == "true"
+ONCHAIN_PROVIDER_ENABLED = os.getenv("ONCHAIN_PROVIDER_ENABLED", "true").lower() == "true"
+SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
+B4_SOLANA_PROGRAM_ID = os.getenv("B4_SOLANA_PROGRAM_ID", "9XQDD38sy1qJ57DqAQvADuLRTjcYUXD48H7deyNuaehH")
+ONCHAIN_POLL_SECONDS = float(os.getenv("ONCHAIN_POLL_SECONDS", "3"))
+ONCHAIN_MARKET_ACCOUNT_SIZE = int(os.getenv("ONCHAIN_MARKET_ACCOUNT_SIZE", "464"))
+ONCHAIN_MARKET_ID_OFFSET = int(os.getenv("ONCHAIN_MARKET_ID_OFFSET", "8"))
+ONCHAIN_TITLE_LENGTH_OFFSET = int(os.getenv("ONCHAIN_TITLE_LENGTH_OFFSET", "48"))
+ONCHAIN_TITLE_OFFSET = int(os.getenv("ONCHAIN_TITLE_OFFSET", "52"))
+ONCHAIN_MARKET_DURATION_SECONDS = int(os.getenv("ONCHAIN_MARKET_DURATION_SECONDS", "86400"))
 IMAGE_FOLLOWUP_WAIT_SECONDS = float(os.getenv("IMAGE_FOLLOWUP_WAIT_SECONDS", "45"))
 PREMIUM_GO_LIVE_REMINDER_SECONDS = int(os.getenv("PREMIUM_GO_LIVE_REMINDER_SECONDS", "120"))
 TEMP_RESPONSE_DELETE_SECONDS = int(os.getenv("TEMP_RESPONSE_DELETE_SECONDS", "180"))
@@ -123,6 +134,8 @@ if ai_api_key and ai_base_url:
     logger.info("ai client initialized with model %s", ai_model)
 else:
     logger.warning("ai not configured, using template notifications")
+
+last_onchain_poll_at = 0.0
 
 
 class _CacheEntry:
@@ -254,6 +267,14 @@ def init_db():
                 cur.execute("ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS notified_6h BOOLEAN DEFAULT FALSE")
                 cur.execute("ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS notified_30m BOOLEAN DEFAULT FALSE")
                 cur.execute("ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS is_featured BOOLEAN DEFAULT FALSE")
+                cur.execute("ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'api'")
+                cur.execute("ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS market_pubkey TEXT")
+                cur.execute("ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS cover_image_url TEXT")
+                cur.execute("ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS onchain_detected_at TIMESTAMP")
+                cur.execute("ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS api_detected_at TIMESTAMP")
+                cur.execute("ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS premium_notified_onchain BOOLEAN DEFAULT FALSE")
+                cur.execute("ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS premium_lead_seconds INTEGER")
+                cur.execute("ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS metadata_json TEXT")
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS market_messages (
                         id SERIAL PRIMARY KEY,
@@ -1209,10 +1230,27 @@ def get_announced_market(market_id):
         return None
 
 
-def save_announced_market(market_id, title, theme, end_time, notified_new=True, is_scheduled=False, go_live_at=None, is_featured=False):
+def save_announced_market(
+    market_id,
+    title,
+    theme,
+    end_time,
+    notified_new=True,
+    is_scheduled=False,
+    go_live_at=None,
+    source="api",
+    market_pubkey=None,
+    cover_image_url=None,
+    onchain_detected_at=None,
+    api_detected_at=None,
+    premium_notified_onchain=False,
+    metadata=None,
+    is_featured=False,
+):
     try:
         market_link = build_market_link(market_id)
         go_live_value = go_live_at.isoformat() if isinstance(go_live_at, datetime) else go_live_at
+        metadata_json = json.dumps(metadata or {}, default=str) if metadata is not None else None
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
@@ -1220,20 +1258,95 @@ def save_announced_market(market_id, title, theme, end_time, notified_new=True, 
                         market_id, title, theme, end_time, market_link, notified_new,
                         notified_1h, notified_5m, notified_ended, delete_scheduled,
                         notified_scheduled, notified_go_live_2m, image_followup_sent,
-                        is_scheduled, go_live_at, detected_at,
+                        is_scheduled, go_live_at, detected_at, source, market_pubkey,
+                        cover_image_url, onchain_detected_at, api_detected_at,
+                        premium_notified_onchain, metadata_json,
                         notified_12h, notified_6h, notified_30m, is_featured
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, %s, %s, %s, FALSE, FALSE, FALSE, %s)
+                    VALUES (
+                        %s, %s, %s, %s, %s, %s,
+                        FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE,
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                        FALSE, FALSE, FALSE, %s
+                    )
                     ON CONFLICT (market_id) DO NOTHING
                     RETURNING market_id
                 """, (
                     str(market_id), title, theme, end_time, market_link, notified_new,
-                    is_scheduled, go_live_value, now_utc().isoformat(), is_featured
+                    is_scheduled, go_live_value, now_utc().isoformat(), source,
+                    market_pubkey, cover_image_url, onchain_detected_at, api_detected_at,
+                    premium_notified_onchain, metadata_json, is_featured
                 ))
                 return cur.fetchone() is not None
     except Exception as e:
         logger.error(f"error saving market {market_id}: {e}")
     return False
+
+
+def reconcile_market_from_api(market, existing=None):
+    market_id = str(market.get("market_id", "")).strip()
+    if not market_id:
+        return None
+    existing = existing or get_announced_market(market_id)
+    api_detected_at = now_utc()
+    market_link = build_market_link(market_id)
+    metadata_json = json.dumps(market, default=str)
+    title = str(market.get("title", "")).strip()
+    raw_theme = normalize_theme(market.get("theme", "other"))
+    end_time_unix = market.get("end_time")
+    end_time = None
+    if end_time_unix:
+        end_time = datetime.fromtimestamp(int(end_time_unix), tz=timezone.utc).replace(tzinfo=None)
+    go_live_at = get_market_go_live_at(market)
+    go_live_value = go_live_at.isoformat() if isinstance(go_live_at, datetime) else go_live_at
+    cover_url = get_market_cover_image(market)
+    pubkey = str(market.get("market_pubkey") or "").strip() or None
+
+    try:
+        with get_db() as conn:
+            with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
+                cur.execute("""
+                    UPDATE announced_markets
+                    SET title = COALESCE(NULLIF(%s, ''), title),
+                        theme = COALESCE(%s, theme),
+                        end_time = COALESCE(%s, end_time),
+                        market_link = %s,
+                        source = CASE
+                            WHEN source = 'onchain' THEN 'onchain+api'
+                            ELSE 'api'
+                        END,
+                        market_pubkey = COALESCE(%s, market_pubkey),
+                        cover_image_url = COALESCE(%s, cover_image_url),
+                        api_detected_at = COALESCE(api_detected_at, %s),
+                        go_live_at = COALESCE(%s, go_live_at),
+                        metadata_json = %s,
+                        premium_lead_seconds = CASE
+                            WHEN onchain_detected_at IS NOT NULL THEN
+                                EXTRACT(EPOCH FROM (COALESCE(api_detected_at, %s) - onchain_detected_at))::INTEGER
+                            ELSE premium_lead_seconds
+                        END
+                    WHERE market_id = %s
+                    RETURNING *
+                """, (
+                    title,
+                    raw_theme,
+                    end_time.isoformat() if end_time else None,
+                    market_link,
+                    pubkey,
+                    cover_url,
+                    api_detected_at,
+                    go_live_value,
+                    metadata_json,
+                    api_detected_at,
+                    market_id,
+                ))
+                row = cur.fetchone()
+                if row and row.get("premium_lead_seconds") is not None:
+                    set_bot_state("last_premium_lead_seconds", row.get("premium_lead_seconds"))
+                return row
+    except Exception as e:
+        logger.error(f"error reconciling api market {market_id}: {e}")
+        return existing
 
 
 def update_market_flag(market_id, flag):
@@ -1704,6 +1817,111 @@ def fetch_b4_markets():
             return []
     except Exception as e:
         logger.error(f"error fetching b4 markets: {e}")
+        return []
+
+
+def build_onchain_cover_url(market_id):
+    return f"https://www.b4app.xyz/api/assets/market-cover/{market_id}.png"
+
+
+def read_u64_le(data, offset):
+    if offset < 0 or offset + 8 > len(data):
+        return None
+    return struct.unpack_from("<Q", data, offset)[0]
+
+
+def read_u32_le(data, offset):
+    if offset < 0 or offset + 4 > len(data):
+        return None
+    return struct.unpack_from("<I", data, offset)[0]
+
+
+def decode_onchain_market_account(pubkey, encoded_data):
+    try:
+        raw_data = encoded_data[0] if isinstance(encoded_data, list) else encoded_data
+        data = base64.b64decode(raw_data)
+        market_id = read_u64_le(data, ONCHAIN_MARKET_ID_OFFSET)
+        title_len = read_u32_le(data, ONCHAIN_TITLE_LENGTH_OFFSET)
+        if not market_id or not title_len:
+            return None
+        if market_id < 1_700_000_000_000_000 or market_id > 1_900_000_000_000_000:
+            return None
+        if title_len < 6 or title_len > 180:
+            return None
+        title_end = ONCHAIN_TITLE_OFFSET + title_len
+        if title_end > len(data):
+            return None
+        title = data[ONCHAIN_TITLE_OFFSET:title_end].decode("utf-8", errors="strict").strip("\x00").strip()
+        if len(title) < 6 or "?" not in title:
+            return None
+
+        created_unix = int(market_id // 1_000_000)
+        end_unix = created_unix + ONCHAIN_MARKET_DURATION_SECONDS
+        return {
+            "market_id": str(market_id),
+            "market_pubkey": str(pubkey),
+            "title": title,
+            "description": "",
+            "theme": "other",
+            "end_time": end_unix,
+            "created_at": datetime.fromtimestamp(created_unix, tz=timezone.utc).isoformat(),
+            "updated_at": now_utc().isoformat(),
+            "go_live_at": datetime.fromtimestamp(created_unix, tz=timezone.utc).isoformat(),
+            "hidden": False,
+            "resolved": False,
+            "is_private": False,
+            "cover_image_url": build_onchain_cover_url(market_id),
+            "cover_image_status": "ready",
+            "source": "onchain",
+        }
+    except Exception as e:
+        logger.debug(f"could not decode on-chain market account {pubkey}: {e}")
+        return None
+
+
+def fetch_onchain_markets():
+    if not ONCHAIN_PROVIDER_ENABLED:
+        return []
+    try:
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getProgramAccounts",
+            "params": [
+                B4_SOLANA_PROGRAM_ID,
+                {
+                    "encoding": "base64",
+                    "commitment": "confirmed",
+                    "filters": [{"dataSize": ONCHAIN_MARKET_ACCOUNT_SIZE}],
+                    "dataSlice": {"offset": 0, "length": 220},
+                },
+            ],
+        }
+        response = requests.post(SOLANA_RPC_URL, json=payload, timeout=max(API_TIMEOUT_SECONDS, 12))
+        response.raise_for_status()
+        data = response.json()
+        if data.get("error"):
+            logger.error(f"solana rpc error: {data['error']}")
+            return []
+
+        markets = []
+        now_ts = int(datetime.now(timezone.utc).timestamp())
+        for account in data.get("result", []):
+            market = decode_onchain_market_account(
+                account.get("pubkey"),
+                account.get("account", {}).get("data"),
+            )
+            if not market:
+                continue
+            if int(market["end_time"]) <= now_ts:
+                continue
+            markets.append(market)
+
+        set_bot_state("last_onchain_check", now_utc().isoformat())
+        logger.info(f"decoded {len(markets)} live markets from on-chain provider")
+        return sorted(markets, key=lambda item: item["market_id"], reverse=True)
+    except Exception as e:
+        logger.error(f"error fetching on-chain markets: {e}")
         return []
 
 
@@ -4033,6 +4251,45 @@ def build_premium_priority_notification(market, ai_message):
     )
 
 
+def build_onchain_premium_notification(market):
+    title = str(market.get("title", "")).strip()
+    end_time_unix = int(market.get("end_time"))
+    end_time = datetime.fromtimestamp(end_time_unix, tz=timezone.utc).replace(tzinfo=None)
+    body_text = build_fast_market_cta(title, "new")
+    message = (
+        f"{custom_emoji('premium', '*')} <b>PREMIUM EARLY SIGNAL</b>\n"
+        "You are seeing this before the public feed catches up.\n\n"
+        f"<b>{escape_text(title)}</b>\n\n"
+        f"Closes: {escape_text(format_market_time(end_time))}\n\n"
+        f"{body_text}"
+    )
+    return render_template_text("onchain_early_market_text", build_market_template_context(market, body_text), message)
+
+
+def build_rich_onchain_premium_notification(market):
+    title = str(market.get("title", "")).strip()
+    end_time_unix = int(market.get("end_time"))
+    end_time = datetime.fromtimestamp(end_time_unix, tz=timezone.utc).replace(tzinfo=None)
+    cover_url = get_market_cover_image(market)
+    body_text = build_fast_market_cta(title, "new")
+    fallback = (
+        f"<h3>{custom_emoji('premium', '*')} Premium Early Signal</h3>"
+        f"{build_rich_media_block(cover_url, title)}"
+        f"<h2>{escape_text(title)}</h2>"
+        "<table>"
+        f"<tr><th>Closes</th><td>{escape_text(format_market_time(end_time))}</td></tr>"
+        "<tr><th>Access</th><td>Premium members first</td></tr>"
+        "</table>"
+        "<blockquote>You are seeing this before the public feed catches up.</blockquote>"
+        f"<p>{body_text}</p>"
+    )
+    return render_template_rich(
+        "onchain_early_market_rich",
+        build_market_template_context(market, body_text),
+        fallback,
+    )
+
+
 def build_scheduled_market_notification(market):
     title = str(market.get("title", "")).strip()
     go_live_at = get_market_go_live_at(market)
@@ -4517,13 +4774,69 @@ def get_health_text():
         f"🩺 <b>Notify Bot Health</b>\n\n"
         f"Status: <b>{'Paused' if get_pause_state() else 'Running'}</b>\n"
         f"Last API Check: <code>{escape_text(get_bot_state('last_api_check', 'never'))}</code>\n"
+        f"Last On-Chain Check: <code>{escape_text(get_bot_state('last_onchain_check', 'never'))}</code>\n"
         f"Last Market: <code>{escape_text(get_bot_state('last_market_detected', 'none'))}</code>\n"
+        f"Last On-Chain Market: <code>{escape_text(get_bot_state('last_onchain_market_detected', 'none'))}</code>\n"
+        f"Last Premium Lead: <code>{escape_text(get_bot_state('last_premium_lead_seconds', 'none'))}s</code>\n"
         f"Last Notification: <code>{escape_text(get_bot_state('last_notification_sent', 'none'))}</code>\n"
         f"AI: <b>{'Active' if ai_client else 'Not configured'}</b>\n"
         f"Poll Interval: <b>{MARKET_POLL_SECONDS}s</b>\n"
+        f"On-Chain Poll: <b>{ONCHAIN_POLL_SECONDS}s</b>\n"
         f"Image Wait: <b>{COVER_IMAGE_WAIT_SECONDS}s</b>\n"
         f"Market Link Base: <code>{escape_text(MARKET_LINK_BASE)}</code>"
     )
+
+
+def get_premium_lead_report_text():
+    try:
+        with get_db() as conn:
+            with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
+                cur.execute("""
+                    SELECT
+                        COUNT(*) AS reconciled_count,
+                        AVG(premium_lead_seconds)::INTEGER AS average_lead,
+                        MIN(premium_lead_seconds) AS min_lead,
+                        MAX(premium_lead_seconds) AS max_lead
+                    FROM announced_markets
+                    WHERE onchain_detected_at IS NOT NULL
+                      AND api_detected_at IS NOT NULL
+                      AND premium_lead_seconds IS NOT NULL
+                """)
+                stats = cur.fetchone() or {}
+                cur.execute("""
+                    SELECT market_id, title, premium_lead_seconds
+                    FROM announced_markets
+                    WHERE premium_lead_seconds IS NOT NULL
+                    ORDER BY api_detected_at DESC NULLS LAST
+                    LIMIT 5
+                """)
+                recent = cur.fetchall()
+    except Exception as e:
+        logger.error(f"error building premium lead report: {e}")
+        return "Could not load premium lead metrics right now."
+
+    count = stats.get("reconciled_count") or 0
+    average = stats.get("average_lead")
+    min_lead = stats.get("min_lead")
+    max_lead = stats.get("max_lead")
+    lines = [
+        f"{custom_emoji('premium', '*')} <b>Premium Lead-Time Report</b>",
+        "",
+        f"Reconciled markets: <b>{count}</b>",
+        f"Average advantage: <b>{average if average is not None else 'n/a'}s</b>",
+        f"Minimum advantage: <b>{min_lead if min_lead is not None else 'n/a'}s</b>",
+        f"Maximum advantage: <b>{max_lead if max_lead is not None else 'n/a'}s</b>",
+    ]
+    if recent:
+        lines.append("\n<b>Recent measured markets</b>")
+        for row in recent:
+            lines.append(
+                f"- <b>{escape_text(row.get('title') or row.get('market_id'))}</b>: "
+                f"{escape_text(row.get('premium_lead_seconds'))}s"
+            )
+    else:
+        lines.append("\nNo reconciled lead-time samples yet. This fills after an early market later appears in the public API.")
+    return "\n".join(lines)
 
 
 def build_recent_markets_text():
@@ -4634,6 +4947,73 @@ def is_scheduled_market(market):
     return bool(go_live_at and go_live_at > now_utc())
 
 
+def mark_onchain_premium_notified(market_id):
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE announced_markets
+                    SET premium_notified_onchain = TRUE
+                    WHERE market_id = %s
+                """, (str(market_id),))
+    except Exception as e:
+        logger.error(f"error marking on-chain premium notification for {market_id}: {e}")
+
+
+def announce_onchain_market_to_premium(market):
+    market_id = str(market.get("market_id", "")).strip()
+    if not market_id:
+        return
+
+    existing = get_announced_market(market_id)
+    if existing and existing.get("premium_notified_onchain"):
+        return
+    if existing and existing.get("notified_new"):
+        return
+
+    title = str(market.get("title", "")).strip()
+    raw_theme = normalize_theme(market.get("theme", "other"))
+    end_time = datetime.fromtimestamp(int(market.get("end_time")), tz=timezone.utc).replace(tzinfo=None)
+    detected_at = now_utc()
+
+    if not existing:
+        saved = save_announced_market(
+            market_id,
+            title,
+            raw_theme,
+            end_time.isoformat(),
+            notified_new=False,
+            is_scheduled=False,
+            go_live_at=get_market_go_live_at(market),
+            source="onchain",
+            market_pubkey=market.get("market_pubkey"),
+            cover_image_url=get_market_cover_image(market),
+            onchain_detected_at=detected_at,
+            premium_notified_onchain=False,
+            metadata=market,
+        )
+        if not saved:
+            existing = get_announced_market(market_id)
+            if existing and existing.get("premium_notified_onchain"):
+                return
+
+    context = build_market_template_context(market)
+    keyboard = create_market_keyboard(market_id, build_market_link(market_id), scope="new_market", context=context)
+    broadcast_to_all(
+        build_onchain_premium_notification(market),
+        market_id,
+        keyboard,
+        theme=raw_theme,
+        notification_key=f"onchain_premium_new_{market_id}",
+        photo_url=get_market_cover_image(market),
+        premium_only=True,
+        rich_html=build_rich_onchain_premium_notification(market),
+    )
+    mark_onchain_premium_notified(market_id)
+    set_bot_state("last_onchain_market_detected", f"{market_id} | {title}")
+    logger.info(f"premium on-chain market announced: {title}")
+
+
 def announce_live_market(market, existing=None):
     market_id = str(market.get("market_id", "")).strip()
     title = str(market.get("title", "")).strip()
@@ -4644,7 +5024,10 @@ def announce_live_market(market, existing=None):
     keyboard = create_market_keyboard(market_id, build_market_link(market_id), scope="new_market", context=context)
     featured = is_featured_creator(market)
 
+    premium_already_notified = bool(existing and existing.get("premium_notified_onchain"))
+
     if existing:
+        reconcile_market_from_api(market, existing=existing)
         update_market_flag(market_id, "notified_new")
         update_market_live_state(market_id, is_scheduled=False, go_live_at=get_market_go_live_at(market))
         should_broadcast = True
@@ -4657,6 +5040,11 @@ def announce_live_market(market, existing=None):
             notified_new=True,
             is_scheduled=False,
             go_live_at=get_market_go_live_at(market),
+            source="api",
+            market_pubkey=market.get("market_pubkey"),
+            cover_image_url=get_market_cover_image(market),
+            api_detected_at=now_utc(),
+            metadata=market,
             is_featured=featured,
         )
 
@@ -4664,17 +5052,18 @@ def announce_live_market(market, existing=None):
         logger.info(f"market {market_id} was already reserved for announcement")
         return
 
-    premium_ai_message = generate_smart_notification(title, raw_theme, "new") if AI_ON_PREMIUM_FAST_ALERT else None
-    premium_notification = build_premium_priority_notification(market, premium_ai_message)
-    broadcast_to_all(
-        premium_notification,
-        market_id,
-        keyboard,
-        theme=raw_theme,
-        notification_key=f"premium_new_{market_id}",
-        premium_only=True,
-        premium_filter=lambda chat_id: premium_chat_wants_market(chat_id, market),
-    )
+    if not premium_already_notified:
+        premium_ai_message = generate_smart_notification(title, raw_theme, "new") if AI_ON_PREMIUM_FAST_ALERT else None
+        premium_notification = build_premium_priority_notification(market, premium_ai_message)
+        broadcast_to_all(
+            premium_notification,
+            market_id,
+            keyboard,
+            theme=raw_theme,
+            notification_key=f"premium_new_{market_id}",
+            premium_only=True,
+            premium_filter=lambda chat_id: premium_chat_wants_market(chat_id, market),
+        )
 
     def send_premium_cover_image():
         cover_image_url = get_market_cover_image(market)
@@ -4762,6 +5151,7 @@ def announce_scheduled_market_to_premium(market):
 
 
 def monitor_b4_markets():
+    global last_onchain_poll_at
     logger.info("b4 market monitoring thread started")
     while True:
         try:
@@ -4769,6 +5159,15 @@ def monitor_b4_markets():
                 logger.info("notifications paused, skipping check")
                 time.sleep(10)
                 continue
+
+            if ONCHAIN_PROVIDER_ENABLED and time.time() - last_onchain_poll_at >= ONCHAIN_POLL_SECONDS:
+                last_onchain_poll_at = time.time()
+                for market in fetch_onchain_markets():
+                    try:
+                        if is_valid_market(market) and is_market_active(market):
+                            announce_onchain_market_to_premium(market)
+                    except Exception as e:
+                        logger.error(f"error processing on-chain market: {e}")
             
             markets = fetch_b4_markets()
             logger.info(f"processing {len(markets)} markets")
@@ -4825,8 +5224,10 @@ def monitor_b4_markets():
                             announce_scheduled_market_to_premium(market)
                         else:
                             announce_live_market(market)
-                    elif existing.get("is_scheduled") and not existing.get("notified_new") and not is_scheduled_market(market):
+                    elif not existing.get("notified_new") and not is_scheduled_market(market):
                         announce_live_market(market, existing=existing)
+                    else:
+                        reconcile_market_from_api(market, existing=existing)
 
                 except Exception as e:
                     logger.error(f"error processing market: {e}")
@@ -4887,6 +5288,9 @@ def check_scheduled_notifications():
                             )
                             update_market_flag(market_id, "notified_go_live_2m")
                             logger.info(f"premium go-live reminder sent for: {title}")
+
+                if not market_data.get("notified_new"):
+                    continue
 
                 end_time = datetime.fromisoformat(end_time_str)
                 time_until = (end_time - now).total_seconds()
@@ -5696,6 +6100,18 @@ def premium_digest_command(message):
         logger.error(f"error in premium_digest: {e}")
 
 
+@bot.message_handler(commands=['premiumlead'])
+def premiumlead_command(message):
+    try:
+        if not is_admin(message.from_user.id):
+            reply_temp(message, "Permission denied.")
+            return
+        reply_temp(message, get_premium_lead_report_text(), parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"error in premiumlead: {e}")
+        reply_temp(message, f"Error: {e}")
+
+
 @bot.message_handler(commands=['health'])
 def health_command(message):
     try:
@@ -6218,6 +6634,19 @@ try:
         telebot.types.BotCommand("premium_remove", "Remove premium user or chat"),
         telebot.types.BotCommand("premium_users", "List premium users or chats"),
         telebot.types.BotCommand("premium_digest", "Premium digest (disabled)"),
+        telebot.types.BotCommand("premiumlead", "Show premium lead-time report"),
+        telebot.types.BotCommand("studio", "Open admin message studio"),
+        telebot.types.BotCommand("studio_commands", "Show message studio commands"),
+        telebot.types.BotCommand("templates", "List custom templates"),
+        telebot.types.BotCommand("buttons", "List custom inline buttons"),
+        telebot.types.BotCommand("settemplate", "Edit plain message template"),
+        telebot.types.BotCommand("setrich", "Edit rich message template"),
+        telebot.types.BotCommand("deltemplate", "Delete custom template"),
+        telebot.types.BotCommand("addbutton", "Add custom inline button"),
+        telebot.types.BotCommand("delbutton", "Delete custom inline button"),
+        telebot.types.BotCommand("studiobroadcast", "Send rich broadcast with studio buttons"),
+        telebot.types.BotCommand("quickbroadcast", "Broadcast with one custom button"),
+        telebot.types.BotCommand("quickpremium", "Premium broadcast with one custom button"),
         telebot.types.BotCommand("reset", "Reset all data"),
         telebot.types.BotCommand("cleanmessages", "Delete tracked messages only"),
         telebot.types.BotCommand("refreshlinks", "Refresh market button links"),
