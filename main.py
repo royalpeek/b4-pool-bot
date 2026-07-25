@@ -1755,39 +1755,87 @@ def save_announced_market(
     metadata=None,
     is_featured=False,
 ):
+    """Persist a notification registration row for a market.
+
+    CRITICAL: placeholder count must match params exactly. A silent INSERT
+    failure here produces 0 announced_markets rows while discovery still works.
+    """
     try:
         market_link = build_market_link(market_id)
         go_live_value = go_live_at.isoformat() if isinstance(go_live_at, datetime) else go_live_at
         metadata_json = json.dumps(metadata or {}, default=str) if metadata is not None else None
+        params = (
+            str(market_id),
+            title,
+            theme,
+            end_time,
+            market_link,
+            notified_new,
+            is_scheduled,
+            go_live_value,
+            now_utc().isoformat(),
+            source,
+            market_pubkey,
+            cover_image_url,
+            onchain_detected_at,
+            api_detected_at,
+            premium_notified_onchain,
+            metadata_json,
+            is_featured,
+        )
+        # 27 columns: 17 bound params + 10 FALSE literals
+        sql = """
+            INSERT INTO announced_markets (
+                market_id, title, theme, end_time, market_link, notified_new,
+                notified_1h, notified_5m, notified_ended, delete_scheduled,
+                notified_scheduled, notified_go_live_2m, image_followup_sent,
+                is_scheduled, go_live_at, detected_at, source, market_pubkey,
+                cover_image_url, onchain_detected_at, api_detected_at,
+                premium_notified_onchain, metadata_json,
+                notified_12h, notified_6h, notified_30m, is_featured
+            )
+            VALUES (
+                %s, %s, %s, %s, %s, %s,
+                FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE,
+                %s, %s, %s, %s, %s,
+                %s, %s, %s,
+                %s, %s,
+                FALSE, FALSE, FALSE, %s
+            )
+            ON CONFLICT (market_id) DO NOTHING
+            RETURNING market_id
+        """
+        placeholder_count = sql.count("%s")
+        if placeholder_count != len(params):
+            logger.critical(
+                "CRITICAL: save_announced_market placeholder mismatch params=%s placeholders=%s market=%s",
+                len(params), placeholder_count, market_id,
+            )
+            return False
+
         with get_db() as conn:
             with conn.cursor() as cur:
-                cur.execute("""
-                    INSERT INTO announced_markets (
-                        market_id, title, theme, end_time, market_link, notified_new,
-                        notified_1h, notified_5m, notified_ended, delete_scheduled,
-                        notified_scheduled, notified_go_live_2m, image_followup_sent,
-                        is_scheduled, go_live_at, detected_at, source, market_pubkey,
-                        cover_image_url, onchain_detected_at, api_detected_at,
-                        premium_notified_onchain, metadata_json,
-                        notified_12h, notified_6h, notified_30m, is_featured
-                    )
-                    VALUES (
-                        %s, %s, %s, %s, %s, %s,
-                        FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE,
-                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                        FALSE, FALSE, FALSE, %s
-                    )
-                    ON CONFLICT (market_id) DO NOTHING
-                    RETURNING market_id
-                """, (
-                    str(market_id), title, theme, end_time, market_link, notified_new,
-                    is_scheduled, go_live_value, now_utc().isoformat(), source,
-                    market_pubkey, cover_image_url, onchain_detected_at, api_detected_at,
-                    premium_notified_onchain, metadata_json, is_featured
-                ))
-                return cur.fetchone() is not None
+                cur.execute(sql, params)
+                inserted = cur.fetchone() is not None
+        if inserted:
+            logger.info(
+                "NOTIFICATION_REGISTERED market_id=%s title=%s source=%s notified_new=%s",
+                market_id, (title or "")[:50], source, notified_new,
+            )
+            audit_log(market_id, "register", "row_created", f"source={source} title={(title or '')[:40]}")
+        else:
+            logger.info(
+                "NOTIFICATION_REGISTER_SKIP market_id=%s reason=already_exists_or_conflict",
+                market_id,
+            )
+            audit_log(market_id, "register", "row_exists", "ON CONFLICT DO NOTHING")
+        return inserted
     except Exception as e:
-        logger.error(f"error saving market {market_id}: {e}")
+        logger.critical(
+            "CRITICAL: notification registration FAILED market_id=%s error=%s",
+            market_id, e,
+        )
+        audit_log(market_id, "register", "row_failed", str(e)[:200])
     return False
 
 
@@ -6461,6 +6509,24 @@ def monitor_b4_markets():
                 int(_MONITOR_HEARTBEAT.get("notifications_evaluated", 0)) + evaluated
             )
 
+            # CRITICAL guard: discovery without registration means pipeline is broken.
+            try:
+                active_api = sum(
+                    1 for m in markets
+                    if is_valid_market(m) and is_market_active(m) and not is_scheduled_market(m)
+                )
+                row_count = len(get_all_announced_market_ids())
+                if active_api > 0 and row_count == 0:
+                    logger.critical(
+                        "CRITICAL: %s active API markets but 0 announced_markets rows — "
+                        "notification registration is broken (check save_announced_market)",
+                        active_api,
+                    )
+                    PIPELINE_METRICS["api_skipped"] = PIPELINE_METRICS.get("api_skipped", 0) + 1
+                    set_bot_state("last_registration_critical", now_utc().isoformat())
+            except Exception as e:
+                logger.error(f"registration integrity check failed: {e}")
+
             check_scheduled_notifications()
 
             # Intelligence is secondary — never let it starve notification delivery.
@@ -7372,6 +7438,177 @@ def premiumlead_command(message):
         reply_temp(message, f"Error: {e}")
 
 
+def audit_one_market(market, existing=None):
+    """Full filter audit for one market. Returns list of (stage, yes/no, exact reason)."""
+    mid = str(market.get("market_id", "")).strip()
+    title = str(market.get("title", "")).strip()
+    existing = existing if existing is not None else get_announced_market(mid)
+    lines = []
+
+    def add(stage, ok, reason):
+        lines.append((stage, ok, reason))
+
+    add("detected", True, "present_in_api_or_input")
+    if not mid:
+        add("registered", False, "code: empty market_id → skip")
+        return mid, title, lines
+    if not is_valid_market(market):
+        add("valid", False, "code: is_valid_market() failed (missing title/end_time)")
+        return mid, title, lines
+    add("valid", True, "is_valid_market() passed")
+    if not is_market_active(market):
+        add("active", False, f"code: is_market_active() false resolved={market.get('resolved')} hidden={market.get('hidden')}")
+        return mid, title, lines
+    add("active", True, "is_market_active() passed")
+
+    scheduled = is_scheduled_market(market)
+    add("scheduled", scheduled, "is_scheduled_market() go_live_at > now" if scheduled else "live_now")
+
+    app_live = is_market_app_live(mid, market)
+    add("APP_LIVE", app_live, "cover_image_status=ready or cover HEAD 200" if app_live else "cover not ready (is_market_app_live=False)")
+
+    api_indexed = True  # if we have it from API scan
+    add("API_INDEXED", api_indexed, "market returned by public API fetch")
+
+    if not existing:
+        add("row_in_db", False, "code: get_announced_market() is None — registration missing/failed")
+        add("premium_should_create", app_live and not scheduled, "no row yet; premium if APP_LIVE and not scheduled")
+        add("public_should_create", not scheduled, "no row yet; public if not scheduled")
+        add("reminder_12h", False, "code: check_scheduled requires notified_new/premium/public flags on DB row")
+        add("reminder_6h", False, "code: same — no DB row")
+        add("reminder_1h", False, "code: same — no DB row")
+        add("reminder_final", False, "code: same — no DB row")
+        return mid, title, lines
+
+    add("row_in_db", True, f"source={existing.get('source')} lifecycle={existing.get('lifecycle_state')}")
+    prem_done = market_premium_already_notified(existing)
+    pub_done = market_public_already_notified(existing)
+    live_flag = bool(existing.get("notified_new") or prem_done or pub_done)
+
+    if prem_done:
+        add("premium_should_create", False, "code: market_premium_already_notified() premium_notified_onchain=TRUE")
+    elif scheduled:
+        add("premium_should_create", False, "code: is_scheduled_market — uses scheduled path not APP_LIVE premium")
+    elif not app_live:
+        add("premium_should_create", False, "code: is_market_app_live=False — waiting cover")
+    else:
+        add("premium_should_create", True, "code: APP_LIVE and premium_notified_onchain=FALSE → send_premium / announce_live")
+
+    if pub_done:
+        add("public_should_create", False, "code: market_public_already_notified() public_notified|notified_new")
+    elif scheduled:
+        add("public_should_create", False, "code: scheduled market — public after go-live via announce_live")
+    else:
+        add("public_should_create", True, "code: API_INDEXED and public not done → send_public_api_indexed_notification")
+
+    # Time windows for reminders
+    try:
+        et = existing.get("end_time")
+        if isinstance(et, datetime):
+            end_dt = et.replace(tzinfo=None) if et.tzinfo else et
+        else:
+            end_dt = datetime.fromisoformat(str(et).replace("Z", "+00:00")).replace(tzinfo=None)
+        hours = (end_dt - now_utc()).total_seconds() / 3600
+        mins = hours * 60
+    except Exception as e:
+        hours, mins = None, None
+        add("timer_parse", False, f"code: end_time parse failed: {e}")
+
+    featured = bool(existing.get("is_featured") and FEATURED_WALLETS)
+
+    def rem(name, should, reason_yes, reason_no):
+        add(name, should, reason_yes if should else reason_no)
+
+    if not live_flag:
+        rem("reminder_12h", False, "", "code: check_scheduled skip — notified_new/premium/public all false")
+        rem("reminder_6h", False, "", "code: same")
+        rem("reminder_1h", False, "", "code: same")
+        rem("reminder_final", False, "", "code: same")
+    elif hours is None:
+        rem("reminder_12h", False, "", "code: cannot compute time_until")
+        rem("reminder_6h", False, "", "code: cannot compute time_until")
+        rem("reminder_1h", False, "", "code: cannot compute time_until")
+        rem("reminder_final", False, "", "code: cannot compute time_until")
+    else:
+        if featured:
+            rem(
+                "reminder_12h",
+                6 < hours <= 12 and not existing.get("notified_12h"),
+                "code: featured window 12h>t>6h and notified_12h=FALSE",
+                f"code: featured but hours={hours:.1f} or notified_12h={existing.get('notified_12h')}",
+            )
+            rem(
+                "reminder_6h",
+                1 < hours <= 6 and not existing.get("notified_6h"),
+                "code: featured window 6h>t>1h and notified_6h=FALSE",
+                f"code: featured but hours={hours:.1f} or notified_6h={existing.get('notified_6h')}",
+            )
+        else:
+            rem("reminder_12h", False, "", "code: standard markets have no 12h path (featured-only FEATURED_WALLETS)")
+            rem("reminder_6h", False, "", "code: standard markets have no 6h path (featured-only)")
+        rem(
+            "reminder_1h",
+            hours <= 1.0 and mins > 10 and not existing.get("notified_1h"),
+            "code: hours<=1 and notified_1h=FALSE",
+            f"code: hours={hours:.2f} or notified_1h={existing.get('notified_1h')}",
+        )
+        rem(
+            "reminder_final",
+            mins <= 10 and mins > 0 and not existing.get("notified_5m"),
+            "code: minutes<=10 and notified_5m=FALSE (10m final)",
+            f"code: mins={mins:.1f} or notified_5m={existing.get('notified_5m')}",
+        )
+
+    return mid, title, lines
+
+
+def build_audit_pipeline_text(limit=12):
+    """Admin /auditpipeline — every active market + exact skip reasons."""
+    markets = [
+        m for m in fetch_b4_markets()
+        if is_valid_market(m) and is_market_active(m)
+    ]
+    rows = get_all_announced_markets()
+    rows_by_id = {str(r.get("market_id", "")).strip(): r for r in rows}
+
+    parts = [
+        f"🔎 <b>Pipeline Audit</b>",
+        f"API active: <b>{len(markets)}</b> | DB rows: <b>{len(rows)}</b>",
+        f"Dry-run: <b>{NOTIFICATION_DRY_RUN}</b> | Paused: <b>{get_pause_state()}</b>",
+    ]
+    if len(markets) > 0 and len(rows) == 0:
+        parts.append(
+            "\n🚨 <b>CRITICAL</b>: active markets &gt; 0 but DB rows = 0\n"
+            "Registration is broken — check <code>save_announced_market</code> / logs for "
+            "<code>NOTIFICATION_REGISTER</code> / <code>row_failed</code>."
+        )
+
+    for market in markets[:limit]:
+        mid, title, stages = audit_one_market(market, rows_by_id.get(str(market.get("market_id", "")).strip()))
+        parts.append(f"\n———\n<b>{escape_text((title or '')[:48])}</b>")
+        parts.append(f"<code>{escape_text(mid)}</code>")
+        for stage, ok, reason in stages:
+            mark = "✅" if ok else "❌"
+            parts.append(f"{mark} <b>{escape_text(stage)}</b>: {escape_text(reason)[:120]}")
+
+    if len(markets) > limit:
+        parts.append(f"\n… and {len(markets) - limit} more markets (showing first {limit})")
+
+    # Also dump any orphan DB rows not in API
+    orphan = [r for r in rows if str(r.get("market_id", "")).strip() not in {
+        str(m.get("market_id", "")).strip() for m in markets
+    }]
+    if orphan:
+        parts.append(f"\n📦 DB-only rows not in API now: <b>{len(orphan)}</b>")
+        for r in orphan[:5]:
+            parts.append(f"  • <code>{escape_text(str(r.get('market_id'))[:16])}</code> {escape_text((r.get('title') or '')[:30])}")
+
+    text = "\n".join(parts)
+    if len(text) > 3900:
+        text = text[:3900] + "\n…truncated"
+    return text
+
+
 @bot.message_handler(commands=['health', 'pipeline', 'pipelinestatus'])
 def health_command(message):
     """Admin diagnostics: /health, /pipeline, /pipelinestatus (aliases)."""
@@ -7389,6 +7626,26 @@ def health_command(message):
         try_delete_user_message(message)
     except Exception as e:
         logger.error(f"error in health/pipeline: {e}")
+        reply_temp(message, f"❌ Error: {e}")
+
+
+@bot.message_handler(commands=['auditpipeline'])
+def auditpipeline_command(message):
+    """Admin: per-market notification state + exact skip reasons."""
+    try:
+        if not is_admin(message.from_user.id):
+            reply_temp(message, "❌ Permission Denied. Admin Only Command")
+            return
+        reply_temp(message, "Auditing pipeline…", parse_mode=None)
+        text = build_audit_pipeline_text(limit=10)
+        # May need multiple messages if long
+        if len(text) <= 4000:
+            reply_temp(message, text, parse_mode="HTML")
+        else:
+            for i in range(0, len(text), 3500):
+                reply_temp(message, text[i:i + 3500], parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"error in auditpipeline: {e}")
         reply_temp(message, f"❌ Error: {e}")
 
 @bot.message_handler(commands=['recent'])
@@ -7898,6 +8155,7 @@ try:
         telebot.types.BotCommand("preview", "Preview latest market alert"),
         telebot.types.BotCommand("health", "Pipeline diagnostics"),
         telebot.types.BotCommand("pipeline", "Pipeline diagnostics"),
+        telebot.types.BotCommand("auditpipeline", "Per-market notification audit"),
         telebot.types.BotCommand("premium_add", "Add premium user or chat"),
         telebot.types.BotCommand("setpremiumwallet", "Set USDC Solana payment address"),
         telebot.types.BotCommand("premium_remove", "Remove premium user or chat"),

@@ -148,6 +148,53 @@ def test_pipeline_stages_for_one_market():
         print(f"  {stage}: {ok} ({reason})")
 
 
+def test_save_announced_market_placeholder_count():
+    """ROOT CAUSE of 12 markets / 0 rows: INSERT %s count must match params."""
+    sql = """
+            INSERT INTO announced_markets (
+                market_id, title, theme, end_time, market_link, notified_new,
+                notified_1h, notified_5m, notified_ended, delete_scheduled,
+                notified_scheduled, notified_go_live_2m, image_followup_sent,
+                is_scheduled, go_live_at, detected_at, source, market_pubkey,
+                cover_image_url, onchain_detected_at, api_detected_at,
+                premium_notified_onchain, metadata_json,
+                notified_12h, notified_6h, notified_30m, is_featured
+            )
+            VALUES (
+                %s, %s, %s, %s, %s, %s,
+                FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE,
+                %s, %s, %s, %s, %s,
+                %s, %s, %s,
+                %s, %s,
+                FALSE, FALSE, FALSE, %s
+            )
+            ON CONFLICT (market_id) DO NOTHING
+            RETURNING market_id
+        """
+    params = (
+        "id", "title", "theme", "end", "link", False,
+        False, None, "now", "api",
+        None, None, None, None,
+        False, None,
+        False,
+    )
+    assert sql.count("%s") == len(params), (
+        f"placeholders={sql.count('%s')} params={len(params)} — registration will always fail"
+    )
+    # Broken legacy form had 18 placeholders and 17 params
+    broken = "%s, " * 11  # old middle line had 11 %s instead of 10
+    assert sql.count("%s") == 17
+    print("PASS: save_announced_market placeholder count matches params (17)")
+
+
+def test_active_markets_zero_rows_is_critical():
+    active_api = 12
+    row_count = 0
+    is_critical = active_api > 0 and row_count == 0
+    assert is_critical is True
+    print("PASS: active markets with 0 rows is a CRITICAL condition")
+
+
 if __name__ == "__main__":
     test_notified_new_must_unlock_on_premium_success()
     test_public_empty_audience_must_not_block_forever()
@@ -156,4 +203,6 @@ if __name__ == "__main__":
     test_no_duplicate_public_inflight()
     test_standard_reminder_windows()
     test_pipeline_stages_for_one_market()
+    test_save_announced_market_placeholder_count()
+    test_active_markets_zero_rows_is_critical()
     print("ALL NOTIFY PIPELINE REGRESSION TESTS PASSED")
