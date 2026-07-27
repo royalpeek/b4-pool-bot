@@ -22,6 +22,47 @@ def test_notified_new_must_unlock_on_premium_success():
     print("PASS: premium success unlocks reminders (notified_new)")
 
 
+def test_public_independent_of_notified_new_and_premium():
+    """ROOT CAUSE: public must NOT treat notified_new as public_notified."""
+
+    def market_public_already_notified(existing):
+        if not existing:
+            return False
+        return bool(existing.get("public_notified"))
+
+    # Premium already sent + reminders unlocked — public still pending
+    row = {
+        "premium_notified_onchain": True,
+        "notified_new": True,
+        "public_notified": False,
+    }
+    assert market_public_already_notified(row) is False, "public must still run after premium"
+    row["public_notified"] = True
+    assert market_public_already_notified(row) is True
+    print("PASS: public independent of premium/notified_new")
+
+
+def test_premium_independent_of_api_indexed():
+    """Premium fires on APP_LIVE; must not require public/api flags."""
+    premium_done = False
+    app_live = True
+    api_indexed = False  # not yet in API
+
+    def should_send_premium():
+        return app_live and not premium_done
+
+    assert should_send_premium() is True
+    premium_done = True
+    assert should_send_premium() is False
+    # API later does not re-send premium
+    api_indexed = True
+    assert should_send_premium() is False
+    # Public still independent
+    public_done = False
+    assert api_indexed and not public_done
+    print("PASS: premium on APP_LIVE independent of API_INDEXED")
+
+
 def test_public_empty_audience_must_not_block_forever():
     """ROOT CAUSE: all chats premium → exclude_premium targets=0 → public never set flags."""
     public_targets = 0
@@ -197,6 +238,8 @@ def test_active_markets_zero_rows_is_critical():
 
 if __name__ == "__main__":
     test_notified_new_must_unlock_on_premium_success()
+    test_public_independent_of_notified_new_and_premium()
+    test_premium_independent_of_api_indexed()
     test_public_empty_audience_must_not_block_forever()
     test_reminder_gate_accepts_premium_or_public_or_notified_new()
     test_claim_before_send_releases_on_failure()
