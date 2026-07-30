@@ -1,19 +1,17 @@
 """
-B4 Notify Bot — Lightweight public edition.
+B4 Notify Bot — API-only lightweight public edition.
 
-On-chain discovery → APP_LIVE (cover HEAD 200) → public Telegram notification.
-Optimized for free-tier hosts (Render): low memory, one monitor loop, no AI/premium.
+Polls the official B4 API → new market detection → public Telegram notification.
+Optimized for free-tier hosts (Render): low memory, one monitor loop.
 """
-print("B4 Notify Bot — LIGHTWEIGHT public edition")
+print("B4 Notify Bot — API-ONLY public edition")
 
-import base64
 import html
 import logging
 import os
-import struct
 import time
 import urllib.parse
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from threading import Thread
 
 import psycopg
@@ -57,21 +55,10 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or 0)
 MARKET_LINK_BASE = os.getenv("MARKET_LINK_BASE", "https://www.b4app.xyz/m").rstrip("/")
 B4_API_URL = os.getenv("B4_API_URL", "https://www.b4app.xyz/api/markets")
 
-SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
-B4_PROGRAM_ID = os.getenv("B4_SOLANA_PROGRAM_ID", "9XQDD38sy1qJ57DqAQvADuLRTjcYUXD48H7deyNuaehH")
-ONCHAIN_ENABLED = os.getenv("ONCHAIN_PROVIDER_ENABLED", "true").lower() == "true"
-ONCHAIN_POLL_SECONDS = float(os.getenv("ONCHAIN_POLL_SECONDS", "8"))
-ONCHAIN_ACCOUNT_SIZE = int(os.getenv("ONCHAIN_MARKET_ACCOUNT_SIZE", "464"))
-ONCHAIN_ID_OFFSET = int(os.getenv("ONCHAIN_MARKET_ID_OFFSET", "8"))
-ONCHAIN_TITLE_LEN_OFFSET = int(os.getenv("ONCHAIN_TITLE_LENGTH_OFFSET", "48"))
-ONCHAIN_TITLE_OFFSET = int(os.getenv("ONCHAIN_TITLE_OFFSET", "52"))
-ONCHAIN_DURATION = int(os.getenv("ONCHAIN_MARKET_DURATION_SECONDS", "86400"))
-
 MARKET_POLL_SECONDS = float(os.getenv("MARKET_POLL_SECONDS", "5"))
 NEW_MARKET_DELAY_SECONDS = float(os.getenv("NEW_MARKET_DELAY_SECONDS", "30"))
 SEND_DELAY_SECONDS = float(os.getenv("SEND_DELAY_SECONDS", "0.08"))
 API_TIMEOUT = float(os.getenv("API_TIMEOUT_SECONDS", "8"))
-COVER_CACHE_SECONDS = float(os.getenv("COVER_LIVE_CACHE_SECONDS", "60"))
 ENABLE_REMINDERS = os.getenv("ENABLE_REMINDERS", "true").lower() == "true"
 REMINDER_1H = float(os.getenv("REMINDER_1H_SECONDS", "3600"))
 REMINDER_10M = float(os.getenv("REMINDER_10M_SECONDS", "600"))
@@ -85,20 +72,15 @@ HEALTH = {
     "started_at": time.time(),
     "status": "starting",
     "last_scan_at": 0.0,
-    "last_onchain_at": 0.0,
     "last_eval_at": 0.0,
     "last_notification_at": 0.0,
     "last_notification_title": "",
-    "markets_onchain_last": 0,
-    "markets_api_last": 0,
+    "last_market_count": 0,
     "markets_registered": 0,
     "notifications_sent": 0,
     "loop_count": 0,
     "last_error": "",
 }
-
-_cover_cache: dict = {}  # mid -> (ok, expires_mono)
-_last_onchain_poll = 0.0
 
 
 # ── Time / DB helpers ────────────────────────────────────────────────────────
@@ -145,13 +127,11 @@ def init_db():
                             title TEXT,
                             end_time TEXT,
                             market_link TEXT,
-                            source TEXT DEFAULT 'onchain',
-                            lifecycle_state TEXT DEFAULT 'discovered_onchain',
+                            source TEXT DEFAULT 'api',
                             public_notified BOOLEAN DEFAULT FALSE,
                             notified_1h BOOLEAN DEFAULT FALSE,
                             notified_10m BOOLEAN DEFAULT FALSE,
                             notified_ended BOOLEAN DEFAULT FALSE,
-                            app_live_at TIMESTAMP,
                             public_sent_at TIMESTAMP,
                             detected_at TIMESTAMP DEFAULT NOW(),
                             updated_at TIMESTAMP DEFAULT NOW()
@@ -174,16 +154,13 @@ def init_db():
                     cur.execute(
                         "CREATE INDEX IF NOT EXISTS idx_market_messages_market ON market_messages (market_id)"
                     )
-                    # Compat with older full-bot schema
+                    # Compat columns for existing databases
                     for stmt in (
                         "ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS public_notified BOOLEAN DEFAULT FALSE",
                         "ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS notified_1h BOOLEAN DEFAULT FALSE",
                         "ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS notified_10m BOOLEAN DEFAULT FALSE",
                         "ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS notified_ended BOOLEAN DEFAULT FALSE",
-                        "ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS lifecycle_state TEXT DEFAULT 'discovered_onchain'",
-                        "ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS app_live_at TIMESTAMP",
                         "ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS public_sent_at TIMESTAMP",
-                        "ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'onchain'",
                         "ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS market_link TEXT",
                         "ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS end_time TEXT",
                         "ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS title TEXT",
@@ -296,21 +273,19 @@ def register_market(market):
     end_unix = int(market.get("end_time") or 0)
     end_iso = datetime.fromtimestamp(end_unix, tz=timezone.utc).replace(tzinfo=None).isoformat()
     link = f"{MARKET_LINK_BASE}/{mid}"
-    source = str(market.get("source") or "onchain")
     try:
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
                     INSERT INTO announced_markets (
-                        market_id, title, end_time, market_link, source,
-                        lifecycle_state, public_notified, notified_1h, notified_10m, notified_ended
+                        market_id, title, end_time, market_link, source
                     )
-                    VALUES (%s, %s, %s, %s, %s, 'discovered_onchain', FALSE, FALSE, FALSE, FALSE)
+                    VALUES (%s, %s, %s, %s, 'api')
                     ON CONFLICT (market_id) DO NOTHING
                     RETURNING market_id
                     """,
-                    (mid, title, end_iso, link, source),
+                    (mid, title, end_iso, link),
                 )
                 inserted = cur.fetchone() is not None
         if inserted:
@@ -362,45 +337,6 @@ def release_flag(market_id, flag):
         logger.error("release_flag %s: %s", market_id, e)
 
 
-def set_lifecycle(market_id, state, app_live=False, public_sent=False):
-    try:
-        with get_db() as conn:
-            with conn.cursor() as cur:
-                if app_live:
-                    cur.execute(
-                        """
-                        UPDATE announced_markets
-                        SET lifecycle_state = %s,
-                            app_live_at = COALESCE(app_live_at, NOW()),
-                            updated_at = NOW()
-                        WHERE market_id = %s
-                        """,
-                        (state, str(market_id)),
-                    )
-                elif public_sent:
-                    cur.execute(
-                        """
-                        UPDATE announced_markets
-                        SET lifecycle_state = %s,
-                            public_sent_at = COALESCE(public_sent_at, NOW()),
-                            updated_at = NOW()
-                        WHERE market_id = %s
-                        """,
-                        (state, str(market_id)),
-                    )
-                else:
-                    cur.execute(
-                        """
-                        UPDATE announced_markets
-                        SET lifecycle_state = %s, updated_at = NOW()
-                        WHERE market_id = %s
-                        """,
-                        (state, str(market_id)),
-                    )
-    except Exception as e:
-        logger.error("set_lifecycle %s: %s", market_id, e)
-
-
 def _track_message(market_id, chat_id, message_id, msg_type="new"):
     try:
         with get_db() as conn:
@@ -450,9 +386,6 @@ def cleanup_market(market_id):
             logger.warning("cleanup delete msg mid=%s chat=%s: %s", market_id, row.get("chat_id"), e)
     logger.info("Market ended mid=%s: deleted %s Telegram messages", market_id, deleted)
     _delete_market_messages(market_id)
-    logger.info("Market ended mid=%s: cleared message tracking", market_id)
-    _cover_cache.pop(str(market_id), None)
-    logger.info("Market ended mid=%s: cleared cover cache", market_id)
     logger.info("Market ended mid=%s: cleanup complete", market_id)
 
 
@@ -460,124 +393,12 @@ def is_admin(uid):
     return ADMIN_ID and int(uid) == ADMIN_ID
 
 
-# ── On-chain + APP_LIVE ──────────────────────────────────────────────────────
-
-def cover_url(market_id):
-    return f"https://www.b4app.xyz/api/assets/market-cover/{market_id}.png"
-
-
 def market_link(market_id):
     return f"{MARKET_LINK_BASE}/{market_id}"
 
 
-def is_app_live(market_id):
-    """APP_LIVE = cover image HEAD returns 200 (cached)."""
-    mid = str(market_id).strip()
-    if not mid:
-        return False
-    now_m = time.monotonic()
-    cached = _cover_cache.get(mid)
-    if cached and cached[1] > now_m:
-        return cached[0]
-    ok = False
-    try:
-        r = requests.head(cover_url(mid), timeout=min(API_TIMEOUT, 6), allow_redirects=True)
-        ok = r.status_code == 200
-    except Exception as e:
-        logger.debug("cover HEAD %s: %s", mid, e)
-    _cover_cache[mid] = (ok, now_m + COVER_CACHE_SECONDS)
-    if len(_cover_cache) > 1500:
-        dead = [k for k, v in _cover_cache.items() if v[1] <= now_m]
-        for k in dead[:400]:
-            _cover_cache.pop(k, None)
-    return ok
-
-
-def read_u64_le(data, offset):
-    if offset < 0 or offset + 8 > len(data):
-        return None
-    return struct.unpack_from("<Q", data, offset)[0]
-
-
-def read_u32_le(data, offset):
-    if offset < 0 or offset + 4 > len(data):
-        return None
-    return struct.unpack_from("<I", data, offset)[0]
-
-
-def decode_onchain_account(pubkey, encoded_data):
-    try:
-        raw = encoded_data[0] if isinstance(encoded_data, list) else encoded_data
-        data = base64.b64decode(raw)
-        market_id = read_u64_le(data, ONCHAIN_ID_OFFSET)
-        title_len = read_u32_le(data, ONCHAIN_TITLE_LEN_OFFSET)
-        if not market_id or not title_len:
-            return None
-        if market_id < 1_700_000_000_000_000 or market_id > 1_900_000_000_000_000:
-            return None
-        if title_len < 6 or title_len > 180:
-            return None
-        end = ONCHAIN_TITLE_OFFSET + title_len
-        if end > len(data):
-            return None
-        title = data[ONCHAIN_TITLE_OFFSET:end].decode("utf-8", errors="strict").strip("\x00").strip()
-        if len(title) < 6:
-            return None
-        created = int(market_id // 1_000_000)
-        return {
-            "market_id": str(market_id),
-            "market_pubkey": str(pubkey),
-            "title": title,
-            "end_time": created + ONCHAIN_DURATION,
-            "source": "onchain",
-        }
-    except Exception:
-        return None
-
-
-def fetch_onchain_markets():
-    if not ONCHAIN_ENABLED:
-        return []
-    try:
-        payload = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "getProgramAccounts",
-            "params": [
-                B4_PROGRAM_ID,
-                {
-                    "encoding": "base64",
-                    "commitment": "confirmed",
-                    "filters": [{"dataSize": ONCHAIN_ACCOUNT_SIZE}],
-                    "dataSlice": {"offset": 0, "length": ONCHAIN_ACCOUNT_SIZE},
-                },
-            ],
-        }
-        r = requests.post(SOLANA_RPC_URL, json=payload, timeout=max(API_TIMEOUT, 15))
-        r.raise_for_status()
-        data = r.json()
-        if data.get("error"):
-            logger.error("solana rpc: %s", data["error"])
-            return []
-        now_ts = int(time.time())
-        markets = []
-        for acc in data.get("result") or []:
-            m = decode_onchain_account(acc.get("pubkey"), (acc.get("account") or {}).get("data"))
-            if m and int(m["end_time"]) > now_ts:
-                markets.append(m)
-        HEALTH["last_onchain_at"] = time.time()
-        HEALTH["markets_onchain_last"] = len(markets)
-        set_state("last_onchain_check", now_utc().isoformat())
-        logger.info("on-chain live markets: %s", len(markets))
-        return markets
-    except Exception as e:
-        logger.error("fetch_onchain_markets: %s", e)
-        HEALTH["last_error"] = f"onchain:{e}"
-        return []
-
-
 def fetch_api_markets():
-    """Optional secondary discovery — does not gate APP_LIVE public notify."""
+    """Fetch active markets from the official B4 API."""
     try:
         r = requests.get(
             B4_API_URL,
@@ -605,9 +426,8 @@ def fetch_api_markets():
                 "title": title,
                 "end_time": end,
                 "source": "api",
-                "cover_image_status": m.get("cover_image_status"),
             })
-        HEALTH["markets_api_last"] = len(out)
+        HEALTH["last_market_count"] = len(out)
         HEALTH["last_scan_at"] = time.time()
         set_state("last_api_check", now_utc().isoformat())
         return out
@@ -682,28 +502,23 @@ def build_reminder_message(title, market_id, label, time_left_sec):
 # ── Notification pipeline ────────────────────────────────────────────────────
 
 def send_public_new_market(market, row):
-    """APP_LIVE → delay → verify → public notification (once)."""
+    """Delay → verify → public notification (once)."""
     mid = str(market.get("market_id", "")).strip()
     if not mid or not row:
         return False
     if row.get("public_notified"):
         return False
-    if not is_app_live(mid):
-        return False
 
     if not claim_flag(mid, "public_notified"):
         return False
 
-    set_lifecycle(mid, "app_live", app_live=True)
     title = str(market.get("title") or row.get("title") or "").strip()
     end_unix = int(market.get("end_time") or 0)
 
-    # Delay before announcing (configurable, default 30s)
     if NEW_MARKET_DELAY_SECONDS > 0:
         logger.debug("delaying announcement mid=%s %ss", mid, NEW_MARKET_DELAY_SECONDS)
         time.sleep(NEW_MARKET_DELAY_SECONDS)
 
-    # Re-check market is still live (not resolved)
     latest = get_market(mid)
     if latest and latest.get("notified_ended"):
         release_flag(mid, "public_notified")
@@ -712,7 +527,6 @@ def send_public_new_market(market, row):
     text = build_new_market_message(title, mid, end_unix)
     sent = broadcast(text, vote_keyboard(mid), track_market_id=mid, msg_type="new")
     if sent > 0:
-        set_lifecycle(mid, "public_notified", public_sent=True)
         HEALTH["last_notification_title"] = title[:80]
         set_state("last_market_detected", f"{mid} | {title}")
         logger.info("PUBLIC NEW MARKET sent mid=%s title=%s sent=%s", mid, title[:40], sent)
@@ -769,29 +583,8 @@ def process_reminders():
             logger.error("reminder error: %s", e)
 
 
-def process_market(market):
-    """Discovery → register → APP_LIVE public notify."""
-    mid = str(market.get("market_id", "")).strip()
-    title = str(market.get("title", "")).strip()
-    end_unix = int(market.get("end_time") or 0)
-    if not mid or not title or end_unix <= int(time.time()):
-        return
-
-    row, is_new = register_market(market)
-    if not row:
-        return
-
-    if row.get("public_notified") or row.get("notified_ended"):
-        return
-
-    if is_app_live(mid):
-        send_public_new_market(market, row)
-    else:
-        set_lifecycle(mid, "discovered_onchain")
-
-
 def monitor_loop():
-    global _last_onchain_poll, _PAUSED
+    global _PAUSED
     logger.info("monitor loop started")
     HEALTH["status"] = "running"
     while True:
@@ -805,43 +598,22 @@ def monitor_loop():
                 time.sleep(max(1.0, MARKET_POLL_SECONDS - elapsed))
                 continue
 
-            # On-chain discovery (primary)
-            if ONCHAIN_ENABLED and (time.time() - _last_onchain_poll) >= ONCHAIN_POLL_SECONDS:
-                _last_onchain_poll = time.time()
-                for market in fetch_onchain_markets():
-                    try:
-                        process_market(market)
-                    except Exception as e:
-                        logger.error("process onchain market: %s", e)
-
-            # API discovery (secondary — catches anything on-chain missed)
+            # API discovery (sole source of truth)
             for market in fetch_api_markets():
                 try:
-                    process_market(market)
+                    mid = str(market.get("market_id", "")).strip()
+                    title = str(market.get("title", "")).strip()
+                    end_unix = int(market.get("end_time") or 0)
+                    if not mid or not title or end_unix <= int(time.time()):
+                        continue
+
+                    row, is_new = register_market(market)
+                    if not row or row.get("public_notified") or row.get("notified_ended"):
+                        continue
+
+                    send_public_new_market(market, row)
                 except Exception as e:
                     logger.error("process api market: %s", e)
-
-            # Pending APP_LIVE for registered but not yet public
-            for row in get_all_markets():
-                try:
-                    if row.get("public_notified") or row.get("notified_ended"):
-                        continue
-                    mid = str(row.get("market_id", "")).strip()
-                    if not mid or not is_app_live(mid):
-                        continue
-                    et = row.get("end_time")
-                    if isinstance(et, datetime):
-                        end_unix = int(et.replace(tzinfo=timezone.utc).timestamp()) if et.tzinfo is None else int(et.timestamp())
-                    else:
-                        end_unix = int(datetime.fromisoformat(str(et).replace("Z", "+00:00")).timestamp())
-                    process_market({
-                        "market_id": mid,
-                        "title": row.get("title") or "",
-                        "end_time": end_unix,
-                        "source": row.get("source") or "onchain",
-                    })
-                except Exception as e:
-                    logger.error("pending app_live: %s", e)
 
             process_reminders()
             HEALTH["last_eval_at"] = time.time()
@@ -849,10 +621,9 @@ def monitor_loop():
 
             if HEALTH["loop_count"] % 12 == 0:
                 logger.info(
-                    "HEARTBEAT loops=%s onchain=%s api=%s chats=%s sends=%s",
+                    "HEARTBEAT loops=%s markets=%s chats=%s sends=%s",
                     HEALTH["loop_count"],
-                    HEALTH.get("markets_onchain_last"),
-                    HEALTH.get("markets_api_last"),
+                    HEALTH.get("last_market_count"),
                     len(get_all_chats()),
                     HEALTH.get("notifications_sent"),
                 )
@@ -973,7 +744,7 @@ def root():
 @app.route("/health")
 def http_health():
     return {"ok": HEALTH.get("status") == "running", **{k: HEALTH[k] for k in (
-        "status", "loop_count", "markets_onchain_last", "notifications_sent", "last_error"
+        "status", "loop_count", "last_market_count", "notifications_sent", "last_error"
     )}}
 
 
