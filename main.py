@@ -52,6 +52,8 @@ logger.info(
     any(q.startswith("sslmode=") for q in _db_parsed.query.split("&")),
 )
 
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or 0)
+
 MARKET_LINK_BASE = os.getenv("MARKET_LINK_BASE", "https://www.b4app.xyz/m").rstrip("/")
 B4_API_URL = os.getenv("B4_API_URL", "https://www.b4app.xyz/api/markets")
 
@@ -66,13 +68,15 @@ ONCHAIN_TITLE_OFFSET = int(os.getenv("ONCHAIN_TITLE_OFFSET", "52"))
 ONCHAIN_DURATION = int(os.getenv("ONCHAIN_MARKET_DURATION_SECONDS", "86400"))
 
 MARKET_POLL_SECONDS = float(os.getenv("MARKET_POLL_SECONDS", "5"))
-PUBLIC_ALERT_DELAY_SECONDS = float(os.getenv("PUBLIC_ALERT_DELAY_SECONDS", "0"))
+NEW_MARKET_DELAY_SECONDS = float(os.getenv("NEW_MARKET_DELAY_SECONDS", "30"))
 SEND_DELAY_SECONDS = float(os.getenv("SEND_DELAY_SECONDS", "0.08"))
 API_TIMEOUT = float(os.getenv("API_TIMEOUT_SECONDS", "8"))
 COVER_CACHE_SECONDS = float(os.getenv("COVER_LIVE_CACHE_SECONDS", "60"))
 ENABLE_REMINDERS = os.getenv("ENABLE_REMINDERS", "true").lower() == "true"
 REMINDER_1H = float(os.getenv("REMINDER_1H_SECONDS", "3600"))
 REMINDER_10M = float(os.getenv("REMINDER_10M_SECONDS", "600"))
+
+_PAUSED = False
 
 bot = telebot.TeleBot(BOT_TOKEN, threaded=False)
 
@@ -153,6 +157,22 @@ def init_db():
                             updated_at TIMESTAMP DEFAULT NOW()
                         )
                         """
+                    )
+                    # Track sent message IDs for cleanup
+                    cur.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS market_messages (
+                            id SERIAL PRIMARY KEY,
+                            market_id TEXT NOT NULL,
+                            chat_id TEXT NOT NULL,
+                            message_id BIGINT NOT NULL,
+                            msg_type TEXT DEFAULT 'new',
+                            sent_at TIMESTAMP DEFAULT NOW()
+                        )
+                        """
+                    )
+                    cur.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_market_messages_market ON market_messages (market_id)"
                     )
                     # Compat with older full-bot schema
                     for stmt in (
@@ -381,6 +401,65 @@ def set_lifecycle(market_id, state, app_live=False, public_sent=False):
         logger.error("set_lifecycle %s: %s", market_id, e)
 
 
+def _track_message(market_id, chat_id, message_id, msg_type="new"):
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO market_messages (market_id, chat_id, message_id, msg_type) VALUES (%s, %s, %s, %s)",
+                    (str(market_id), str(chat_id), int(message_id), msg_type),
+                )
+    except Exception as e:
+        logger.warning("track_message %s: %s", market_id, e)
+
+
+def _get_market_messages(market_id):
+    try:
+        with get_db() as conn:
+            with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
+                cur.execute(
+                    "SELECT chat_id, message_id FROM market_messages WHERE market_id = %s",
+                    (str(market_id),),
+                )
+                return cur.fetchall()
+    except Exception as e:
+        logger.warning("get_market_messages %s: %s", market_id, e)
+        return []
+
+
+def _delete_market_messages(market_id):
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM market_messages WHERE market_id = %s", (str(market_id),))
+    except Exception as e:
+        logger.warning("delete_market_messages %s: %s", market_id, e)
+
+
+def cleanup_market(market_id):
+    """Delete all tracked messages, clear cache, mark DB ended."""
+    logger.info("Market ended mid=%s: starting cleanup", market_id)
+    messages = _get_market_messages(market_id)
+    deleted = 0
+    for row in messages:
+        try:
+            bot.delete_message(int(row["chat_id"]), int(row["message_id"]))
+            deleted += 1
+            time.sleep(SEND_DELAY_SECONDS)
+        except Exception as e:
+            logger.warning("cleanup delete msg mid=%s chat=%s: %s", market_id, row.get("chat_id"), e)
+    logger.info("Market ended mid=%s: deleted %s Telegram messages", market_id, deleted)
+    _delete_market_messages(market_id)
+    logger.info("Market ended mid=%s: cleared message tracking", market_id)
+    _cover_cache.pop(str(market_id), None)
+    logger.info("Market ended mid=%s: cleared cover cache", market_id)
+    logger.info("Market ended mid=%s: cleanup complete", market_id)
+
+
+def is_admin(uid):
+    return ADMIN_ID and int(uid) == ADMIN_ID
+
+
 # ── On-chain + APP_LIVE ──────────────────────────────────────────────────────
 
 def cover_url(market_id):
@@ -542,7 +621,7 @@ def fetch_api_markets():
 
 def send_to_chat(chat_id, text, keyboard=None):
     try:
-        bot.send_message(
+        msg = bot.send_message(
             int(chat_id),
             text,
             parse_mode="HTML",
@@ -550,18 +629,21 @@ def send_to_chat(chat_id, text, keyboard=None):
             disable_web_page_preview=False,
         )
         time.sleep(SEND_DELAY_SECONDS)
-        return True
+        return msg.message_id
     except Exception as e:
         logger.warning("send_to_chat %s: %s", chat_id, e)
-        return False
+        return None
 
 
-def broadcast(text, keyboard=None):
+def broadcast(text, keyboard=None, track_market_id=None, msg_type="new"):
     chats = get_all_chats()
     sent = 0
     for chat_id in chats:
-        if send_to_chat(chat_id, text, keyboard):
+        msg_id = send_to_chat(chat_id, text, keyboard)
+        if msg_id:
             sent += 1
+            if track_market_id:
+                _track_message(track_market_id, chat_id, msg_id, msg_type)
     if sent:
         HEALTH["last_notification_at"] = time.time()
         HEALTH["notifications_sent"] = int(HEALTH.get("notifications_sent", 0)) + sent
@@ -600,7 +682,7 @@ def build_reminder_message(title, market_id, label, time_left_sec):
 # ── Notification pipeline ────────────────────────────────────────────────────
 
 def send_public_new_market(market, row):
-    """APP_LIVE → public notification (once)."""
+    """APP_LIVE → delay → verify → public notification (once)."""
     mid = str(market.get("market_id", "")).strip()
     if not mid or not row:
         return False
@@ -616,17 +698,19 @@ def send_public_new_market(market, row):
     title = str(market.get("title") or row.get("title") or "").strip()
     end_unix = int(market.get("end_time") or 0)
 
-    if PUBLIC_ALERT_DELAY_SECONDS > 0:
-        time.sleep(PUBLIC_ALERT_DELAY_SECONDS)
+    # Delay before announcing (configurable, default 30s)
+    if NEW_MARKET_DELAY_SECONDS > 0:
+        logger.debug("delaying announcement mid=%s %ss", mid, NEW_MARKET_DELAY_SECONDS)
+        time.sleep(NEW_MARKET_DELAY_SECONDS)
 
-    # Re-check ended
+    # Re-check market is still live (not resolved)
     latest = get_market(mid)
     if latest and latest.get("notified_ended"):
         release_flag(mid, "public_notified")
         return False
 
     text = build_new_market_message(title, mid, end_unix)
-    sent = broadcast(text, vote_keyboard(mid))
+    sent = broadcast(text, vote_keyboard(mid), track_market_id=mid, msg_type="new")
     if sent > 0:
         set_lifecycle(mid, "public_notified", public_sent=True)
         HEALTH["last_notification_title"] = title[:80]
@@ -658,10 +742,7 @@ def process_reminders():
 
             if left <= 0:
                 if not row.get("notified_ended") and claim_flag(mid, "notified_ended"):
-                    broadcast(
-                        f"⬜ <b>MARKET ENDED</b>\n\n<b>{escape(title)}</b>",
-                        None,
-                    )
+                    cleanup_market(mid)
                 continue
 
             if left <= REMINDER_10M and not row.get("notified_10m"):
@@ -669,6 +750,8 @@ def process_reminders():
                     sent = broadcast(
                         build_reminder_message(title, mid, "10 MINUTES LEFT", left),
                         vote_keyboard(mid),
+                        track_market_id=mid,
+                        msg_type="reminder_10m",
                     )
                     if not sent:
                         release_flag(mid, "notified_10m")
@@ -677,6 +760,8 @@ def process_reminders():
                     sent = broadcast(
                         build_reminder_message(title, mid, "1 HOUR LEFT", left),
                         vote_keyboard(mid),
+                        track_market_id=mid,
+                        msg_type="reminder_1h",
                     )
                     if not sent:
                         release_flag(mid, "notified_1h")
@@ -706,13 +791,19 @@ def process_market(market):
 
 
 def monitor_loop():
-    global _last_onchain_poll
+    global _last_onchain_poll, _PAUSED
     logger.info("monitor loop started")
     HEALTH["status"] = "running"
     while True:
         try:
             loop_t = time.time()
             HEALTH["loop_count"] = int(HEALTH.get("loop_count", 0)) + 1
+
+            if _PAUSED:
+                HEALTH["last_eval_at"] = time.time()
+                elapsed = time.time() - loop_t
+                time.sleep(max(1.0, MARKET_POLL_SECONDS - elapsed))
+                continue
 
             # On-chain discovery (primary)
             if ONCHAIN_ENABLED and (time.time() - _last_onchain_poll) >= ONCHAIN_POLL_SECONDS:
@@ -789,6 +880,9 @@ def cmd_start(message):
         message,
         "🔔 <b>B4 Notify Bot</b>\n\n"
         "You will receive alerts when new B4 markets go live.\n\n"
+        "Commands:\n"
+        "/status — bot status\n"
+        "/start — subscribe\n"
         "/stop — unsubscribe",
         parse_mode="HTML",
     )
@@ -803,6 +897,47 @@ def cmd_stop(message):
         bot.reply_to(message, "Unsubscribed. Use /start to subscribe again.")
     except Exception as e:
         bot.reply_to(message, f"Error: {e}")
+
+
+@bot.message_handler(commands=["status"])
+def cmd_status(message):
+    add_chat(message.chat.id, "")
+    active = len(get_all_markets())
+    chats = len(get_all_chats())
+    state = "paused" if _PAUSED else "running"
+    bot.reply_to(
+        message,
+        f"📊 <b>B4 Notify</b>\n"
+        f"State: <b>{state}</b>\n"
+        f"Tracked markets: <b>{active}</b>\n"
+        f"Subscribers: <b>{chats}</b>\n"
+        f"Notifications sent: <b>{HEALTH.get('notifications_sent', 0)}</b>",
+        parse_mode="HTML",
+    )
+
+
+@bot.message_handler(commands=["pause"])
+def cmd_pause(message):
+    if not is_admin(message.from_user.id):
+        bot.reply_to(message, "Admin only.")
+        return
+    global _PAUSED
+    _PAUSED = True
+    set_state("paused", "true")
+    logger.warning("ADMIN PAUSE by user=%s", message.from_user.id)
+    bot.reply_to(message, "⏸ Notifications paused. Use /resume to resume.")
+
+
+@bot.message_handler(commands=["resume"])
+def cmd_resume(message):
+    if not is_admin(message.from_user.id):
+        bot.reply_to(message, "Admin only.")
+        return
+    global _PAUSED
+    _PAUSED = False
+    set_state("paused", "false")
+    logger.warning("ADMIN RESUME by user=%s", message.from_user.id)
+    bot.reply_to(message, "▶ Notifications resumed.")
 
 
 # ── Flask ────────────────────────────────────────────────────────────────────
@@ -833,7 +968,10 @@ def _run_bot_polling():
     try:
         bot.set_my_commands([
             BotCommand("start", "Subscribe to market alerts"),
+            BotCommand("status", "Bot status"),
             BotCommand("stop", "Unsubscribe"),
+            BotCommand("pause", "Pause notifications (admin)"),
+            BotCommand("resume", "Resume notifications (admin)"),
         ])
     except Exception:
         pass
