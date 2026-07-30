@@ -797,13 +797,37 @@ def http_health():
 
 
 def _run_bot_polling():
+    """Manual long-poll loop with 409 conflict resilience."""
     bot.remove_webhook()
+    try:
+        bot.get_updates(offset=-1, timeout=0)
+    except Exception:
+        pass
+
+    retry = 1
     while True:
         try:
-            bot.infinity_polling(timeout=20, long_polling_timeout=20, skip_pending=True)
+            updates = bot.get_updates(
+                offset=(bot.last_update_id or 0) + 1,
+                timeout=20,
+                long_polling_timeout=20,
+            )
+            retry = 1
+            if updates:
+                bot.process_new_updates(updates)
+        except telebot.apihelper.ApiTelegramException as e:
+            if e.status_code == 409:
+                logger.warning("409 conflict (another instance active), retrying in %ss", retry)
+                time.sleep(retry)
+                retry = min(retry * 2, 120)
+            else:
+                logger.error("API error (code %s): %s", e.status_code, e)
+                time.sleep(5)
+                retry = 1
         except Exception as e:
             logger.critical("polling failed: %s", e)
             time.sleep(5)
+            retry = 1
 
 
 # ── Entry point ──────────────────────────────────────────────────────────────
