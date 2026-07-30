@@ -146,6 +146,8 @@ def init_db():
                 "ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS market_link TEXT",
                 "ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS end_time TEXT",
                 "ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS title TEXT",
+                "ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()",
+                "ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS detected_at TIMESTAMP DEFAULT NOW()",
             ):
                 try:
                     cur.execute(stmt)
