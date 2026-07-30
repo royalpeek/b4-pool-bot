@@ -835,7 +835,7 @@ def cmd_health(message):
     bot.reply_to(message, health_text(), parse_mode="HTML")
 
 
-# ── Flask + startup ──────────────────────────────────────────────────────────
+# ── Flask ────────────────────────────────────────────────────────────────────
 
 app = Flask(__name__)
 
@@ -857,18 +857,26 @@ def http_health():
     )}}
 
 
-def run_flask():
-    port = int(os.getenv("PORT", "5000"))
-    app.run(host="0.0.0.0", port=port, use_reloader=False)
+def _run_bot_polling():
+    bot.remove_webhook()
+    while True:
+        try:
+            bot.infinity_polling(timeout=20, long_polling_timeout=20, skip_pending=True)
+        except Exception as e:
+            logger.critical("polling failed: %s", e)
+            time.sleep(5)
 
+
+# ── Entry point ──────────────────────────────────────────────────────────────
 
 init_db()
 Thread(target=monitor_loop, daemon=True).start()
-Thread(target=run_flask, daemon=True).start()
-logger.info("Bot ready (lightweight public notify)")
-try:
-    bot.remove_webhook()
-    bot.infinity_polling(timeout=20, long_polling_timeout=20, skip_pending=True)
-except Exception as e:
-    logger.critical("polling failed: %s", e)
-    time.sleep(5)
+
+if __name__ == "__main__":
+    Thread(target=_run_bot_polling, daemon=True).start()
+    port = int(os.getenv("PORT", "5000"))
+    logger.info("Bot ready (dev server)")
+    app.run(host="0.0.0.0", port=port, use_reloader=False)
+else:
+    Thread(target=_run_bot_polling, daemon=True).start()
+    logger.info("Bot ready (lightweight public notify, Gunicorn managed)")
