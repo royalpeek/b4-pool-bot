@@ -20,6 +20,7 @@ import requests
 import telebot
 from flask import Flask
 from telebot import types
+from telebot.types import BotCommand
 
 # ── Config ──────────────────────────────────────────────────────────────────
 
@@ -800,6 +801,13 @@ def _run_bot_polling():
     """Manual long-poll loop with 409 conflict resilience."""
     bot.remove_webhook()
     try:
+        bot.set_my_commands([
+            BotCommand("start", "Subscribe to market alerts"),
+            BotCommand("stop", "Unsubscribe"),
+        ])
+    except Exception:
+        pass
+    try:
         bot.get_updates(offset=-1, timeout=0)
     except Exception:
         pass
@@ -815,19 +823,16 @@ def _run_bot_polling():
             retry = 1
             if updates:
                 bot.process_new_updates(updates)
-        except telebot.apihelper.ApiTelegramException as e:
-            if e.status_code == 409:
+        except Exception as e:
+            code = getattr(e, 'status_code', 0)
+            if code == 409:
                 logger.warning("409 conflict (another instance active), retrying in %ss", retry)
                 time.sleep(retry)
                 retry = min(retry * 2, 120)
             else:
-                logger.error("API error (code %s): %s", e.status_code, e)
+                logger.critical("polling failed (code %s): %s", code, e)
                 time.sleep(5)
                 retry = 1
-        except Exception as e:
-            logger.critical("polling failed: %s", e)
-            time.sleep(5)
-            retry = 1
 
 
 # ── Entry point ──────────────────────────────────────────────────────────────
