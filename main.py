@@ -12,6 +12,7 @@ import logging
 import os
 import struct
 import time
+import urllib.parse
 from datetime import datetime, timezone, timedelta
 from threading import Thread
 
@@ -28,11 +29,28 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger("b4-notify-lite")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-DATABASE_URL = os.getenv("DATABASE_URL")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is required")
-if not DATABASE_URL:
+
+_raw_db_url = os.getenv("DATABASE_URL")
+if not _raw_db_url:
     raise RuntimeError("DATABASE_URL is required")
+
+# Railway external PostgreSQL requires sslmode=require
+_parsed = urllib.parse.urlparse(_raw_db_url)
+if "sslmode" not in _parsed.query:
+    _sep = "&" if _parsed.query else "?"
+    DATABASE_URL = f"{_raw_db_url}{_sep}sslmode=require"
+else:
+    DATABASE_URL = _raw_db_url
+
+_db_parsed = urllib.parse.urlparse(DATABASE_URL)
+logger.info(
+    "database: host=%s port=%s ssl=%s",
+    _db_parsed.hostname or "?",
+    _db_parsed.port or 5432,
+    any(q.startswith("sslmode=") for q in _db_parsed.query.split("&")),
+)
 
 MARKET_LINK_BASE = os.getenv("MARKET_LINK_BASE", "https://www.b4app.xyz/m").rstrip("/")
 B4_API_URL = os.getenv("B4_API_URL", "https://www.b4app.xyz/api/markets")
@@ -94,66 +112,78 @@ def get_db():
 
 
 def init_db():
-    with get_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS subscribed_chats (
-                    chat_id TEXT PRIMARY KEY,
-                    chat_name TEXT,
-                    joined_at TIMESTAMP DEFAULT NOW()
-                )
-                """
-            )
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS bot_state (
-                    key TEXT PRIMARY KEY,
-                    value TEXT
-                )
-                """
-            )
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS announced_markets (
-                    market_id TEXT PRIMARY KEY,
-                    title TEXT,
-                    end_time TEXT,
-                    market_link TEXT,
-                    source TEXT DEFAULT 'onchain',
-                    lifecycle_state TEXT DEFAULT 'discovered_onchain',
-                    public_notified BOOLEAN DEFAULT FALSE,
-                    notified_1h BOOLEAN DEFAULT FALSE,
-                    notified_10m BOOLEAN DEFAULT FALSE,
-                    notified_ended BOOLEAN DEFAULT FALSE,
-                    app_live_at TIMESTAMP,
-                    public_sent_at TIMESTAMP,
-                    detected_at TIMESTAMP DEFAULT NOW(),
-                    updated_at TIMESTAMP DEFAULT NOW()
-                )
-                """
-            )
-            # Compat with older full-bot schema
-            for stmt in (
-                "ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS public_notified BOOLEAN DEFAULT FALSE",
-                "ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS notified_1h BOOLEAN DEFAULT FALSE",
-                "ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS notified_10m BOOLEAN DEFAULT FALSE",
-                "ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS notified_ended BOOLEAN DEFAULT FALSE",
-                "ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS lifecycle_state TEXT DEFAULT 'discovered_onchain'",
-                "ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS app_live_at TIMESTAMP",
-                "ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS public_sent_at TIMESTAMP",
-                "ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'onchain'",
-                "ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS market_link TEXT",
-                "ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS end_time TEXT",
-                "ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS title TEXT",
-                "ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()",
-                "ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS detected_at TIMESTAMP DEFAULT NOW()",
-            ):
-                try:
-                    cur.execute(stmt)
-                except Exception:
-                    pass
-    logger.info("database ready")
+    last_err = None
+    for attempt in range(1, 6):
+        try:
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS subscribed_chats (
+                            chat_id TEXT PRIMARY KEY,
+                            chat_name TEXT,
+                            joined_at TIMESTAMP DEFAULT NOW()
+                        )
+                        """
+                    )
+                    cur.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS bot_state (
+                            key TEXT PRIMARY KEY,
+                            value TEXT
+                        )
+                        """
+                    )
+                    cur.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS announced_markets (
+                            market_id TEXT PRIMARY KEY,
+                            title TEXT,
+                            end_time TEXT,
+                            market_link TEXT,
+                            source TEXT DEFAULT 'onchain',
+                            lifecycle_state TEXT DEFAULT 'discovered_onchain',
+                            public_notified BOOLEAN DEFAULT FALSE,
+                            notified_1h BOOLEAN DEFAULT FALSE,
+                            notified_10m BOOLEAN DEFAULT FALSE,
+                            notified_ended BOOLEAN DEFAULT FALSE,
+                            app_live_at TIMESTAMP,
+                            public_sent_at TIMESTAMP,
+                            detected_at TIMESTAMP DEFAULT NOW(),
+                            updated_at TIMESTAMP DEFAULT NOW()
+                        )
+                        """
+                    )
+                    # Compat with older full-bot schema
+                    for stmt in (
+                        "ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS public_notified BOOLEAN DEFAULT FALSE",
+                        "ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS notified_1h BOOLEAN DEFAULT FALSE",
+                        "ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS notified_10m BOOLEAN DEFAULT FALSE",
+                        "ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS notified_ended BOOLEAN DEFAULT FALSE",
+                        "ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS lifecycle_state TEXT DEFAULT 'discovered_onchain'",
+                        "ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS app_live_at TIMESTAMP",
+                        "ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS public_sent_at TIMESTAMP",
+                        "ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'onchain'",
+                        "ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS market_link TEXT",
+                        "ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS end_time TEXT",
+                        "ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS title TEXT",
+                        "ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()",
+                        "ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS detected_at TIMESTAMP DEFAULT NOW()",
+                    ):
+                        try:
+                            cur.execute(stmt)
+                        except Exception:
+                            pass
+            logger.info("database ready")
+            return
+        except Exception as e:
+            last_err = e
+            if attempt < 5:
+                wait = 2 ** attempt
+                logger.warning("DB connection attempt %d/5 failed, retrying in %ss: %s", attempt, wait, e)
+                time.sleep(wait)
+    logger.critical("DB connection failed after 5 attempts: %s", last_err)
+    raise last_err
 
 
 def set_state(key, value):
