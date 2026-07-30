@@ -880,10 +880,25 @@ def cmd_start(message):
         message,
         "🔔 <b>B4 Notify Bot</b>\n\n"
         "You will receive alerts when new B4 markets go live.\n\n"
-        "Commands:\n"
-        "/status — bot status\n"
         "/start — subscribe\n"
+        "/help — show commands\n"
         "/stop — unsubscribe",
+        parse_mode="HTML",
+    )
+
+
+@bot.message_handler(commands=["help"])
+def cmd_help(message):
+    bot.reply_to(
+        message,
+        "<b>B4 Notify Bot — Commands</b>\n\n"
+        "/start — subscribe to market alerts\n"
+        "/stop — unsubscribe\n"
+        "/help — this message\n\n"
+        "<i>Admin commands (if configured):</i>\n"
+        "/status — bot status\n"
+        "/pause — pause notifications\n"
+        "/resume — resume notifications",
         parse_mode="HTML",
     )
 
@@ -966,13 +981,23 @@ def _run_bot_polling():
     """Manual long-poll loop with 409 conflict resilience."""
     bot.remove_webhook()
     try:
-        bot.set_my_commands([
+        public_commands = [
             BotCommand("start", "Subscribe to market alerts"),
-            BotCommand("status", "Bot status"),
-            BotCommand("stop", "Unsubscribe"),
-            BotCommand("pause", "Pause notifications (admin)"),
-            BotCommand("resume", "Resume notifications (admin)"),
-        ])
+            BotCommand("help", "Show available commands"),
+        ]
+        bot.set_my_commands(public_commands)
+        bot.set_my_commands(public_commands, scope=telebot.types.BotCommandScopeAllPrivateChats())
+        bot.set_my_commands(public_commands, scope=telebot.types.BotCommandScopeAllGroupChats())
+        if ADMIN_ID:
+            try:
+                admin_scope = telebot.types.BotCommandScopeChat(chat_id=ADMIN_ID)
+                bot.set_my_commands([
+                    BotCommand("pause", "Pause all notifications"),
+                    BotCommand("resume", "Resume notifications"),
+                    BotCommand("status", "Bot status"),
+                ], scope=admin_scope)
+            except Exception:
+                pass
     except Exception:
         pass
     try:
