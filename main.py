@@ -33,7 +33,6 @@ if not BOT_TOKEN:
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is required")
 
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or 0)
 MARKET_LINK_BASE = os.getenv("MARKET_LINK_BASE", "https://www.b4app.xyz/m").rstrip("/")
 B4_API_URL = os.getenv("B4_API_URL", "https://www.b4app.xyz/api/markets")
 
@@ -747,11 +746,7 @@ def monitor_loop():
 
 # ── Bot commands ─────────────────────────────────────────────────────────────
 
-def is_admin(uid):
-    return ADMIN_ID and int(uid) == ADMIN_ID
-
-
-@bot.message_handler(commands=["start", "help"])
+@bot.message_handler(commands=["start"])
 def cmd_start(message):
     add_chat(
         message.chat.id,
@@ -761,12 +756,8 @@ def cmd_start(message):
     )
     bot.reply_to(
         message,
-        "🔔 <b>B4 Notify Bot</b> (public)\n\n"
+        "🔔 <b>B4 Notify Bot</b>\n\n"
         "You will receive alerts when new B4 markets go live.\n\n"
-        "Commands:\n"
-        "/start — subscribe\n"
-        "/status — simple status\n"
-        "/health — admin health (admin only)\n"
         "/stop — unsubscribe",
         parse_mode="HTML",
     )
@@ -781,58 +772,6 @@ def cmd_stop(message):
         bot.reply_to(message, "Unsubscribed. Use /start to subscribe again.")
     except Exception as e:
         bot.reply_to(message, f"Error: {e}")
-
-
-@bot.message_handler(commands=["status"])
-def cmd_status(message):
-    add_chat(message.chat.id, "")
-    active = len(get_all_markets())
-    chats = len(get_all_chats())
-    bot.reply_to(
-        message,
-        f"📊 Status: <b>{escape(HEALTH.get('status'))}</b>\n"
-        f"Active tracked markets: <b>{active}</b>\n"
-        f"Subscribers: <b>{chats}</b>\n"
-        f"Notifications sent (process): <b>{HEALTH.get('notifications_sent', 0)}</b>",
-        parse_mode="HTML",
-    )
-
-
-def health_text():
-    def ago(ts):
-        if not ts:
-            return "never"
-        return f"{int(time.time() - float(ts))}s ago"
-
-    return (
-        f"🩺 <b>B4 Notify Health</b> (lightweight)\n\n"
-        f"Status: <b>{escape(HEALTH.get('status'))}</b>\n"
-        f"Uptime: <b>{int(time.time() - HEALTH['started_at'])}s</b>\n"
-        f"Loops: <b>{HEALTH.get('loop_count', 0)}</b>\n\n"
-        f"Last on-chain scan: <code>{escape(ago(HEALTH.get('last_onchain_at')))}</code>\n"
-        f"Last API scan: <code>{escape(ago(HEALTH.get('last_scan_at')))}</code>\n"
-        f"Last eval: <code>{escape(ago(HEALTH.get('last_eval_at')))}</code>\n\n"
-        f"On-chain markets (last): <b>{HEALTH.get('markets_onchain_last', 0)}</b>\n"
-        f"API markets (last): <b>{HEALTH.get('markets_api_last', 0)}</b>\n"
-        f"Registered (process): <b>{HEALTH.get('markets_registered', 0)}</b>\n"
-        f"DB active rows: <b>{len(get_all_markets())}</b>\n"
-        f"Subscribers: <b>{len(get_all_chats())}</b>\n\n"
-        f"Last notification: <code>{escape(ago(HEALTH.get('last_notification_at')))}</code>\n"
-        f"Last title: <code>{escape(HEALTH.get('last_notification_title') or '—')}</code>\n"
-        f"Sends (process): <b>{HEALTH.get('notifications_sent', 0)}</b>\n\n"
-        f"On-chain: <b>{'on' if ONCHAIN_ENABLED else 'off'}</b> | "
-        f"Poll: {ONCHAIN_POLL_SECONDS}s / {MARKET_POLL_SECONDS}s\n"
-        f"Reminders: <b>{'on' if ENABLE_REMINDERS else 'off'}</b>\n"
-        f"Last error: <code>{escape(HEALTH.get('last_error') or 'none')}</code>"
-    )
-
-
-@bot.message_handler(commands=["health"])
-def cmd_health(message):
-    if not is_admin(message.from_user.id):
-        bot.reply_to(message, "Admin only.")
-        return
-    bot.reply_to(message, health_text(), parse_mode="HTML")
 
 
 # ── Flask ────────────────────────────────────────────────────────────────────
