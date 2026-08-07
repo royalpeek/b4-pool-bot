@@ -912,6 +912,7 @@ def is_app_live(market_id, market=None):
     """True when the market is live in the app (cover published).
 
     Trust API cover_image_status=ready (no network). On-chain uses cached HEAD.
+    Returns (bool, cover_code).
     """
     market_id = str(market_id or (market or {}).get("market_id", "")).strip()
     if market:
@@ -919,11 +920,14 @@ def is_app_live(market_id, market=None):
         source = str(market.get("source") or "").strip().lower()
         if status == "ready":
             if source == "onchain":
-                ok, _ = check_cover_image_published(market_id)
-                return ok
-            return True
-    ok, _ = check_cover_image_published(market_id)
-    return ok
+                ok, code = check_cover_image_published(market_id)
+                return ok, code
+            # API: trust cover_image_status=ready (no gating change); still
+            # probe the cover HEAD so the DIAG log reports the real HTTP code.
+            ok, code = check_cover_image_published(market_id)
+            return True, code
+    ok, code = check_cover_image_published(market_id)
+    return ok, code
 
 
 def scheduled_go_live_passed(row):
@@ -950,6 +954,11 @@ def scheduled_go_live_passed(row):
             except Exception:
                 sgl_ts = 0.0
         if sgl_ts > 0:
+            logger.info(
+                "DIAG mid=%s scheduled_go_live=%s sgl_ts=%s now=%s wait_until=%s passed=%s",
+                row.get("market_id"), sgl, sgl_ts, now_ts, sgl_ts + NOTIFY_DELAY_SECONDS,
+                now_ts >= sgl_ts + NOTIFY_DELAY_SECONDS,
+            )
             return now_ts >= sgl_ts + NOTIFY_DELAY_SECONDS
     # Legacy fallback: delay measured from detection time.
     detected = row.get("detected_at")
@@ -1094,29 +1103,47 @@ def send_public_new_market(market, row):
     mid = str(market.get("market_id", "")).strip()
     if not mid or not row:
         return False
+    diag = {
+        "mid": mid,
+        "title": str(row.get("title") or "")[:60],
+        "source": str(row.get("source") or market.get("source") or "?"),
+        "detected_at": str(row.get("detected_at")),
+        "sgl": str(row.get("scheduled_go_live") or ""),
+        "end_time": str(row.get("end_time") or ""),
+        "boot_ts": _boot_ts,
+    }
     if row.get("public_notified"):
+        logger.info("DIAG %s gate=already_notified skip", diag)
         return False
     if mid in _inflight_public:
+        logger.info("DIAG %s gate=inflight skip", diag)
         return False
     # Pause aborts immediately — queued delayed notifies are cancelled, never sent.
     if _PAUSED:
+        logger.info("DIAG %s gate=paused skip", diag)
         return False
     # Historical markets live at boot must never be announced as new.
     if mid in _baseline_markets:
+        logger.info("DIAG %s gate=baseline skip", diag)
         return False
     if row.get("notify_cancelled"):
+        logger.info("DIAG %s gate=cancelled skip", diag)
         return False
 
     # Intentional lag: never fire before scheduled go-live + notify delay.
     if not scheduled_go_live_passed(row):
+        logger.info("DIAG %s gate=delay_not_passed skip (waiting for sgl+180s)", diag)
         return False
 
     # Verify the market is actually live (cover published) before sending.
-    if not is_app_live(mid, market):
-        logger.debug("mid=%s not app-live yet, waiting", mid)
+    live, cover_code = is_app_live(mid, market)
+    if not live:
+        logger.info("DIAG %s gate=app_not_live skip cover_code=%s", diag, cover_code)
         return False
+    logger.info("DIAG %s gate=all_passed proceeding_to_broadcast cover_code=%s", diag, cover_code)
 
     if not claim_flag(mid, "public_notified"):
+        logger.warning("DIAG %s gate=claim_failed skip", diag)
         return False
     _inflight_public.add(mid)
     try:
@@ -1129,9 +1156,10 @@ def send_public_new_market(market, row):
             return False
 
         # Re-verify after claim so a market that went dark is not announced.
-        if not is_app_live(mid, market):
+        re_live, re_cover = is_app_live(mid, market)
+        if not re_live:
             release_flag(mid, "public_notified")
-            logger.info("mid=%s went dark before notify, releasing claim", mid)
+            logger.info("mid=%s went dark before notify, releasing claim (cover_code=%s)", mid, re_cover)
             return False
 
         # Pause during a mid-flight send must cancel, not release-and-retry.
@@ -1275,8 +1303,10 @@ def monitor_loop():
                         if not mid or not title or end_unix <= int(time.time()):
                             continue
                         if mid in _baseline_markets:
+                            logger.info("DIAG onchain mid=%s baseline_skip title=%s", mid, title[:50])
                             continue
-                        register_market(market)
+                        row, is_new = register_market(market)
+                        logger.info("DIAG onchain mid=%s discovered is_new=%s sgl=%s end=%s", mid, is_new, market.get("scheduled_go_live"), end_unix)
                     except Exception as e:
                         logger.error("process onchain market: %s", e)
 
@@ -1306,12 +1336,15 @@ def monitor_loop():
                     logger.error("process api market: %s", e)
 
             # Pending public markets registered on-chain (delayed notify).
-            for row in get_markets_pending_public():
+            pending_rows = get_markets_pending_public()
+            logger.info("DIAG pending_public rows=%s", len(pending_rows))
+            for row in pending_rows:
                 try:
                     mid = str(row.get("market_id", "")).strip()
                     if not mid or mid in _inflight_public:
                         continue
                     if row.get("public_notified") or row.get("notified_ended"):
+                        logger.info("DIAG pending mid=%s already_notified/ended skip", mid)
                         continue
                     market = {
                         "market_id": mid,
