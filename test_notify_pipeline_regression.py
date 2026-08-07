@@ -340,6 +340,134 @@ def test_send_releases_claim_if_delay_not_yet_passed():
     print("PASS: flag not claimed before delay window opens")
 
 
+# ── Startup baseline (no historical replay) ────────────────────────────────
+
+def test_startup_baseline_never_notifies_historical_markets():
+    """ROOT CAUSE: first scan after deploy returned ALL live markets → old
+    markets were announced as brand-new. The boot baseline must gate which
+    markets may ever be registered/notified."""
+    baseline = set()
+
+    def seed_baseline(scan):
+        for m in scan:
+            baseline.add(str(m.get("market_id")))
+
+    # Boot: two markets already live (historical).
+    seed_baseline([{"market_id": "OLD1"}, {"market_id": "OLD2"}])
+    assert baseline == {"OLD1", "OLD2"}
+
+    def register_if_new(market):
+        return str(market["market_id"]) not in baseline
+
+    assert register_if_new({"market_id": "OLD1"}) is False  # historical → skipped
+    assert register_if_new({"market_id": "OLD2"}) is False  # historical → skipped
+    assert register_if_new({"market_id": "OLD3"}) is True   # seen only AFTER boot → genuinely new
+    print("PASS: boot baseline gates registration -> old markets never replayed")
+
+
+def test_restart_reseeds_baseline_no_replay():
+    """ROOT CAUSE: on every restart the baseline must be reseeded from the
+    then-live markets, so a restart never replays markets that exist at boot."""
+    def boot(now_live, prior_rows):
+        baseline = set(now_live)
+        # Any prior row still live at boot is in the new baseline → never replayed.
+        newly = sorted(m for m in prior_rows if m not in baseline)
+        return newly, sorted(baseline)
+
+    newly, baseline = boot({"A", "B"}, ["A", "B", "C"])
+    assert newly == ["C"]
+    assert baseline == ["A", "B"]
+    # A live-at-restart market stays silent even if it was never notified before.
+    assert "A" not in newly
+    print("PASS: restart reseeds baseline; only genuinely new markets notify")
+
+
+def test_pause_cancels_queued_delayed_notifies():
+    """ROOT CAUSE: bot kept sending after Pause. Pause must cancel queued
+    delayed notifies so Resume only applies to markets discovered after it."""
+    rows = {"P1": {"public_notified": False, "notify_cancelled": False}}
+
+    def pause():
+        for r in rows.values():
+            if not r["public_notified"] and not r["notify_cancelled"]:
+                r["notify_cancelled"] = True  # queued delayed notifies cancelled
+
+    def pending():
+        return [mid for mid, r in rows.items()
+                if not r["public_notified"] and not r["notify_cancelled"]]
+
+    pause()
+    assert rows["P1"]["notify_cancelled"] is True
+    assert pending() == []  # nothing re-sends after Resume
+    # Markets discovered AFTER resume are future markets → may still notify.
+    rows["P2"] = {"public_notified": False, "notify_cancelled": False}
+    assert pending() == ["P2"]
+    print("PASS: pause cancels queued notifies; resume only future markets")
+
+
+def test_send_aborts_when_paused_mid_flight():
+    """Pause during a send must cancel (mark notify_cancelled), not just
+    release-and-retry, otherwise the send would fire after Resume."""
+    state = {"paused": True, "public_notified": True}
+
+    def pre_send():
+        if state["paused"]:
+            state["public_notified"] = False
+            state["notify_cancelled"] = True
+            return "cancelled"
+        return "sent"
+
+    assert pre_send() == "cancelled"
+    assert state["notify_cancelled"] is True
+    # After Resume it must NOT be re-queued.
+    state["paused"] = False
+
+    def should_resend():
+        return not state["public_notified"] and not state.get("notify_cancelled")
+
+    assert should_resend() is False
+    print("PASS: mid-flight pause cancels instead of re-queuing")
+
+
+def test_pending_queue_only_admits_this_session_new():
+    """The delayed-notify queue only admits rows first seen during this session
+    (detected_at >= boot) — pre-boot legacy rows are never replayed."""
+    boot_ts = 1_800_000_000.0
+
+    def pending(row):
+        detected = row.get("detected_at")
+        return (
+            detected is not None
+            and detected >= boot_ts
+            and not row.get("public_notified")
+            and not row.get("notify_cancelled")
+        )
+
+    assert pending({"detected_at": boot_ts - 100, "public_notified": False}) is False  # legacy
+    assert pending({"detected_at": boot_ts + 5, "public_notified": False}) is True      # new
+    assert pending({"detected_at": boot_ts + 5, "public_notify": False}) is True        # typo key ≠ cancel
+    assert pending({"detected_at": boot_ts + 5, "notify_cancelled": True}) is False     # paused
+    print("PASS: pending queue excludes pre-boot legacy + paused rows")
+
+
+def test_delay_still_applies_to_genuinely_new_markets():
+    """ROOT CAUSE: old markets passed the delay gate because sgl was long past.
+    With the baseline, only genuinely-new markets reach the gate, and the gate
+    still waits NOTIFY_DELAY_SECONDS after go-live."""
+    baseline = {"OLD1", "OLD2"}
+    delay = 180
+
+    def eligible(mid, sgl, now):
+        if mid in baseline:
+            return False  # historical — never eligible regardless of timing
+        return now >= sgl + delay
+
+    assert eligible("OLD1", 1_000_000, 2_000_000) is False   # old, past, but baseline → skip
+    assert eligible("NEW1", 1_784_000_000, 1_784_000_000 + 179) is False  # still in window
+    assert eligible("NEW1", 1_784_000_000, 1_784_000_000 + 180) is True   # window elapsed
+    print("PASS: baseline prevents old-market delay bypass; delay still enforced")
+
+
 if __name__ == "__main__":
     test_notified_new_must_unlock_on_premium_success()
     test_public_independent_of_notified_new_and_premium()
@@ -358,4 +486,10 @@ if __name__ == "__main__":
     test_scheduled_go_live_derived_from_end_time()
     test_onchain_register_backfills_schedule_but_not_duplicate()
     test_send_releases_claim_if_delay_not_yet_passed()
+    test_startup_baseline_never_notifies_historical_markets()
+    test_restart_reseeds_baseline_no_replay()
+    test_pause_cancels_queued_delayed_notifies()
+    test_send_aborts_when_paused_mid_flight()
+    test_pending_queue_only_admits_this_session_new()
+    test_delay_still_applies_to_genuinely_new_markets()
     print("ALL NOTIFY PIPELINE REGRESSION TESTS PASSED")

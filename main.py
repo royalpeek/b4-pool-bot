@@ -91,6 +91,16 @@ _cover_live_cache: dict = {}
 _inflight_public: set = set()
 last_onchain_poll_at = 0.0
 
+# Startup baseline (no historical replay): market_ids that were already live when
+# this process booted. They are historical from the bot's perspective and must
+# NEVER be registered as new / notified. Only markets first seen AFTER the
+# baseline may be delayed-notified. Reseeded from then-live markets on every boot.
+_baseline_markets: set = set()
+_baseline_seeded = False
+_boot_ts = time.time()
+_last_onchain_fetch_ok = False
+_last_api_fetch_ok = False
+
 bot = telebot.TeleBot(BOT_TOKEN, threaded=False)
 
 # Process health (in-memory)
@@ -180,6 +190,7 @@ def init_db():
                             notified_1h BOOLEAN DEFAULT FALSE,
                             notified_10m BOOLEAN DEFAULT FALSE,
                             notified_ended BOOLEAN DEFAULT FALSE,
+                            notify_cancelled BOOLEAN DEFAULT FALSE,
                             public_sent_at TIMESTAMP,
                             detected_at TIMESTAMP DEFAULT NOW(),
                             updated_at TIMESTAMP DEFAULT NOW(),
@@ -210,6 +221,7 @@ def init_db():
                         "ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS notified_1h BOOLEAN DEFAULT FALSE",
                         "ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS notified_10m BOOLEAN DEFAULT FALSE",
                         "ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS notified_ended BOOLEAN DEFAULT FALSE",
+                        "ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS notify_cancelled BOOLEAN DEFAULT FALSE",
                         "ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS public_sent_at TIMESTAMP",
                         "ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS market_link TEXT",
                         "ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS end_time TEXT",
@@ -478,6 +490,7 @@ def market_link(market_id):
 
 def fetch_api_markets():
     """Fetch active markets from the official B4 API."""
+    global _last_api_fetch_ok
     try:
         r = requests.get(
             B4_API_URL,
@@ -489,6 +502,7 @@ def fetch_api_markets():
         data = r.json()
         markets = data.get("markets", data) if isinstance(data, dict) else data
         if not isinstance(markets, list):
+            _last_api_fetch_ok = True
             return []
         out = []
         now_ts = int(time.time())
@@ -520,10 +534,12 @@ def fetch_api_markets():
         HEALTH["last_market_count"] = len(out)
         HEALTH["last_scan_at"] = time.time()
         set_state("last_api_check", now_utc().isoformat())
+        _last_api_fetch_ok = True
         return out
     except Exception as e:
         logger.error("fetch_api_markets: %s", e)
         HEALTH["last_error"] = f"api:{e}"
+        _last_api_fetch_ok = False
         return []
 
 
@@ -586,7 +602,9 @@ def decode_onchain_market_account(pubkey, encoded_data):
 
 def fetch_onchain_markets():
     """Discover live V2 markets on-chain (same mechanism as the live bot)."""
+    global _last_onchain_fetch_ok
     if not ONCHAIN_ENABLED:
+        _last_onchain_fetch_ok = True
         return []
     try:
         payload = {
@@ -608,6 +626,7 @@ def fetch_onchain_markets():
         data = response.json()
         if data.get("error"):
             logger.error("solana rpc error: %s", data["error"])
+            _last_onchain_fetch_ok = False
             return []
         markets = []
         now_ts = int(time.time())
@@ -624,11 +643,79 @@ def fetch_onchain_markets():
         HEALTH["last_onchain_at"] = time.time()
         HEALTH["onchain_markets"] = len(markets)
         logger.info("on-chain discovery: %s live markets", len(markets))
+        _last_onchain_fetch_ok = True
         return markets
     except Exception as e:
         logger.error("fetch_onchain_markets: %s", e)
         HEALTH["last_error"] = f"onchain:{e}"
+        _last_onchain_fetch_ok = False
         return []
+
+
+def _seed_baseline():
+    """Snapshot the markets live at boot (no historical replay).
+
+    Every market already on-chain/in the API when this process starts is
+    historical from the bot's perspective and must NEVER be notified. Only
+    market_ids first seen after the baseline may be registered and delayed-
+    notified. Returns True once a baseline is recorded (retry if both sources
+    failed, so an outage at boot cannot turn into an empty baseline).
+    """
+    global _baseline_markets, _baseline_seeded
+    if _baseline_seeded:
+        return True
+    ids: set = set()
+    onchain = fetch_onchain_markets()
+    for m in onchain:
+        ids.add(str(m.get("market_id") or "").strip())
+    api = fetch_api_markets()
+    for m in api:
+        ids.add(str(m.get("market_id") or "").strip())
+    ids.discard("")
+    if not _last_onchain_fetch_ok and not _last_api_fetch_ok:
+        logger.warning("baseline sources unavailable at boot, retrying")
+        return False
+    _baseline_markets = ids
+    _baseline_seeded = True
+    logger.info("BASELINE seeded: %s live markets at boot (never replayed)", len(ids))
+    return True
+
+
+def _mark_notify_cancelled(market_id):
+    """Mark a single market's delayed notify as cancelled (pause aborts)."""
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE announced_markets SET notify_cancelled = TRUE, updated_at = NOW() WHERE market_id = %s",
+                    (str(market_id),),
+                )
+    except Exception as e:
+        logger.error("mark notify_cancelled %s: %s", market_id, e)
+
+
+def cancel_pending_delayed_notifies():
+    """Pause cancels already-queued delayed notifies.
+
+    The delayed-notify 'queue' is the set of rows with public_notified = FALSE.
+    On pause these are cancelled (notify_cancelled = TRUE) so Resume never sends
+    them; Resume applies only to markets discovered after it.
+    """
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE announced_markets
+                    SET notify_cancelled = TRUE, updated_at = NOW()
+                    WHERE COALESCE(public_notified, FALSE) = FALSE
+                      AND COALESCE(notified_ended, FALSE) = FALSE
+                      AND COALESCE(notify_cancelled, FALSE) = FALSE
+                    """
+                )
+                logger.warning("PAUSE cancelled %s queued delayed notifies", cur.rowcount)
+    except Exception as e:
+        logger.error("cancel_pending_delayed_notifies: %s", e)
 
 
 # ── APP_LIVE / still-live verification (cover HEAD, cached) ────────────────
@@ -718,7 +805,13 @@ def scheduled_go_live_passed(row):
 
 
 def get_markets_pending_public():
-    """Markets discovered but not yet publicly notified (and not ended)."""
+    """Markets discovered but not yet publicly notified (and not ended).
+
+    Only rows first seen during THIS session (detected_at >= boot) are eligible,
+    so pre-boot legacy rows are never replayed after a restart, and paused
+    (notify_cancelled) rows are never re-queued after Resume.
+    """
+    boot_iso = datetime.fromtimestamp(_boot_ts, tz=timezone.utc).replace(tzinfo=None).isoformat()
     try:
         with get_db() as conn:
             with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
@@ -727,8 +820,11 @@ def get_markets_pending_public():
                     SELECT * FROM announced_markets
                     WHERE COALESCE(public_notified, FALSE) = FALSE
                       AND COALESCE(notified_ended, FALSE) = FALSE
+                      AND COALESCE(notify_cancelled, FALSE) = FALSE
+                      AND detected_at >= %s
                     ORDER BY detected_at
-                    """
+                    """,
+                    (boot_iso,),
                 )
                 return cur.fetchall()
     except Exception as e:
@@ -758,6 +854,9 @@ def broadcast(text, keyboard=None, track_market_id=None, msg_type="new"):
     chats = get_all_chats()
     sent = 0
     for chat_id in chats:
+        if _PAUSED:
+            logger.info("broadcast aborted mid-way: paused")
+            break
         msg_id = send_to_chat(chat_id, text, keyboard)
         if msg_id:
             sent += 1
@@ -809,6 +908,14 @@ def send_public_new_market(market, row):
         return False
     if mid in _inflight_public:
         return False
+    # Pause aborts immediately — queued delayed notifies are cancelled, never sent.
+    if _PAUSED:
+        return False
+    # Historical markets live at boot must never be announced as new.
+    if mid in _baseline_markets:
+        return False
+    if row.get("notify_cancelled"):
+        return False
 
     # Intentional lag: never fire before scheduled go-live + notify delay.
     if not scheduled_go_live_passed(row):
@@ -835,6 +942,13 @@ def send_public_new_market(market, row):
         if not is_app_live(mid, market):
             release_flag(mid, "public_notified")
             logger.info("mid=%s went dark before notify, releasing claim", mid)
+            return False
+
+        # Pause during a mid-flight send must cancel, not release-and-retry.
+        if _PAUSED:
+            release_flag(mid, "public_notified")
+            _mark_notify_cancelled(mid)
+            logger.info("mid=%s paused before send, cancelled", mid)
             return False
 
         text = build_new_market_message(title, mid, end_unix)
@@ -916,6 +1030,12 @@ def monitor_loop():
             loop_t = time.time()
             HEALTH["loop_count"] = int(HEALTH.get("loop_count", 0)) + 1
 
+            # Seed the boot baseline before anything can notify (no replay).
+            if not _baseline_seeded:
+                if not _seed_baseline():
+                    time.sleep(max(1.0, MARKET_POLL_SECONDS))
+                    continue
+
             if _PAUSED:
                 HEALTH["last_eval_at"] = time.time()
                 elapsed = time.time() - loop_t
@@ -933,6 +1053,8 @@ def monitor_loop():
                         end_unix = int(market.get("end_time") or 0)
                         if not mid or not title or end_unix <= int(time.time()):
                             continue
+                        if mid in _baseline_markets:
+                            continue
                         register_market(market)
                     except Exception as e:
                         logger.error("process onchain market: %s", e)
@@ -945,9 +1067,11 @@ def monitor_loop():
                     end_unix = int(market.get("end_time") or 0)
                     if not mid or not title or end_unix <= int(time.time()):
                         continue
+                    if mid in _baseline_markets:
+                        continue
 
                     row, is_new = register_market(market)
-                    if not row or row.get("public_notified") or row.get("notified_ended"):
+                    if not row or row.get("public_notified") or row.get("notified_ended") or row.get("notify_cancelled"):
                         continue
 
                     # API markets carry cover_image_status; synthesize for app-live check.
@@ -1064,6 +1188,7 @@ def health_text():
         f"Notifications sent: <b>{HEALTH.get('notifications_sent', 0)}</b>\n"
         f"On-chain loops: <b>{HEALTH.get('onchain_loops', 0)}</b>\n"
         f"On-chain markets: <b>{HEALTH.get('onchain_markets', 0)}</b>\n"
+        f"Baseline (no-replay): <b>{len(_baseline_markets)}</b>\n"
         f"Notify delay: <b>{int(NOTIFY_DELAY_SECONDS)}s</b>"
     )
 
@@ -1076,6 +1201,7 @@ def cmd_pause(message):
     global _PAUSED
     _PAUSED = True
     set_state("paused", "true")
+    cancel_pending_delayed_notifies()
     logger.warning("ADMIN PAUSE by user=%s", message.from_user.id)
     bot.reply_to(message, "⏸ Notifications paused. Use /resume to resume.")
 

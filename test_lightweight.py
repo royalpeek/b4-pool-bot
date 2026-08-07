@@ -53,6 +53,22 @@ def test_v2_discovery_uses_confirmed_layout():
     print("PASS: V2 on-chain discovery + delayed-notify wiring present")
 
 
+def test_no_historical_replay_baseline_pause_wiring():
+    src = open("main.py", encoding="utf-8").read()
+    # Boot baseline: markets live at boot are never registered/notified again.
+    assert "_seed_baseline" in src
+    assert "_baseline_markets" in src
+    assert "_baseline_seeded" in src
+    # Pause must cancel queued delayed notifies (notify_cancelled column).
+    assert "notify_cancelled" in src
+    assert "cancel_pending_delayed_notifies" in src
+    # Pending queue only admits this-session rows (detected_at >= boot).
+    assert "detected_at >= %s" in src
+    # Send path must abort on pause before broadcast.
+    assert "if _PAUSED:" in src
+    print("PASS: baseline (no-replay) + immediate-pause wiring present")
+
+
 def test_architecture_flow():
     stages = [
         "onchain_discovery",
@@ -76,6 +92,7 @@ if __name__ == "__main__":
     os.chdir(os.path.dirname(os.path.abspath(__file__)) or ".")
     test_main_parses()
     test_v2_discovery_uses_confirmed_layout()
+    test_no_historical_replay_baseline_pause_wiring()
     test_architecture_flow()
     test_no_openai_dependency()
     print("ALL LIGHTWEIGHT TESTS PASSED")
