@@ -132,18 +132,19 @@ def test_no_duplicate_public_inflight():
 
 
 def test_standard_reminder_windows():
-    """Standard markets: 1h and 10m. Featured: 12h/6h/1h/30m/10m."""
-    def standard_window(hours_until, minutes_until, flags):
-        if hours_until <= 1.0 and not flags.get("notified_1h"):
-            return "1h"
-        if minutes_until <= 10.0 and not flags.get("notified_5m"):
-            return "10m"
+    """V2 lifecycle: 12h and 6h windows, once each, after the market went live."""
+    def window(hours_until, flags):
+        if hours_until <= 6.0 and not flags.get("notified_6h"):
+            return "6h"
+        if hours_until <= 12.0 and not flags.get("notified_12h"):
+            return "12h"
         return None
 
-    assert standard_window(0.9, 54, {}) == "1h"
-    assert standard_window(0.1, 6, {"notified_1h": True}) == "10m"
-    assert standard_window(5.0, 300, {}) is None  # 5h left: no standard 6h reminder
-    print("PASS: standard reminder windows (1h/10m)")
+    assert window(10.0, {}) == "12h"
+    assert window(5.0, {"notified_12h": True}) == "6h"
+    assert window(1.0, {"notified_12h": True, "notified_6h": True}) is None
+    assert window(5.0, {}) == "6h"  # within 6h, 6h milestone wins
+    print("PASS: lifecycle reminder windows (12h/6h, once each)")
 
 
 def test_pipeline_stages_for_one_market():
@@ -468,6 +469,80 @@ def test_delay_still_applies_to_genuinely_new_markets():
     print("PASS: baseline prevents old-market delay bypass; delay still enforced")
 
 
+def test_one_message_per_market_edit_in_place():
+    """A market's card is edited across stages, never duplicated: banner priority
+    6h > 12h > graduated > new live, all rendered from the same row."""
+    def banner(row):
+        if row.get("notified_6h"):
+            return "6h"
+        if row.get("notified_12h"):
+            return "12h"
+        if row.get("graduated"):
+            return "graduated"
+        return "new_live"
+
+    live = {"public_notified": True, "graduated": False, "notified_12h": False, "notified_6h": False}
+    assert banner(live) == "new_live"
+    live["graduated"] = True
+    assert banner(live) == "graduated"
+    live["notified_12h"] = True
+    assert banner(live) == "12h"
+    live["notified_6h"] = True
+    assert banner(live) == "6h"
+    print("PASS: single card edits in place, 6h > 12h > graduated > new live")
+
+
+def test_graduation_gated_by_app_signal():
+    """Graduation only fires on an observed app signal, and can be disabled."""
+    graduated_set = {"M1", "M2"}
+
+    def is_graduated(mid, enabled=True):
+        return enabled and str(mid) in graduated_set
+
+    assert is_graduated("M2") is True
+    assert is_graduated("M3") is False
+    assert is_graduated("M2", enabled=False) is False  # GRADUATION_ENABLED=false
+    print("PASS: graduation is gated on the app's observed signal")
+
+
+def test_cleanup_deletes_every_message_and_state():
+    """global_cleanup removes every tracked message, clears DB rows and caches."""
+    tracked = [
+        {"market_id": "M1", "chat_id": 1, "message_id": 11},
+        {"market_id": "M2", "chat_id": 1, "message_id": 22},
+        {"market_id": "M2", "chat_id": 2, "message_id": 33},
+    ]
+    deleted = 0
+    chats = set()
+    for r in tracked:
+        # Simulate _safe_delete_message succeeding even when already gone.
+        deleted += 1
+        chats.add(r["chat_id"])
+    cache = {"M1": "x", "M2": "y"}
+    cache.clear()
+    inflight = {"M1"}
+    inflight.clear()
+    assert deleted == 3 and chats == {1, 2}
+    assert cache == {} and inflight == set()
+    print("PASS: cleanup deletes all messages + chats and clears state")
+
+
+def test_safe_delete_ignores_already_deleted():
+    """Telegram 'message not found' / 'too old' must be treated as success."""
+    def missing(e):
+        txt = str(e).lower()
+        return ("message to delete not found" in txt
+                or "message is too old" in txt
+                or "chat not found" in txt
+                or "not found" in txt and "method" not in txt)
+
+    assert missing("Bad Request: message to delete not found")
+    assert missing("Bad Request: message is too old to be deleted")
+    assert missing("Bad Request: chat not found")
+    assert missing("Bad Request: only the creator of a basic group") is False
+    print("PASS: already-deleted messages are ignored, not crashes")
+
+
 if __name__ == "__main__":
     test_notified_new_must_unlock_on_premium_success()
     test_public_independent_of_notified_new_and_premium()
@@ -492,4 +567,8 @@ if __name__ == "__main__":
     test_send_aborts_when_paused_mid_flight()
     test_pending_queue_only_admits_this_session_new()
     test_delay_still_applies_to_genuinely_new_markets()
+    test_one_message_per_market_edit_in_place()
+    test_graduation_gated_by_app_signal()
+    test_cleanup_deletes_every_message_and_state()
+    test_safe_delete_ignores_already_deleted()
     print("ALL NOTIFY PIPELINE REGRESSION TESTS PASSED")

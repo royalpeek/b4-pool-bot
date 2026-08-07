@@ -62,10 +62,19 @@ B4_API_URL = os.getenv("B4_API_URL", "https://www.b4app.xyz/api/markets")
 MARKET_POLL_SECONDS = float(os.getenv("MARKET_POLL_SECONDS", "5"))
 NEW_MARKET_DELAY_SECONDS = float(os.getenv("NEW_MARKET_DELAY_SECONDS", "30"))
 SEND_DELAY_SECONDS = float(os.getenv("SEND_DELAY_SECONDS", "0.08"))
+DELETE_DELAY_SECONDS = float(os.getenv("DELETE_DELAY_SECONDS", "0.2"))
 API_TIMEOUT = float(os.getenv("API_TIMEOUT_SECONDS", "8"))
 ENABLE_REMINDERS = os.getenv("ENABLE_REMINDERS", "true").lower() == "true"
-REMINDER_1H = float(os.getenv("REMINDER_1H_SECONDS", "3600"))
-REMINDER_10M = float(os.getenv("REMINDER_10M_SECONDS", "600"))
+REMINDER_12H = float(os.getenv("REMINDER_12H_SECONDS", "43200"))
+REMINDER_6H = float(os.getenv("REMINDER_6H_SECONDS", "21600"))
+# Graduation (V2 lifecycle): the app signals a market has graduated from its
+# bonding curve. The notify bot re-renders the market's single message when the
+# signal is observed. Detection uses whatever the app itself exposes (API
+# `graduated`/`status`); the on-chain 81-byte graduation account exists but its
+# flag offset is not yet confirmed, so on-chain detection is a documented
+# placeholder (see refresh_graduation). Safe to leave enabled — it only fires on
+# a real observed signal.
+GRADUATION_ENABLED = os.getenv("GRADUATION_ENABLED", "true").lower() == "true"
 
 # ── V2 on-chain discovery + delayed notify ─────────────────────────────────
 # Detection uses the same mechanism as the live bot: getProgramAccounts on the
@@ -90,6 +99,11 @@ _PAUSED = False
 _cover_live_cache: dict = {}
 _inflight_public: set = set()
 last_onchain_poll_at = 0.0
+
+# V2 lifecycle: markets the app has reported as graduated (from the market's
+# own API signal). A market in this set gets its single message re-rendered
+# with a "🎓 MARKET GRADUATED" banner.
+_graduated_markets: set = set()
 
 # Startup baseline (no historical replay): market_ids that were already live when
 # this process booted. They are historical from the bot's perspective and must
@@ -119,6 +133,7 @@ HEALTH = {
     "onchain_loops": 0,
     "onchain_markets": 0,
     "last_onchain_at": 0.0,
+    "graduated_markets": 0,
 }
 
 
@@ -129,9 +144,13 @@ def now_utc():
 
 
 def _end_unix(value):
-    """Parse an end_time value (unix number or ISO string) to epoch seconds."""
+    """Parse an end_time value (unix number, ISO string or datetime) to epoch seconds."""
     if not value:
         return 0
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return int(value.timestamp())
     if isinstance(value, (int, float)):
         return int(value)
     try:
@@ -191,6 +210,9 @@ def init_db():
                             notified_10m BOOLEAN DEFAULT FALSE,
                             notified_ended BOOLEAN DEFAULT FALSE,
                             notify_cancelled BOOLEAN DEFAULT FALSE,
+                            graduated BOOLEAN DEFAULT FALSE,
+                            notified_12h BOOLEAN DEFAULT FALSE,
+                            notified_6h BOOLEAN DEFAULT FALSE,
                             public_sent_at TIMESTAMP,
                             detected_at TIMESTAMP DEFAULT NOW(),
                             updated_at TIMESTAMP DEFAULT NOW(),
@@ -222,6 +244,9 @@ def init_db():
                         "ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS notified_10m BOOLEAN DEFAULT FALSE",
                         "ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS notified_ended BOOLEAN DEFAULT FALSE",
                         "ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS notify_cancelled BOOLEAN DEFAULT FALSE",
+                        "ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS graduated BOOLEAN DEFAULT FALSE",
+                        "ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS notified_12h BOOLEAN DEFAULT FALSE",
+                        "ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS notified_6h BOOLEAN DEFAULT FALSE",
                         "ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS public_sent_at TIMESTAMP",
                         "ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS market_link TEXT",
                         "ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS end_time TEXT",
@@ -392,6 +417,7 @@ def register_market(market):
 def claim_flag(market_id, flag):
     allowed = {
         "public_notified", "notified_1h", "notified_10m", "notified_ended",
+        "graduated", "notified_12h", "notified_6h",
     }
     if flag not in allowed:
         return False
@@ -414,7 +440,7 @@ def claim_flag(market_id, flag):
 
 
 def release_flag(market_id, flag):
-    allowed = {"public_notified", "notified_1h", "notified_10m", "notified_ended"}
+    allowed = {"public_notified", "notified_1h", "notified_10m", "notified_ended", "graduated", "notified_12h", "notified_6h"}
     if flag not in allowed:
         return
     try:
@@ -463,20 +489,88 @@ def _delete_market_messages(market_id):
         logger.warning("delete_market_messages %s: %s", market_id, e)
 
 
+def _delete_all_market_messages():
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM market_messages")
+    except Exception as e:
+        logger.error("clear market_messages: %s", e)
+
+
+def _telegram_missing(e):
+    """True when Telegram says the message is already gone (safe to ignore)."""
+    txt = str(getattr(e, "text", "") or e)
+    low = txt.lower()
+    return (
+        "not found" in low
+        or "message to delete not found" in low
+        or "message to edit not found" in low
+        or ("bad request: message" in low and "can't be deleted" not in low)
+    )
+
+
+def _safe_delete_message(chat_id, message_id, retries=3):
+    """Delete a message, tolerating already-deleted messages and transient
+    errors (retried with backoff). Never raises. Returns True when gone."""
+    for attempt in range(retries):
+        try:
+            bot.delete_message(int(chat_id), int(message_id))
+            return True
+        except Exception as e:
+            if _telegram_missing(e):
+                return True  # already deleted — treat as success
+            if attempt < retries - 1:
+                time.sleep(min(2 ** attempt, 8))
+            else:
+                logger.warning("delete msg chat=%s mid=%s: %s", chat_id, message_id, e)
+    return False
+
+
+def _safe_edit_message(chat_id, message_id, text, keyboard=None, retries=3):
+    """Edit a message, tolerating already-deleted messages and transient errors.
+    Never raises. Returns True when the edit succeeded."""
+    for attempt in range(retries):
+        try:
+            bot.edit_message_text(
+                text,
+                chat_id=int(chat_id),
+                message_id=int(message_id),
+                parse_mode="HTML",
+                reply_markup=keyboard,
+                disable_web_page_preview=False,
+            )
+            return True
+        except Exception as e:
+            if _telegram_missing(e):
+                return False  # message gone — nothing left to edit
+            if attempt < retries - 1:
+                time.sleep(min(2 ** attempt, 8))
+            else:
+                logger.warning("edit msg chat=%s mid=%s: %s", chat_id, message_id, e)
+    return False
+
+
 def cleanup_market(market_id):
-    """Delete all tracked messages, clear cache, mark DB ended."""
+    """Market closed: delete every notification, clear all state.
+
+    After cleanup the market is as if it was never announced — user chats,
+    groups, the message DB, the cover cache, and in-memory state are all clean.
+    Never raises; per-message failures (already deleted) are ignored.
+    """
+    market_id = str(market_id)
     logger.info("Market ended mid=%s: starting cleanup", market_id)
     messages = _get_market_messages(market_id)
     deleted = 0
     for row in messages:
-        try:
-            bot.delete_message(int(row["chat_id"]), int(row["message_id"]))
+        if _safe_delete_message(row.get("chat_id"), row.get("message_id")):
             deleted += 1
-            time.sleep(SEND_DELAY_SECONDS)
-        except Exception as e:
-            logger.warning("cleanup delete msg mid=%s chat=%s: %s", market_id, row.get("chat_id"), e)
+        time.sleep(DELETE_DELAY_SECONDS)
     logger.info("Market ended mid=%s: deleted %s Telegram messages", market_id, deleted)
     _delete_market_messages(market_id)
+    _cover_live_cache.pop(market_id, None)
+    _inflight_public.discard(market_id)
+    _graduated_markets.discard(market_id)
     logger.info("Market ended mid=%s: cleanup complete", market_id)
 
 
@@ -650,6 +744,75 @@ def fetch_onchain_markets():
         HEALTH["last_error"] = f"onchain:{e}"
         _last_onchain_fetch_ok = False
         return []
+
+
+def _discover_graduation_accounts():
+    """Best-effort on-chain graduation state.
+
+    V2 (2026) added an `InitGraduation` instruction that creates an 81-byte
+    account owned by the B4 program (`discriminator 0x44aea24530fa12ed`); the
+    payload updates as users bet (bonding progress). The exact "graduated" flag
+    offset is not yet confirmed, so this only reports the count (for /status).
+    Once the flag offset is verified, return the graduated market_ids here and
+    graduation fires from on-chain too. Never raises.
+    """
+    if not ONCHAIN_ENABLED:
+        return 0
+    try:
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getProgramAccounts",
+            "params": [
+                B4_PROGRAM_ID,
+                {
+                    "encoding": "base64",
+                    "commitment": "confirmed",
+                    "filters": [{"dataSize": 81}],
+                    "dataSlice": {"offset": 0, "length": 8},
+                },
+            ],
+        }
+        response = requests.post(SOLANA_RPC_URL, json=payload, timeout=max(API_TIMEOUT, 12))
+        response.raise_for_status()
+        return len(response.json().get("result", []))
+    except Exception as e:
+        logger.debug("graduation account discovery: %s", e)
+        return 0
+
+
+def refresh_graduation(api_markets):
+    """Refresh the set of graduated market_ids from the app's own signals.
+
+    Signal 1 (authoritative today): the B4 API reports graduation for a market
+    (a `graduated` flag / `graduated` status). This is whatever the app itself
+    exposes — when the product reports graduation, the bot sees it here.
+    Signal 2 (placeholder): on-chain 81-byte graduation accounts, pending the
+    confirmed flag offset. Only observed signals ever mark a market graduated,
+    so this can never fire a false announcement.
+    """
+    global _graduated_markets
+    if not GRADUATION_ENABLED:
+        return set()
+    ids: set = set()
+    for m in api_markets or []:
+        mid = str(m.get("market_id") or "").strip()
+        if not mid:
+            continue
+        raw_grad = m.get("graduated")
+        if raw_grad is True or str(raw_grad).strip().lower() in ("true", "1", "yes"):
+            ids.add(mid)
+        elif "graduated" in str(m.get("status") or "").strip().lower():
+            ids.add(mid)
+        elif str(m.get("bonding_status") or "").strip().lower() == "graduated":
+            ids.add(mid)
+    _graduated_markets = ids
+    HEALTH["graduated_markets"] = len(ids)
+    return ids
+
+
+def is_graduated(market_id):
+    return GRADUATION_ENABLED and str(market_id) in _graduated_markets
 
 
 def _seed_baseline():
@@ -876,25 +1039,52 @@ def vote_keyboard(market_id):
     return kb
 
 
-def build_new_market_message(title, market_id, end_unix):
-    end_dt = datetime.fromtimestamp(int(end_unix), tz=timezone.utc)
-    end_str = end_dt.strftime("%b %d, %Y %H:%M UTC")
+def _banner_for_row(row):
+    """Most recent lifecycle milestone wins (6h > 12h > graduated > new live)."""
+    if row.get("notified_6h"):
+        return "⏰ <b>6 HOURS LEFT</b>"
+    if row.get("notified_12h"):
+        return "⏰ <b>12 HOURS LEFT</b>"
+    if row.get("graduated"):
+        return "🎓 <b>MARKET GRADUATED</b>"
+    return "🟢 <b>NEW MARKET LIVE</b>"
+
+
+def build_market_message(row):
+    """Build the single market card. One message per market is sent and then
+    EDITED as the market progresses (graduated → 12h → 6h) — never a new
+    message per stage."""
+    mid = str(row.get("market_id", "") or "").strip()
+    title = str(row.get("title") or "").strip()
+    end_unix = int(_end_unix(row.get("end_time")) or 0)
+    end_str = datetime.fromtimestamp(end_unix, tz=timezone.utc).strftime("%b %d, %Y %H:%M UTC")
     return (
-        f"🟢 <b>NEW MARKET LIVE</b>\n\n"
+        f"{_banner_for_row(row)}\n\n"
         f"🔥 <b>{escape(title)}</b>\n\n"
         f"⏰ Closes: {escape(end_str)}\n"
-        f"🔗 <a href=\"{escape(market_link(market_id))}\">Open in b4</a>"
+        f"🔗 <a href=\"{escape(market_link(mid))}\">Open in b4</a>"
     )
 
 
-def build_reminder_message(title, market_id, label, time_left_sec):
-    mins = max(1, int(time_left_sec // 60))
-    return (
-        f"⏰ <b>{escape(label)}</b>\n\n"
-        f"<b>{escape(title)}</b>\n\n"
-        f"Time left: <b>{mins} min</b>\n"
-        f"🔗 <a href=\"{escape(market_link(market_id))}\">Vote now</a>"
-    )
+def edit_market_messages(market_id):
+    """Re-render the market's single card in every chat (graduation / 12h / 6h).
+
+    Edits the existing tracked message instead of sending a new one, so users
+    only ever see one message per market. Safe: already-deleted messages are
+    ignored and transient errors are retried. Returns the number edited.
+    """
+    market_id = str(market_id)
+    row = get_market(market_id)
+    if not row:
+        return 0
+    text = build_market_message(row)
+    kb = vote_keyboard(market_id)
+    edited = 0
+    for m in _get_market_messages(market_id):
+        if _safe_edit_message(m.get("chat_id"), m.get("message_id"), text, kb):
+            edited += 1
+        time.sleep(DELETE_DELAY_SECONDS)
+    return edited
 
 
 # ── Notification pipeline ────────────────────────────────────────────────────
@@ -951,7 +1141,11 @@ def send_public_new_market(market, row):
             logger.info("mid=%s paused before send, cancelled", mid)
             return False
 
-        text = build_new_market_message(title, mid, end_unix)
+        text = build_market_message({
+            "market_id": mid,
+            "title": title,
+            "end_time": end_unix,
+        })
         sent = broadcast(text, vote_keyboard(mid), track_market_id=mid, msg_type="new")
         if sent > 0:
             try:
@@ -975,9 +1169,13 @@ def send_public_new_market(market, row):
         _inflight_public.discard(mid)
 
 
-def process_reminders():
-    if not ENABLE_REMINDERS:
-        return
+def process_lifecycle():
+    """Drive the V2 lifecycle for announced markets (edit-in-place, once each).
+
+    - 🎓 Graduated: when the app reports the market graduated, re-render the card.
+    - ⏰ 12 hours / 6 hours remaining: re-render the card, once each.
+    - 🧹 Market closed: delete every message, clear all state (as if never sent).
+    """
     now = now_utc()
     for row in get_all_markets():
         try:
@@ -990,35 +1188,58 @@ def process_reminders():
             else:
                 end_dt = datetime.fromisoformat(str(et).replace("Z", "+00:00")).replace(tzinfo=None)
             left = (end_dt - now).total_seconds()
-            title = row.get("title") or ""
 
             if left <= 0:
                 if not row.get("notified_ended") and claim_flag(mid, "notified_ended"):
                     cleanup_market(mid)
                 continue
 
-            if left <= REMINDER_10M and not row.get("notified_10m"):
-                if claim_flag(mid, "notified_10m"):
-                    sent = broadcast(
-                        build_reminder_message(title, mid, "10 MINUTES LEFT", left),
-                        vote_keyboard(mid),
-                        track_market_id=mid,
-                        msg_type="reminder_10m",
-                    )
-                    if not sent:
-                        release_flag(mid, "notified_10m")
-            elif left <= REMINDER_1H and not row.get("notified_1h"):
-                if claim_flag(mid, "notified_1h"):
-                    sent = broadcast(
-                        build_reminder_message(title, mid, "1 HOUR LEFT", left),
-                        vote_keyboard(mid),
-                        track_market_id=mid,
-                        msg_type="reminder_1h",
-                    )
-                    if not sent:
-                        release_flag(mid, "notified_1h")
+            changed = False
+            # Graduated (immediate, once) — gate on the app's observed signal.
+            if GRADUATION_ENABLED and not row.get("graduated") and is_graduated(mid):
+                if claim_flag(mid, "graduated"):
+                    logger.info("GRADUATED mid=%s title=%s", mid, (row.get("title") or "")[:40])
+                    changed = True
+            # 12h / 6h remaining (once each).
+            if ENABLE_REMINDERS and not row.get("notified_12h") and left <= REMINDER_12H:
+                if claim_flag(mid, "notified_12h"):
+                    logger.info("12H LEFT mid=%s title=%s", mid, (row.get("title") or "")[:40])
+                    changed = True
+            if ENABLE_REMINDERS and not row.get("notified_6h") and left <= REMINDER_6H:
+                if claim_flag(mid, "notified_6h"):
+                    logger.info("6H LEFT mid=%s title=%s", mid, (row.get("title") or "")[:40])
+                    changed = True
+
+            if changed:
+                edit_market_messages(mid)
         except Exception as e:
-            logger.error("reminder error: %s", e)
+            logger.error("lifecycle error mid=%s: %s", row.get("market_id"), e)
+
+
+def global_cleanup():
+    """Admin wipe: delete every bot message across private chats, groups and
+    channels, then clear every stored message ID. Returns (deleted, chats)."""
+    try:
+        with get_db() as conn:
+            with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
+                cur.execute("SELECT market_id, chat_id, message_id FROM market_messages")
+                rows = cur.fetchall()
+    except Exception as e:
+        logger.error("global_cleanup read: %s", e)
+        return 0, 0
+    deleted = 0
+    chats: set = set()
+    for r in rows:
+        if _safe_delete_message(r.get("chat_id"), r.get("message_id")):
+            deleted += 1
+        chats.add(str(r.get("chat_id")))
+        time.sleep(DELETE_DELAY_SECONDS)
+    _delete_all_market_messages()
+    _cover_live_cache.clear()
+    _inflight_public.clear()
+    _graduated_markets.clear()
+    logger.warning("GLOBAL CLEANUP deleted=%s chats=%s", deleted, len(chats))
+    return deleted, len(chats)
 
 
 def monitor_loop():
@@ -1060,7 +1281,9 @@ def monitor_loop():
                         logger.error("process onchain market: %s", e)
 
             # API discovery (supplementary source; V1 compatibility)
-            for market in fetch_api_markets():
+            api_markets = list(fetch_api_markets())
+            refresh_graduation(api_markets)
+            for market in api_markets:
                 try:
                     mid = str(market.get("market_id", "")).strip()
                     title = str(market.get("title", "")).strip()
@@ -1100,7 +1323,7 @@ def monitor_loop():
                 except Exception as e:
                     logger.error("process pending public market: %s", e)
 
-            process_reminders()
+            process_lifecycle()
             HEALTH["last_eval_at"] = time.time()
             HEALTH["status"] = "running"
 
@@ -1154,7 +1377,8 @@ def cmd_help(message):
         "<i>Admin commands (if configured):</i>\n"
         "/status — bot status\n"
         "/pause — pause notifications\n"
-        "/resume — resume notifications",
+        "/resume — resume notifications\n"
+        "/cleanup — delete all bot messages",
         parse_mode="HTML",
     )
 
@@ -1188,6 +1412,7 @@ def health_text():
         f"Notifications sent: <b>{HEALTH.get('notifications_sent', 0)}</b>\n"
         f"On-chain loops: <b>{HEALTH.get('onchain_loops', 0)}</b>\n"
         f"On-chain markets: <b>{HEALTH.get('onchain_markets', 0)}</b>\n"
+        f"Graduated markets: <b>{HEALTH.get('graduated_markets', 0)}</b>\n"
         f"Baseline (no-replay): <b>{len(_baseline_markets)}</b>\n"
         f"Notify delay: <b>{int(NOTIFY_DELAY_SECONDS)}s</b>"
     )
@@ -1216,6 +1441,31 @@ def cmd_resume(message):
     set_state("paused", "false")
     logger.warning("ADMIN RESUME by user=%s", message.from_user.id)
     bot.reply_to(message, "▶ Notifications resumed.")
+
+
+@bot.message_handler(commands=["cleanup"])
+def cmd_cleanup(message):
+    """Admin wipe: delete every bot message and clear all notification state."""
+    if not is_admin(message.from_user.id):
+        bot.reply_to(message, "Admin only.")
+        return
+    logger.warning("ADMIN CLEANUP by user=%s", message.from_user.id)
+    bot.reply_to(message, "🧹 Cleaning up all bot messages…")
+    try:
+        deleted, chats = global_cleanup()
+    except Exception as e:
+        logger.error("cleanup failed: %s", e)
+        bot.reply_to(message, f"⚠️ Cleanup failed: {e}")
+        return
+    bot.reply_to(
+        message,
+        "<b>🧹 Cleanup complete</b>\n\n"
+        f"Deleted:\n"
+        f"• <b>{deleted}</b> messages\n"
+        f"• <b>{chats}</b> chats\n"
+        f"• <b>Database cleaned successfully.</b>",
+        parse_mode="HTML",
+    )
 
 
 # ── Flask ────────────────────────────────────────────────────────────────────
@@ -1258,6 +1508,7 @@ def _run_bot_polling():
                     BotCommand("pause", "Pause all notifications"),
                     BotCommand("resume", "Resume notifications"),
                     BotCommand("status", "Bot status"),
+                    BotCommand("cleanup", "Delete all bot messages"),
                 ], scope=admin_scope)
             except Exception:
                 pass

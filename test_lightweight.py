@@ -80,6 +80,30 @@ def test_architecture_flow():
     print("PASS: architecture flow defined")
 
 
+def test_v2_lifecycle_wiring():
+    src = open("main.py", encoding="utf-8").read()
+    # Single card, edited in place across stages (graduated → 12h → 6h).
+    assert "build_market_message" in src
+    assert "edit_market_messages" in src
+    assert "MARKET GRADUATED" in src
+    assert "12 HOURS LEFT" in src
+    assert "6 HOURS LEFT" in src
+    # Once-only milestone flags.
+    assert "notified_12h" in src
+    assert "notified_6h" in src
+    assert "graduated" in src
+    # Graduation detected from the app's own signal and gated on/off.
+    assert "refresh_graduation" in src
+    assert "is_graduated" in src
+    assert "GRADUATION_ENABLED" in src
+    # Auto-cleanup on close + admin wipe.
+    assert "cleanup_market" in src
+    assert "_safe_delete_message" in src
+    assert "global_cleanup" in src
+    assert "/cleanup" in src
+    print("PASS: V2 lifecycle (graduation / 12h / 6h / edit-in-place / cleanup) wired")
+
+
 def test_no_openai_dependency():
     req = open("requirements.txt", encoding="utf-8").read().lower()
     assert "openai" not in req
@@ -94,5 +118,6 @@ if __name__ == "__main__":
     test_v2_discovery_uses_confirmed_layout()
     test_no_historical_replay_baseline_pause_wiring()
     test_architecture_flow()
+    test_v2_lifecycle_wiring()
     test_no_openai_dependency()
     print("ALL LIGHTWEIGHT TESTS PASSED")

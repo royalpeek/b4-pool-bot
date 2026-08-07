@@ -9,6 +9,11 @@ after the scheduled go-live (the live tracker notifies earliest; this bot
 deliberately lags and verifies the market is still live before sending).
 Optimized for small free hosts (Render free tier).
 
+Each market gets **one Telegram message** that is **edited in place** as it
+progresses through the V2 lifecycle (New Live → Graduated → 12h → 6h), then
+**deleted automatically** when the market closes. Users only ever see active
+markets.
+
 ## Architecture
 
 ```
@@ -22,11 +27,16 @@ Wait NOTIFY_DELAY_SECONDS after scheduled go-live
    ↓
 Verify still live (cover HEAD / API cover ready)
    ↓
-Public Telegram notification (once, dedup via DB flag + inflight guard)
+Public Telegram notification (once) → single card per market
    ↓
-Public reminders (1h / 10m) while active
+V2 lifecycle (edit-in-place, one message per market):
+   🎓 Graduated (immediate, once) → re-render card
+   ⏰ 12 hours left (once)        → re-render card
+   ⏰ 6 hours left (once)         → re-render card
    ↓
-Database tracking
+Market closed → delete every message + clear all state (as if never announced)
+   ↓
+Admin /cleanup → wipe every bot message + all stored state
 ```
 
 ## KEPT
@@ -37,11 +47,15 @@ Database tracking
 | B4 API polling | Supplementary discovery + `cover_image_status` for app-live check |
 | Delayed public notify | Waits `NOTIFY_DELAY_SECONDS` after scheduled go-live (default 180s) |
 | Still-live verification | Cover image HEAD 200 (cached) before sending |
-| Public reminders | 1 hour left, 10 minutes left |
+| Single card per market | One message, edited across lifecycle stages (`edit_market_messages`) |
+| V2 lifecycle stages | 🎓 Graduated (app signal), ⏰ 12h, ⏰ 6h — each fired once |
+| Auto-cleanup on close | Deletes all messages for the closed market + clears state |
+| Admin `/cleanup` | Deletes every bot message + clears all stored message IDs (rate-limited, never crashes) |
+| Graduation detection | `GRADUATION_ENABLED` (default true); app-signal driven; on-chain placeholder documented |
 | PostgreSQL tracking | `announced_markets`, `subscribed_chats`, `bot_state`, `market_messages` |
 | Duplicate prevention | DB flags + claim/send/release + in-flight guard |
-| Telegram broadcast | Simple sequential send |
-| Minimal commands | `/start`, `/help`, `/status` (admin), `/pause` (admin), `/resume` (admin) |
+| Telegram broadcast | Simple sequential send; safe delete/edit helpers |
+| Minimal commands | `/start`, `/help`, `/status` (admin), `/pause` (admin), `/resume` (admin), `/cleanup` (admin) |
 | Flask keepalive | `GET /` / `/health` for Render web process |
 | One monitor loop | Single background thread |
 
@@ -53,9 +67,11 @@ Database tracking
 | Premium early alerts | Out of scope |
 | Premium filters / digests | Out of scope |
 | Featured wallets / Editor's Pick | Out of scope |
-| Featured 12h/6h/30m reminders | Out of scope |
 | Live Tracker integration | Separate bot |
-| Vote / pool tracking | Out of scope |
+| Vote / pool / liquidity tracking | Out of scope |
+| Vote percentages / liquidity amounts | Out of scope — no analytics |
+| Resolution notifications | Out of scope — markets are cleaned up on close |
+| Market-closed notifications | Out of scope — auto cleanup instead |
 | Intelligence / analytics / scoring | Memory + CPU heavy |
 | AI notification copy (OpenAI/Groq) | Optional cost + dependency |
 | Studio / templates / custom buttons | Out of scope |
@@ -71,7 +87,7 @@ Database tracking
 
 - `BOT_TOKEN`
 - `DATABASE_URL`
-- `ADMIN_ID` (optional but recommended for `/health`)
+- `ADMIN_ID` (optional but recommended for `/health` + `/cleanup`)
 
 **Optional:**
 
@@ -83,6 +99,10 @@ Database tracking
 - `B4_PROGRAM_ID` (default B4 program address)
 - `ONCHAIN_POLL_SECONDS` (default `5`)
 - `ENABLE_REMINDERS` (default `true`)
+- `REMINDER_12H_SECONDS` (default `43200`)
+- `REMINDER_6H_SECONDS` (default `21600`)
+- `GRADUATION_ENABLED` (default `true`)
+- `DELETE_DELAY_SECONDS` (default `0.2`; pacing for cleanup deletes/edits)
 - `PORT` (Render sets this)
 
 **Process:**
