@@ -11,6 +11,9 @@ def test_main_parses():
     # Core pieces present
     for name in (
         "fetch_onchain_markets",
+        "decode_onchain_market_account",
+        "scheduled_go_live",
+        "NOTIFY_DELAY_SECONDS",
         "is_app_live",
         "send_public_new_market",
         "monitor_loop",
@@ -29,6 +32,25 @@ def test_main_parses():
     ):
         assert banned not in src, f"should not contain {banned}"
     print("PASS: main.py parses and is slim")
+
+
+def test_v2_discovery_uses_confirmed_layout():
+    src = open("main.py", encoding="utf-8").read()
+    # Detection must use the same mechanism as the live bot: getProgramAccounts
+    # on the B4 program with a 464-byte account filter.
+    assert "getProgramAccounts" in src
+    assert "B4_PROGRAM_ID" in src
+    assert "dataSize" in src
+    assert "ONCHAIN_MARKET_ACCOUNT_SIZE" in src
+    # Deliberate lag, never earliest: delay is applied AFTER scheduled go-live.
+    assert "NOTIFY_DELAY_SECONDS" in src
+    assert "scheduled_go_live + NOTIFY_DELAY_SECONDS" in src or (
+        "sgl_ts + NOTIFY_DELAY_SECONDS" in src
+    )
+    # Still-live verification before send.
+    assert "is_app_live" in src
+    assert "check_cover_image_published" in src
+    print("PASS: V2 on-chain discovery + delayed-notify wiring present")
 
 
 def test_architecture_flow():
@@ -53,6 +75,7 @@ def test_no_openai_dependency():
 if __name__ == "__main__":
     os.chdir(os.path.dirname(os.path.abspath(__file__)) or ".")
     test_main_parses()
+    test_v2_discovery_uses_confirmed_layout()
     test_architecture_flow()
     test_no_openai_dependency()
     print("ALL LIGHTWEIGHT TESTS PASSED")

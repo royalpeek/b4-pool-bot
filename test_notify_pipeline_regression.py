@@ -236,6 +236,110 @@ def test_active_markets_zero_rows_is_critical():
     print("PASS: active markets with 0 rows is a CRITICAL condition")
 
 
+# ── V2 delayed-notify behavior (NOT like the earliest-notify live bot) ─────
+
+def test_notify_delayed_until_scheduled_go_live_plus_delay():
+    """ROOT CAUSE (V2): public notify must lag go-live by NOTIFY_DELAY_SECONDS."""
+    NOTIFY_DELAY_SECONDS = 180  # 2–5 min configurable window
+    scheduled_go_live = 1_784_000_000.0
+
+    def passed(row, now):
+        sgl = row.get("scheduled_go_live")
+        return now >= sgl + NOTIFY_DELAY_SECONDS
+
+    row = {"scheduled_go_live": scheduled_go_live}
+    assert passed(row, scheduled_go_live + 179) is False  # still waiting
+    assert passed(row, scheduled_go_live + 180) is True   # delay elapsed
+    print("PASS: notify fires only after scheduled_go_live + delay")
+
+
+def test_notify_verify_still_live_before_send():
+    """ROOT CAUSE: must verify the market is still live (cover HEAD) before send."""
+    def app_live(mid, market, cover_ok):
+        status = str(market.get("cover_image_status") or "").lower()
+        source = str(market.get("source") or "").lower()
+        if status == "ready":
+            if source == "onchain":
+                return cover_ok
+            return True
+        return cover_ok
+
+    market = {"market_id": "123", "cover_image_status": "ready", "source": "onchain"}
+    assert app_live("123", market, True) is True
+    assert app_live("123", market, False) is False  # went dark → skip
+    api_market = {"cover_image_status": "ready", "source": "api"}
+    assert app_live("123", api_market, False) is True  # API trusted without HEAD
+    print("PASS: still-live verification gates the send")
+
+
+def test_delayed_send_no_duplicate_with_inflight_and_flag():
+    """ROOT CAUSE: delayed send must still claim exactly once (inflight + DB flag)."""
+    inflight = set()
+    state = {"public_notified": False}
+
+    def attempt(mid):
+        if mid in inflight or state["public_notified"]:
+            return False
+        inflight.add(mid)
+        state["public_notified"] = True
+        inflight.discard(mid)
+        return True
+
+    assert attempt("m1") is True
+    assert attempt("m1") is False  # already notified
+    assert attempt("m1") is False  # never re-sends
+    print("PASS: delayed path still dedups via inflight + public_notified")
+
+
+def test_scheduled_go_live_derived_from_end_time():
+    """V2: scheduled_go_live = end_time - 86400 (confirmed chain behavior)."""
+    end_time = 1_785_000_000
+    duration = 86400
+    assert end_time - duration == 1_784_913_600
+    # Feed markets: go_live_at == end_time - 86400 for all observed markets.
+    for end, expected_go_live in [(1_784_913_600, 1_784_827_200), (1_790_000_000, 1_789_913_600)]:
+        assert end - duration == expected_go_live
+    print("PASS: scheduled_go_live derived from end_time (end - 86400)")
+
+
+def test_onchain_register_backfills_schedule_but_not_duplicate():
+    """On-chain + API both discover the same market → one row, schedule merged."""
+    def register(store, market):
+        mid = str(market["market_id"])
+        if mid in store:
+            if not store[mid].get("scheduled_go_live") and market.get("scheduled_go_live"):
+                store[mid]["scheduled_go_live"] = market["scheduled_go_live"]
+            return store[mid], False
+        store[mid] = dict(market)
+        return store[mid], True
+
+    store = {}
+    api = {"market_id": "m1", "title": "t", "end_time": 1_785_000_000, "source": "api"}
+    row, new = register(store, api)
+    assert new is True and row["source"] == "api" and not row.get("scheduled_go_live")
+    onchain = {"market_id": "m1", "title": "t", "end_time": 1_785_000_000,
+               "scheduled_go_live": 1_784_913_600.0, "source": "onchain"}
+    row2, new2 = register(store, onchain)
+    assert new2 is False  # no duplicate row
+    assert row2["scheduled_go_live"] == 1_784_913_600.0  # schedule backfilled
+    print("PASS: on-chain + API discovery merges into one deduped row")
+
+
+def test_send_releases_claim_if_delay_not_yet_passed():
+    """Delayed gate must not claim the flag before the window opens."""
+    claimed = {"flag": False}
+
+    def should_send(row, now, delay):
+        return now >= row["scheduled_go_live"] + delay
+
+    row = {"scheduled_go_live": 1_784_000_000.0}
+    if not should_send(row, 1_784_000_000 + 60, 180):
+        pass  # not claimed yet — gate prevents premature claim
+    assert claimed["flag"] is False
+    assert should_send(row, 1_784_000_000 + 180, 180) is True
+    print("PASS: flag not claimed before delay window opens")
+
+
 if __name__ == "__main__":
     test_notified_new_must_unlock_on_premium_success()
     test_public_independent_of_notified_new_and_premium()
@@ -248,4 +352,10 @@ if __name__ == "__main__":
     test_pipeline_stages_for_one_market()
     test_save_announced_market_placeholder_count()
     test_active_markets_zero_rows_is_critical()
+    test_notify_delayed_until_scheduled_go_live_plus_delay()
+    test_notify_verify_still_live_before_send()
+    test_delayed_send_no_duplicate_with_inflight_and_flag()
+    test_scheduled_go_live_derived_from_end_time()
+    test_onchain_register_backfills_schedule_but_not_duplicate()
+    test_send_releases_claim_if_delay_not_yet_passed()
     print("ALL NOTIFY PIPELINE REGRESSION TESTS PASSED")

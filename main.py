@@ -1,14 +1,18 @@
 """
-B4 Notify Bot — API-only lightweight public edition.
+B4 Notify Bot — lightweight public edition.
 
-Polls the official B4 API → new market detection → public Telegram notification.
-Optimized for free-tier hosts (Render): low memory, one monitor loop.
+On-chain V2 discovery (getProgramAccounts) + official B4 API → new market
+detection → intentionally delayed public Telegram notification (waits
+NOTIFY_DELAY_SECONDS after go-live, verifies the market is still live, then
+sends once). Optimized for free-tier hosts (Render): low memory, one loop.
 """
-print("B4 Notify Bot — API-ONLY public edition")
+print("B4 Notify Bot — lightweight public edition (V2 on-chain + API, delayed notify)")
 
+import base64
 import html
 import logging
 import os
+import struct
 import time
 import urllib.parse
 from datetime import datetime, timezone
@@ -63,7 +67,29 @@ ENABLE_REMINDERS = os.getenv("ENABLE_REMINDERS", "true").lower() == "true"
 REMINDER_1H = float(os.getenv("REMINDER_1H_SECONDS", "3600"))
 REMINDER_10M = float(os.getenv("REMINDER_10M_SECONDS", "600"))
 
+# ── V2 on-chain discovery + delayed notify ─────────────────────────────────
+# Detection uses the same mechanism as the live bot: getProgramAccounts on the
+# B4 program with a 464-byte account filter, decoded with the confirmed layout
+# (market_id u64 @ 0x08, title_byte_len u32 @ 0x30, title @ 0x34,
+# desc_len @ title_end, end_time u32 @ desc_end+32).
+ONCHAIN_ENABLED = os.getenv("ONCHAIN_ENABLED", "true").lower() == "true"
+SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
+B4_PROGRAM_ID = os.getenv("B4_PROGRAM_ID", "9XQDD38sy1qJ57DqAQvADuLRTjcYUXD48H7deyNuaehH")
+ONCHAIN_POLL_SECONDS = float(os.getenv("ONCHAIN_POLL_SECONDS", "5"))
+ONCHAIN_MARKET_ACCOUNT_SIZE = int(os.getenv("ONCHAIN_MARKET_ACCOUNT_SIZE", "464"))
+ONCHAIN_MARKET_ID_OFFSET = int(os.getenv("ONCHAIN_MARKET_ID_OFFSET", "8"))
+ONCHAIN_TITLE_LENGTH_OFFSET = int(os.getenv("ONCHAIN_TITLE_LENGTH_OFFSET", "48"))
+ONCHAIN_TITLE_OFFSET = int(os.getenv("ONCHAIN_TITLE_OFFSET", "52"))
+ONCHAIN_MARKET_DURATION_SECONDS = int(os.getenv("ONCHAIN_MARKET_DURATION_SECONDS", "86400"))
+# Intentional delay after the scheduled go-live before the public notify fires.
+# The live bot notifies earliest; this bot deliberately lags (2–5 min default).
+NOTIFY_DELAY_SECONDS = float(os.getenv("NOTIFY_DELAY_SECONDS", "180"))
+COVER_LIVE_CACHE_SECONDS = float(os.getenv("COVER_LIVE_CACHE_SECONDS", "45"))
+
 _PAUSED = False
+_cover_live_cache: dict = {}
+_inflight_public: set = set()
+last_onchain_poll_at = 0.0
 
 bot = telebot.TeleBot(BOT_TOKEN, threaded=False)
 
@@ -80,6 +106,9 @@ HEALTH = {
     "notifications_sent": 0,
     "loop_count": 0,
     "last_error": "",
+    "onchain_loops": 0,
+    "onchain_markets": 0,
+    "last_onchain_at": 0.0,
 }
 
 
@@ -87,6 +116,25 @@ HEALTH = {
 
 def now_utc():
     return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _end_unix(value):
+    """Parse an end_time value (unix number or ISO string) to epoch seconds."""
+    if not value:
+        return 0
+    if isinstance(value, (int, float)):
+        return int(value)
+    try:
+        return int(float(value))
+    except Exception:
+        pass
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp())
+    except Exception:
+        return 0
 
 
 def escape(text):
@@ -134,7 +182,9 @@ def init_db():
                             notified_ended BOOLEAN DEFAULT FALSE,
                             public_sent_at TIMESTAMP,
                             detected_at TIMESTAMP DEFAULT NOW(),
-                            updated_at TIMESTAMP DEFAULT NOW()
+                            updated_at TIMESTAMP DEFAULT NOW(),
+                            scheduled_go_live TEXT,
+                            app_live_at TIMESTAMP
                         )
                         """
                     )
@@ -166,6 +216,8 @@ def init_db():
                         "ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS title TEXT",
                         "ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()",
                         "ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS detected_at TIMESTAMP DEFAULT NOW()",
+                        "ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS scheduled_go_live TEXT",
+                        "ALTER TABLE announced_markets ADD COLUMN IF NOT EXISTS app_live_at TIMESTAMP",
                     ):
                         try:
                             cur.execute(stmt)
@@ -267,30 +319,57 @@ def register_market(market):
         return None, False
     existing = get_market(mid)
     if existing:
+        # Backfill schedule / source when first learned (on-chain → API merge).
+        update_schedule = False
+        if not existing.get("scheduled_go_live"):
+            sgl = market.get("scheduled_go_live")
+            if sgl:
+                existing["scheduled_go_live"] = sgl
+                update_schedule = True
+        if existing.get("source") in (None, "", "api") and market.get("source") == "onchain":
+            existing["source"] = "onchain"
+            update_schedule = True
+        if update_schedule:
+            try:
+                with get_db() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "UPDATE announced_markets SET scheduled_go_live = %s, source = %s, updated_at = NOW() WHERE market_id = %s",
+                            (existing.get("scheduled_go_live"), existing.get("source"), mid),
+                        )
+            except Exception as e:
+                logger.error("update schedule %s: %s", mid, e)
         return existing, False
 
     title = str(market.get("title", "")).strip()
     end_unix = int(market.get("end_time") or 0)
     end_iso = datetime.fromtimestamp(end_unix, tz=timezone.utc).replace(tzinfo=None).isoformat()
     link = f"{MARKET_LINK_BASE}/{mid}"
+    source = str(market.get("source") or "api").strip() or "api"
+    sgl = market.get("scheduled_go_live")
+    sgl_iso = None
+    if sgl:
+        sgl_ts = int(float(sgl))
+        if sgl_ts > 0:
+            sgl_iso = datetime.fromtimestamp(sgl_ts, tz=timezone.utc).replace(tzinfo=None).isoformat()
     try:
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
                     INSERT INTO announced_markets (
-                        market_id, title, end_time, market_link, source
+                        market_id, title, end_time, market_link, source, scheduled_go_live
                     )
-                    VALUES (%s, %s, %s, %s, 'api')
+                    VALUES (%s, %s, %s, %s, %s, %s)
                     ON CONFLICT (market_id) DO NOTHING
                     RETURNING market_id
                     """,
-                    (mid, title, end_iso, link),
+                    (mid, title, end_iso, link, source, sgl_iso),
                 )
                 inserted = cur.fetchone() is not None
         if inserted:
             HEALTH["markets_registered"] = int(HEALTH.get("markets_registered", 0)) + 1
-            logger.info("REGISTERED market=%s title=%s", mid, title[:50])
+            logger.info("REGISTERED market=%s title=%s source=%s sgl=%s", mid, title[:50], source, sgl_iso)
         return get_market(mid), inserted
     except Exception as e:
         logger.critical("REGISTER failed market=%s error=%s", mid, e)
@@ -421,11 +500,22 @@ def fetch_api_markets():
                 continue
             if m.get("hidden") or m.get("resolved"):
                 continue
+            # Prefer the API's go_live_at; else derive end_time - 86400 (confirmed).
+            sgl = m.get("go_live_at") or m.get("go_live_at_scheduled")
+            if not sgl:
+                sgl = end - ONCHAIN_MARKET_DURATION_SECONDS
+            try:
+                sgl_float = float(sgl)
+            except Exception:
+                sgl_float = float(end - ONCHAIN_MARKET_DURATION_SECONDS)
             out.append({
                 "market_id": mid,
                 "title": title,
                 "end_time": end,
+                "scheduled_go_live": sgl_float,
                 "source": "api",
+                "cover_image_status": str(m.get("cover_image_status") or "").lower(),
+                "go_live_at": m.get("go_live_at") or m.get("go_live_at_scheduled"),
             })
         HEALTH["last_market_count"] = len(out)
         HEALTH["last_scan_at"] = time.time()
@@ -434,6 +524,215 @@ def fetch_api_markets():
     except Exception as e:
         logger.error("fetch_api_markets: %s", e)
         HEALTH["last_error"] = f"api:{e}"
+        return []
+
+
+# ── V2 on-chain discovery (confirmed 464-byte layout) ──────────────────────
+
+def read_u64_le(data, offset):
+    if offset < 0 or offset + 8 > len(data):
+        return None
+    return struct.unpack_from("<Q", data, offset)[0]
+
+
+def read_u32_le(data, offset):
+    if offset < 0 or offset + 4 > len(data):
+        return None
+    return struct.unpack_from("<I", data, offset)[0]
+
+
+def decode_onchain_market_account(pubkey, encoded_data):
+    """Decode a 464-byte B4 market account (confirmed layout).
+
+    market_id u64 @ 0x08, title_byte_len u32 @ 0x30, title @ 0x34,
+    desc_byte_len u32 @ title_end, end_time u32 @ desc_end+32.
+    """
+    try:
+        raw_data = encoded_data[0] if isinstance(encoded_data, list) else encoded_data
+        data = base64.b64decode(raw_data)
+        market_id = read_u64_le(data, ONCHAIN_MARKET_ID_OFFSET)
+        title_len = read_u32_le(data, ONCHAIN_TITLE_LENGTH_OFFSET)
+        if not market_id or not title_len:
+            return None
+        if market_id < 1_700_000_000_000_000 or market_id > 1_900_000_000_000_000:
+            return None
+        if title_len < 6 or title_len > 180:
+            return None
+        title_end = ONCHAIN_TITLE_OFFSET + title_len
+        if title_end > len(data):
+            return None
+        title = data[ONCHAIN_TITLE_OFFSET:title_end].decode("utf-8", errors="strict").strip("\x00").strip()
+        if len(title) < 6:
+            return None
+        desc_len = read_u32_le(data, title_end) or 0
+        desc_end = title_end + 4 + desc_len
+        if desc_end + 36 > len(data):
+            return None
+        end_time = read_u32_le(data, desc_end + 32)
+        if not end_time:
+            return None
+        scheduled_go_live = end_time - ONCHAIN_MARKET_DURATION_SECONDS
+        return {
+            "market_id": str(market_id),
+            "title": title,
+            "end_time": end_time,
+            "scheduled_go_live": float(scheduled_go_live),
+            "source": "onchain",
+        }
+    except Exception as e:
+        logger.debug("could not decode on-chain market account %s: %s", pubkey, e)
+        return None
+
+
+def fetch_onchain_markets():
+    """Discover live V2 markets on-chain (same mechanism as the live bot)."""
+    if not ONCHAIN_ENABLED:
+        return []
+    try:
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getProgramAccounts",
+            "params": [
+                B4_PROGRAM_ID,
+                {
+                    "encoding": "base64",
+                    "commitment": "confirmed",
+                    "filters": [{"dataSize": ONCHAIN_MARKET_ACCOUNT_SIZE}],
+                    "dataSlice": {"offset": 0, "length": ONCHAIN_MARKET_ACCOUNT_SIZE},
+                },
+            ],
+        }
+        response = requests.post(SOLANA_RPC_URL, json=payload, timeout=max(API_TIMEOUT, 12))
+        response.raise_for_status()
+        data = response.json()
+        if data.get("error"):
+            logger.error("solana rpc error: %s", data["error"])
+            return []
+        markets = []
+        now_ts = int(time.time())
+        for account in data.get("result", []):
+            market = decode_onchain_market_account(
+                account.get("pubkey"),
+                account.get("account", {}).get("data"),
+            )
+            if not market:
+                continue
+            if int(market["end_time"]) <= now_ts:
+                continue
+            markets.append(market)
+        HEALTH["last_onchain_at"] = time.time()
+        HEALTH["onchain_markets"] = len(markets)
+        logger.info("on-chain discovery: %s live markets", len(markets))
+        return markets
+    except Exception as e:
+        logger.error("fetch_onchain_markets: %s", e)
+        HEALTH["last_error"] = f"onchain:{e}"
+        return []
+
+
+# ── APP_LIVE / still-live verification (cover HEAD, cached) ────────────────
+
+def check_cover_image_published(market_id, use_cache=True):
+    """True when the cover image is published (APP_LIVE signal), cached."""
+    market_id = str(market_id or "").strip()
+    if not market_id:
+        return False, 0
+    now_m = time.monotonic()
+    if use_cache:
+        cached = _cover_live_cache.get(market_id)
+        if cached and cached[2] > now_m:
+            return cached[0], cached[1]
+    url = f"https://www.b4app.xyz/api/assets/market-cover/{market_id}.png"
+    try:
+        resp = requests.head(url, timeout=min(API_TIMEOUT, 6), allow_redirects=True)
+        ok, code = resp.status_code == 200, resp.status_code
+    except Exception as e:
+        logger.debug("cover HEAD failed for %s: %s", market_id, e)
+        ok, code = False, 0
+    _cover_live_cache[market_id] = (ok, code, now_m + COVER_LIVE_CACHE_SECONDS)
+    if len(_cover_live_cache) > 2000:
+        expired = [k for k, v in _cover_live_cache.items() if v[2] <= now_m]
+        for k in expired[:500]:
+            _cover_live_cache.pop(k, None)
+    return ok, code
+
+
+def is_app_live(market_id, market=None):
+    """True when the market is live in the app (cover published).
+
+    Trust API cover_image_status=ready (no network). On-chain uses cached HEAD.
+    """
+    market_id = str(market_id or (market or {}).get("market_id", "")).strip()
+    if market:
+        status = str(market.get("cover_image_status") or "").strip().lower()
+        source = str(market.get("source") or "").strip().lower()
+        if status == "ready":
+            if source == "onchain":
+                ok, _ = check_cover_image_published(market_id)
+                return ok
+            return True
+    ok, _ = check_cover_image_published(market_id)
+    return ok
+
+
+def scheduled_go_live_passed(row):
+    """True once the market's scheduled go-live + notify delay have elapsed.
+
+    V2 on-chain markets carry scheduled_go_live (derived from end_time), so the
+    notify deliberately lags go-live by NOTIFY_DELAY_SECONDS. V1 API-only rows
+    fall back to the legacy detected_at + NEW_MARKET_DELAY_SECONDS window.
+    """
+    now_ts = time.time()
+    sgl = row.get("scheduled_go_live")
+    if sgl:
+        sgl_ts = 0.0
+        try:
+            sgl_ts = float(sgl)
+        except Exception:
+            pass
+        if isinstance(sgl, str) and not sgl.replace(".", "", 1).isdigit():
+            try:
+                dt = datetime.fromisoformat(sgl)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                sgl_ts = dt.timestamp()
+            except Exception:
+                sgl_ts = 0.0
+        if sgl_ts > 0:
+            return now_ts >= sgl_ts + NOTIFY_DELAY_SECONDS
+    # Legacy fallback: delay measured from detection time.
+    detected = row.get("detected_at")
+    if detected:
+        try:
+            if isinstance(detected, datetime):
+                dt = detected
+            else:
+                dt = datetime.fromisoformat(str(detected).replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return now_ts >= dt.timestamp() + NEW_MARKET_DELAY_SECONDS
+        except Exception:
+            pass
+    return True
+
+
+def get_markets_pending_public():
+    """Markets discovered but not yet publicly notified (and not ended)."""
+    try:
+        with get_db() as conn:
+            with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
+                cur.execute(
+                    """
+                    SELECT * FROM announced_markets
+                    WHERE COALESCE(public_notified, FALSE) = FALSE
+                      AND COALESCE(notified_ended, FALSE) = FALSE
+                    ORDER BY detected_at
+                    """
+                )
+                return cur.fetchall()
+    except Exception as e:
+        logger.error("get_markets_pending_public: %s", e)
         return []
 
 
@@ -502,39 +801,64 @@ def build_reminder_message(title, market_id, label, time_left_sec):
 # ── Notification pipeline ────────────────────────────────────────────────────
 
 def send_public_new_market(market, row):
-    """Delay → verify → public notification (once)."""
+    """Intentionally delayed → verify still live → public notification (once)."""
     mid = str(market.get("market_id", "")).strip()
     if not mid or not row:
         return False
     if row.get("public_notified"):
         return False
+    if mid in _inflight_public:
+        return False
+
+    # Intentional lag: never fire before scheduled go-live + notify delay.
+    if not scheduled_go_live_passed(row):
+        return False
+
+    # Verify the market is actually live (cover published) before sending.
+    if not is_app_live(mid, market):
+        logger.debug("mid=%s not app-live yet, waiting", mid)
+        return False
 
     if not claim_flag(mid, "public_notified"):
         return False
+    _inflight_public.add(mid)
+    try:
+        title = str(market.get("title") or row.get("title") or "").strip()
+        end_unix = int(market.get("end_time") or 0)
 
-    title = str(market.get("title") or row.get("title") or "").strip()
-    end_unix = int(market.get("end_time") or 0)
+        latest = get_market(mid)
+        if latest and latest.get("notified_ended"):
+            release_flag(mid, "public_notified")
+            return False
 
-    if NEW_MARKET_DELAY_SECONDS > 0:
-        logger.debug("delaying announcement mid=%s %ss", mid, NEW_MARKET_DELAY_SECONDS)
-        time.sleep(NEW_MARKET_DELAY_SECONDS)
+        # Re-verify after claim so a market that went dark is not announced.
+        if not is_app_live(mid, market):
+            release_flag(mid, "public_notified")
+            logger.info("mid=%s went dark before notify, releasing claim", mid)
+            return False
 
-    latest = get_market(mid)
-    if latest and latest.get("notified_ended"):
+        text = build_new_market_message(title, mid, end_unix)
+        sent = broadcast(text, vote_keyboard(mid), track_market_id=mid, msg_type="new")
+        if sent > 0:
+            try:
+                with get_db() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "UPDATE announced_markets SET public_sent_at = NOW(), updated_at = NOW() WHERE market_id = %s",
+                            (mid,),
+                        )
+            except Exception as e:
+                logger.error("stamp public_sent_at %s: %s", mid, e)
+            HEALTH["last_notification_title"] = title[:80]
+            set_state("last_market_detected", f"{mid} | {title}")
+            logger.info("PUBLIC NEW MARKET sent mid=%s title=%s sent=%s", mid, title[:40], sent)
+            return True
+
         release_flag(mid, "public_notified")
+        logger.warning("PUBLIC NEW MARKET zero sends mid=%s (will retry)", mid)
         return False
-
-    text = build_new_market_message(title, mid, end_unix)
-    sent = broadcast(text, vote_keyboard(mid), track_market_id=mid, msg_type="new")
-    if sent > 0:
-        HEALTH["last_notification_title"] = title[:80]
-        set_state("last_market_detected", f"{mid} | {title}")
-        logger.info("PUBLIC NEW MARKET sent mid=%s title=%s sent=%s", mid, title[:40], sent)
-        return True
-
-    release_flag(mid, "public_notified")
-    logger.warning("PUBLIC NEW MARKET zero sends mid=%s (will retry)", mid)
-    return False
+    finally:
+        _inflight_public.discard(mid)
 
 
 def process_reminders():
@@ -584,7 +908,7 @@ def process_reminders():
 
 
 def monitor_loop():
-    global _PAUSED
+    global _PAUSED, last_onchain_poll_at
     logger.info("monitor loop started")
     HEALTH["status"] = "running"
     while True:
@@ -598,7 +922,22 @@ def monitor_loop():
                 time.sleep(max(1.0, MARKET_POLL_SECONDS - elapsed))
                 continue
 
-            # API discovery (sole source of truth)
+            # V2 on-chain discovery (throttled)
+            if time.time() - last_onchain_poll_at >= ONCHAIN_POLL_SECONDS:
+                last_onchain_poll_at = time.time()
+                HEALTH["onchain_loops"] = int(HEALTH.get("onchain_loops", 0)) + 1
+                for market in fetch_onchain_markets():
+                    try:
+                        mid = str(market.get("market_id", "")).strip()
+                        title = str(market.get("title", "")).strip()
+                        end_unix = int(market.get("end_time") or 0)
+                        if not mid or not title or end_unix <= int(time.time()):
+                            continue
+                        register_market(market)
+                    except Exception as e:
+                        logger.error("process onchain market: %s", e)
+
+            # API discovery (supplementary source; V1 compatibility)
             for market in fetch_api_markets():
                 try:
                     mid = str(market.get("market_id", "")).strip()
@@ -611,9 +950,31 @@ def monitor_loop():
                     if not row or row.get("public_notified") or row.get("notified_ended"):
                         continue
 
-                    send_public_new_market(market, row)
+                    # API markets carry cover_image_status; synthesize for app-live check.
+                    merged = dict(market)
+                    merged["cover_image_status"] = market.get("cover_image_status") or "ready"
+                    merged["source"] = row.get("source") or "api"
+                    send_public_new_market(merged, row)
                 except Exception as e:
                     logger.error("process api market: %s", e)
+
+            # Pending public markets registered on-chain (delayed notify).
+            for row in get_markets_pending_public():
+                try:
+                    mid = str(row.get("market_id", "")).strip()
+                    if not mid or mid in _inflight_public:
+                        continue
+                    if row.get("public_notified") or row.get("notified_ended"):
+                        continue
+                    market = {
+                        "market_id": mid,
+                        "title": row.get("title") or "",
+                        "end_time": _end_unix(row.get("end_time")),
+                        "source": row.get("source") or "onchain",
+                    }
+                    send_public_new_market(market, row)
+                except Exception as e:
+                    logger.error("process pending public market: %s", e)
 
             process_reminders()
             HEALTH["last_eval_at"] = time.time()
@@ -688,17 +1049,22 @@ def cmd_stop(message):
 @bot.message_handler(commands=["status"])
 def cmd_status(message):
     add_chat(message.chat.id, "")
+    bot.reply_to(message, health_text(), parse_mode="HTML")
+
+
+def health_text():
     active = len(get_all_markets())
     chats = len(get_all_chats())
     state = "paused" if _PAUSED else "running"
-    bot.reply_to(
-        message,
+    return (
         f"📊 <b>B4 Notify</b>\n"
         f"State: <b>{state}</b>\n"
         f"Tracked markets: <b>{active}</b>\n"
         f"Subscribers: <b>{chats}</b>\n"
-        f"Notifications sent: <b>{HEALTH.get('notifications_sent', 0)}</b>",
-        parse_mode="HTML",
+        f"Notifications sent: <b>{HEALTH.get('notifications_sent', 0)}</b>\n"
+        f"On-chain loops: <b>{HEALTH.get('onchain_loops', 0)}</b>\n"
+        f"On-chain markets: <b>{HEALTH.get('onchain_markets', 0)}</b>\n"
+        f"Notify delay: <b>{int(NOTIFY_DELAY_SECONDS)}s</b>"
     )
 
 
