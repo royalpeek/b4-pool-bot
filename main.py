@@ -512,19 +512,26 @@ def _telegram_missing(e):
 
 def _safe_delete_message(chat_id, message_id, retries=3):
     """Delete a message, tolerating already-deleted messages and transient
-    errors (retried with backoff). Never raises. Returns True when gone."""
+    errors (retried with backoff). Never raises.
+
+    Returns a status string: 'deleted', 'already_gone', or 'error'. This lets
+    callers distinguish real Telegram deletions from tolerated failures so
+    /cleanup can report exact counts instead of always "success".
+    """
+    last_err = None
     for attempt in range(retries):
         try:
             bot.delete_message(int(chat_id), int(message_id))
-            return True
+            return "deleted"
         except Exception as e:
+            last_err = e
             if _telegram_missing(e):
-                return True  # already deleted — treat as success
+                return "already_gone"
             if attempt < retries - 1:
                 time.sleep(min(2 ** attempt, 8))
             else:
-                logger.warning("delete msg chat=%s mid=%s: %s", chat_id, message_id, e)
-    return False
+                logger.warning("delete_message failed chat=%s mid=%s: %s", chat_id, message_id, e)
+    return f"error: {last_err}"
 
 
 def _safe_edit_message(chat_id, message_id, text, keyboard=None, retries=3):
@@ -563,7 +570,8 @@ def cleanup_market(market_id):
     messages = _get_market_messages(market_id)
     deleted = 0
     for row in messages:
-        if _safe_delete_message(row.get("chat_id"), row.get("message_id")):
+        status = _safe_delete_message(row.get("chat_id"), row.get("message_id"))
+        if status == "deleted":
             deleted += 1
         time.sleep(DELETE_DELAY_SECONDS)
     logger.info("Market ended mid=%s: deleted %s Telegram messages", market_id, deleted)
@@ -816,17 +824,31 @@ def is_graduated(market_id):
 
 
 def _seed_baseline():
-    """Snapshot the markets live at boot (no historical replay).
+    """Snapshot the markets live at boot (no historical replay) — persisted.
 
-    Every market already on-chain/in the API when this process starts is
-    historical from the bot's perspective and must NEVER be notified. Only
-    market_ids first seen after the baseline may be registered and delayed-
-    notified. Returns True once a baseline is recorded (retry if both sources
-    failed, so an outage at boot cannot turn into an empty baseline).
+    Every market already on-chain/in the API when the bot is FIRST initialized
+    is historical from the bot's perspective and must NEVER be notified. The
+    set is persisted to bot_state on first boot and reloaded from there on every
+    later boot, so a restart can never re-classify a market that this bot has
+    already registered (and is still waiting on its notify delay) as historical.
+    Only market_ids first seen after the first-ever baseline may be registered
+    and delayed-notified. Returns True once a baseline is recorded (retry if
+    both sources failed, so an outage at first boot cannot turn into an empty
+    baseline).
     """
     global _baseline_markets, _baseline_seeded
     if _baseline_seeded:
         return True
+    stored = get_state("baseline_markets", "")
+    if stored:
+        try:
+            _baseline_markets = set(x for x in stored.split(",") if x)
+            _baseline_seeded = True
+            logger.info("BASELINE loaded from state: %s markets (stable across restarts)", len(_baseline_markets))
+            return True
+        except Exception as e:
+            logger.error("parse stored baseline: %s", e)
+
     ids: set = set()
     onchain = fetch_onchain_markets()
     for m in onchain:
@@ -840,7 +862,11 @@ def _seed_baseline():
         return False
     _baseline_markets = ids
     _baseline_seeded = True
-    logger.info("BASELINE seeded: %s live markets at boot (never replayed)", len(ids))
+    try:
+        set_state("baseline_markets", ",".join(sorted(ids)))
+    except Exception as e:
+        logger.error("persist baseline: %s", e)
+    logger.info("BASELINE seeded: %s live markets at first boot (never replayed)", len(ids))
     return True
 
 
@@ -979,11 +1005,13 @@ def scheduled_go_live_passed(row):
 def get_markets_pending_public():
     """Markets discovered but not yet publicly notified (and not ended).
 
-    Only rows first seen during THIS session (detected_at >= boot) are eligible,
-    so pre-boot legacy rows are never replayed after a restart, and paused
-    (notify_cancelled) rows are never re-queued after Resume.
+    Eligibility is decided by the persisted startup baseline (market_ids that
+    were live at FIRST boot are never notified) plus the per-row flags; rows
+    are NOT excluded merely because they were first seen in a previous process
+    session, so a delay-pending market survives a restart without being lost.
+    Paused (notify_cancelled) rows are never re-queued after Resume.
     """
-    boot_iso = datetime.fromtimestamp(_boot_ts, tz=timezone.utc).replace(tzinfo=None).isoformat()
+    now_iso = datetime.fromtimestamp(time.time(), tz=timezone.utc).replace(tzinfo=None).isoformat()
     try:
         with get_db() as conn:
             with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
@@ -993,10 +1021,10 @@ def get_markets_pending_public():
                     WHERE COALESCE(public_notified, FALSE) = FALSE
                       AND COALESCE(notified_ended, FALSE) = FALSE
                       AND COALESCE(notify_cancelled, FALSE) = FALSE
-                      AND detected_at >= %s
+                      AND (end_time IS NULL OR end_time >= %s)
                     ORDER BY detected_at
                     """,
-                    (boot_iso,),
+                    (now_iso,),
                 )
                 return cur.fetchall()
     except Exception as e:
@@ -1246,7 +1274,13 @@ def process_lifecycle():
 
 def global_cleanup():
     """Admin wipe: delete every bot message across private chats, groups and
-    channels, then clear every stored message ID. Returns (deleted, chats)."""
+    channels, then clear every stored message ID.
+
+    Returns a dict: {deleted, skipped, failed, total, chats, errors}
+    'skipped' = already gone / not found (safe to drop from DB);
+    'failed' = Telegram refused or errored — DB rows are NOT dropped for
+    those so the message is never silently forgotten.
+    """
     try:
         with get_db() as conn:
             with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
@@ -1254,20 +1288,54 @@ def global_cleanup():
                 rows = cur.fetchall()
     except Exception as e:
         logger.error("global_cleanup read: %s", e)
-        return 0, 0
+        return {"deleted": 0, "skipped": 0, "failed": 0, "total": 0, "chats": 0, "errors": []}
     deleted = 0
+    skipped = 0
+    failed = 0
+    ok_ids: list = []
     chats: set = set()
     for r in rows:
-        if _safe_delete_message(r.get("chat_id"), r.get("message_id")):
+        chat_id = r.get("chat_id")
+        message_id = r.get("message_id")
+        chats.add(str(chat_id))
+        status = _safe_delete_message(chat_id, message_id)
+        if status == "deleted":
             deleted += 1
-        chats.add(str(r.get("chat_id")))
+            ok_ids.append(int(message_id))
+        elif status == "already_gone":
+            skipped += 1
+            ok_ids.append(int(message_id))
+        else:
+            failed += 1
+            logger.error("DIAG cleanup failed chat=%s mid=%s: %s", chat_id, message_id, status)
         time.sleep(DELETE_DELAY_SECONDS)
-    _delete_all_market_messages()
+    # Drop DB rows only for messages that were actually deleted (or already
+    # gone). Keep failed rows so the messages are never silently forgotten.
+    if rows and ok_ids:
+        try:
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "DELETE FROM market_messages WHERE message_id = ANY(%s)",
+                        (ok_ids,),
+                    )
+        except Exception as e:
+            logger.error("global_cleanup prune ok rows: %s", e)
     _cover_live_cache.clear()
     _inflight_public.clear()
     _graduated_markets.clear()
-    logger.warning("GLOBAL CLEANUP deleted=%s chats=%s", deleted, len(chats))
-    return deleted, len(chats)
+    logger.warning(
+        "GLOBAL CLEANUP deleted=%s skipped=%s failed=%s retained_rows=%s total=%s chats=%s",
+        deleted, skipped, failed, len(rows) - len(ok_ids), len(rows), len(chats),
+    )
+    return {
+        "deleted": deleted,
+        "skipped": skipped,
+        "failed": failed,
+        "retained_rows": len(rows) - len(ok_ids),
+        "total": len(rows),
+        "chats": len(chats),
+    }
 
 
 def monitor_loop():
@@ -1485,20 +1553,23 @@ def cmd_cleanup(message):
     logger.warning("ADMIN CLEANUP by user=%s", message.from_user.id)
     bot.reply_to(message, "🧹 Cleaning up all bot messages…")
     try:
-        deleted, chats = global_cleanup()
+        res = global_cleanup()
     except Exception as e:
         logger.error("cleanup failed: %s", e)
         bot.reply_to(message, f"⚠️ Cleanup failed: {e}")
         return
-    bot.reply_to(
-        message,
-        "<b>🧹 Cleanup complete</b>\n\n"
-        f"Deleted:\n"
-        f"• <b>{deleted}</b> messages\n"
-        f"• <b>{chats}</b> chats\n"
-        f"• <b>Database cleaned successfully.</b>",
-        parse_mode="HTML",
-    )
+    lines = [
+        "<b>🧹 Cleanup complete</b>",
+        "",
+        f"• Deleted: <b>{res['deleted']}/{res['total']}</b> messages {({res['chats']})} chats",
+        f"• Skipped (already gone): <b>{res['skipped']}</b>",
+    ]
+    if res["failed"]:
+        lines.append(f"• Failed (kept for retry): <b>{res['failed']}</b>")
+        lines.append("⚠️ Check the logs for 'DIAG cleanup failed' — these were NOT silently dropped.")
+    else:
+        lines.append("• Database cleaned successfully.")
+    bot.reply_to(message, "\n".join(lines), parse_mode="HTML")
 
 
 # ── Flask ────────────────────────────────────────────────────────────────────

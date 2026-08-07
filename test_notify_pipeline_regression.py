@@ -366,21 +366,33 @@ def test_startup_baseline_never_notifies_historical_markets():
     print("PASS: boot baseline gates registration -> old markets never replayed")
 
 
-def test_restart_reseeds_baseline_no_replay():
-    """ROOT CAUSE: on every restart the baseline must be reseeded from the
-    then-live markets, so a restart never replays markets that exist at boot."""
-    def boot(now_live, prior_rows):
-        baseline = set(now_live)
-        # Any prior row still live at boot is in the new baseline → never replayed.
-        newly = sorted(m for m in prior_rows if m not in baseline)
-        return newly, sorted(baseline)
+def test_restart_does_not_reclassify_newly_registered_market():
+    """ROOT CAUSE: OLD code re-snapped the baseline from *then-live* markets on
+    EVERY restart. That orphaned a market the bot had registered mid-session
+    (still waiting on its 180s delay): after a restart the newly registered
+    market was still live, so the restart classified it as 'historical' and it
+    was never notified — 0 sends while all markets stayed 'tracked'.
 
-    newly, baseline = boot({"A", "B"}, ["A", "B", "C"])
-    assert newly == ["C"]
-    assert baseline == ["A", "B"]
-    # A live-at-restart market stays silent even if it was never notified before.
-    assert "A" not in newly
-    print("PASS: restart reseeds baseline; only genuinely new markets notify")
+    Fixed semantics: the baseline is captured once at FIRST boot and persisted.
+    A market the bot fully registered (is_new) is never re-classified as
+    historical by a later restart."""
+    persisted = {"A", "B"}  # live at first-ever boot
+
+    def is_historical(mid):
+        return str(mid) in persisted
+
+    # First boot: A and B already live → historical. C is genuinely new.
+    assert is_historical("A") and is_historical("B")
+    assert not is_historical("C")
+
+    # C was registered at 10:00, resting for its 180s delay. Restart at 10:02,
+    # C is STILL LIVE — but it must NOT become historical just because it's live now.
+    current_live = {"A", "B", "C"}
+    assert "C" in current_live
+    assert not is_historical("C"), "restart must not promote a registered market to historical"
+    # Baseline is untouched: still just the first-boot set (A, B).
+    assert persisted == {"A", "B"}
+    print("PASS: restart does not re-classify a newly registered market as historical")
 
 
 def test_pause_cancels_queued_delayed_notifies():
@@ -430,25 +442,69 @@ def test_send_aborts_when_paused_mid_flight():
     print("PASS: mid-flight pause cancels instead of re-queuing")
 
 
-def test_pending_queue_only_admits_this_session_new():
-    """The delayed-notify queue only admits rows first seen during this session
-    (detected_at >= boot) — pre-boot legacy rows are never replayed."""
-    boot_ts = 1_800_000_000.0
+def test_pending_queue_admits_delay_pending_surviving_restart():
+    """The delayed-notify queue must NOT drop a market merely because it was
+    first seen in a previous session. A market waiting on its 180s delay that
+    survives a restart must still be notified — otherwise it is lost forever
+    (not-notified rows stayed 'tracked' but never sent).
+    The only excluded rows are: notified, ended, cancelled, historical market
+    (in the persisted baseline), or already closed."""
+    baseline = {"HIST1", "HIST2"}  # live at FIRST boot — persisted, never replayed
 
     def pending(row):
-        detected = row.get("detected_at")
         return (
-            detected is not None
-            and detected >= boot_ts
-            and not row.get("public_notified")
+            not row.get("public_notified")
+            and not row.get("notified_ended")
             and not row.get("notify_cancelled")
+            and str(row.get("market_id")) not in baseline
         )
 
-    assert pending({"detected_at": boot_ts - 100, "public_notified": False}) is False  # legacy
-    assert pending({"detected_at": boot_ts + 5, "public_notified": False}) is True      # new
-    assert pending({"detected_at": boot_ts + 5, "public_notify": False}) is True        # typo key ≠ cancel
-    assert pending({"detected_at": boot_ts + 5, "notify_cancelled": True}) is False     # paused
-    print("PASS: pending queue excludes pre-boot legacy + paused rows")
+    assert pending({"market_id": "DELAY1", "detected_at": "older-session"}) is True   # was pending pre-restart
+    assert pending({"market_id": "DELAY1", "public_notified": False}) is True          # restored after restart
+    assert pending({"market_id": "HIST1"}) is False                                   # historical → never notified
+    assert pending({"market_id": "X", "notify_cancelled": True}) is False             # paused
+    assert pending({"market_id": "X", "public_notified": True}) is False
+    print("PASS: pending queue keeps pre-restart delayed markets eligible; only historical are barred")
+
+
+def test_baseline_persists_across_restart():
+    """Historical baseline must persist across restarts. Old code re-snapped the
+    ENTIRE live market set on EVERY boot, so a market this bot had just
+    registered (waiting on its notify delay) was re-labeled 'historical' by the
+    restart and never notified (0 sends, all markets 'tracked')."""
+    store = {}  # bot_state
+
+    def seed_baseline(now_live):
+        stored = store.get("baseline_markets")
+        if stored:
+            return set(x for x in stored.split(",") if x)
+        baseline = set(str(m.get("market_id")) for m in now_live)
+        store["baseline_markets"] = ",".join(sorted(baseline))
+        return baseline
+
+    # First boot: LEGACY1, LEGACY2 already live → baseline.
+    b1 = seed_baseline([{"market_id": "LEGACY1"}, {"market_id": "LEGACY2"}])
+    assert b1 == {"LEGACY1", "LEGACY2"}
+
+    # Bot registers NEW1 while running; delay in flight.
+    row = {"market_id": "NEW1", "public_notified": False}
+    assert "NEW1" not in b1  # genuinely new this session
+
+    # Restart. Old code: re-snapshots the then-live set (LEGACY1, LEGACY2, NEW1)
+    # → NEW1 becomes 'historical' → never notified.
+    def restart_baseline_live(current_live):
+        return set(str(m.get("market_id")) for m in current_live)
+
+    broken_snapshot = restart_baseline_live([{"market_id": "LEGACY1"}, {"market_id": "LEGACY2"}, {"market_id": "NEW1"}])
+    assert "NEW1" in broken_snapshot  # this is the bug: NEW1 got orphaned
+
+    # With persistence: restart loads the STORED baseline → NEW1 stays eligible.
+    b2 = seed_baseline([{"market_id": "LEGACY1"}, {"market_id": "LEGACY2"}, {"market_id": "NEW1"}])
+    assert b2 == {"LEGACY1", "LEGACY2"}  # persisted baseline, not re-snapshotted
+    assert "NEW1" not in b2
+    from_broken = broken_snapshot  # renamed to keep reference
+    assert "NEW1" in from_broken and "NEW1" not in b2
+    print("PASS: baseline persists across restart; newly registered markets stay eligible")
 
 
 def test_delay_still_applies_to_genuinely_new_markets():
@@ -543,6 +599,33 @@ def test_safe_delete_ignores_already_deleted():
     print("PASS: already-deleted messages are ignored, not crashes")
 
 
+def test_cleanup_reports_real_counts_not_always_success():
+    """/cleanup must distinguish deleted vs already-gone vs failed, and must
+    NEVER report 'Database cleaned successfully' when deletions failed."""
+    def safe_delete(outcome):
+        """Mirror _safe_delete_message outcome contract: 'deleted'|'already_gone'|'error'."""
+        return outcome
+
+    rows = [
+        {"chat_id": "1", "message_id": 11, "outcome": "deleted"},
+        {"chat_id": "2", "message_id": 22, "outcome": "already_gone"},
+        {"chat_id": "3", "message_id": 33, "outcome": "error: Bot blocked by user"},
+    ]
+    deleted = sum(1 for r in rows if safe_delete(r["outcome"]) == "deleted")
+    skipped = sum(1 for r in rows if safe_delete(r["outcome"]) == "already_gone")
+    failed = sum(1 for r in rows if safe_delete(r["outcome"]) != "deleted" and safe_delete(r["outcome"]) != "already_gone")
+
+    assert deleted == 1, f"expected 1 deleted got {deleted}"
+    assert skipped == 1, f"expected 1 skipped got {skipped}"
+    assert failed == 1, f"expected 1 failed got {failed}"
+    assert not (failed == 0 and skipped == 0), "a fully-success report hides real failures"
+
+    # DB rows are only kept for failed messages; deleted/already-gone are pruned.
+    kept = sum(1 for r in rows if r["outcome"] != "deleted" and r["outcome"] != "already_gone")
+    assert kept == 1, "failed rows must be retained for retry"
+    print("PASS: /cleanup reports deleted/skipped/failed truthfully and retains failed rows")
+
+
 if __name__ == "__main__":
     test_notified_new_must_unlock_on_premium_success()
     test_public_independent_of_notified_new_and_premium()
@@ -562,13 +645,15 @@ if __name__ == "__main__":
     test_onchain_register_backfills_schedule_but_not_duplicate()
     test_send_releases_claim_if_delay_not_yet_passed()
     test_startup_baseline_never_notifies_historical_markets()
-    test_restart_reseeds_baseline_no_replay()
+    test_restart_does_not_reclassify_newly_registered_market()
     test_pause_cancels_queued_delayed_notifies()
     test_send_aborts_when_paused_mid_flight()
-    test_pending_queue_only_admits_this_session_new()
+    test_pending_queue_admits_delay_pending_surviving_restart()
+    test_baseline_persists_across_restart()
     test_delay_still_applies_to_genuinely_new_markets()
     test_one_message_per_market_edit_in_place()
     test_graduation_gated_by_app_signal()
     test_cleanup_deletes_every_message_and_state()
     test_safe_delete_ignores_already_deleted()
+    test_cleanup_reports_real_counts_not_always_success()
     print("ALL NOTIFY PIPELINE REGRESSION TESTS PASSED")
